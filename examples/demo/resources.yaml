@@ -1,0 +1,19 @@
+apiVersion: ai.platform/v1
+kind: Workspace
+metadata:
+  name: demo
+spec:
+  rootPath: ../examples/demo
+  model:
+    provider: stub
+    model: stub-model
+---
+apiVersion: ai.platform/v1
+kind: Mission
+metadata:
+  name: implement-auth
+  namespace: demo
+spec:
+  objective: Build authentication for a prototype API
+  brief:
+    ref: knowledge://prd.md

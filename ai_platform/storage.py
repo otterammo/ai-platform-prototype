@@ -3,20 +3,22 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, TypeAlias
 
-from sqlalchemy import DateTime, Integer, String, UniqueConstraint, create_engine, delete as sql_delete, select
+from sqlalchemy import DateTime, Integer, String, UniqueConstraint, create_engine, select
+from sqlalchemy import delete as sql_delete
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.types import JSON
 
 from .resources import (
+    AgentResource,
+    FleetResource,
     ResourceKind,
     dump_resource,
     parse_resource,
     resource_key,
 )
-
 
 DEFAULT_DB_URL = "sqlite:///./platform.db"
 
@@ -41,7 +43,9 @@ class ResourceRecord(Base):
     generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     manifest: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
 
 
 class EventRecord(Base):
@@ -66,6 +70,11 @@ class ArtifactRecord(Base):
     agent: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     path: Mapped[str] = mapped_column(String(2000), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+JsonDict: TypeAlias = dict[str, Any]
+JsonDictList: TypeAlias = list[JsonDict]
+ResourceRecordList: TypeAlias = list[ResourceRecord]
 
 
 def make_engine(database_url: str = DEFAULT_DB_URL) -> Engine:
@@ -93,7 +102,7 @@ class ResourceStore:
         finally:
             session.close()
 
-    def apply(self, manifest: dict[str, Any]) -> dict[str, Any]:
+    def apply(self, manifest: JsonDict) -> JsonDict:
         resource = parse_resource(manifest)
         kind, namespace, name = resource_key(resource.kind, resource.metadata.name, resource.metadata.namespace)
         with self.session() as session:
@@ -141,7 +150,7 @@ class ResourceStore:
             )
             return record.manifest
 
-    def get(self, kind: str | ResourceKind, name: str, namespace: str | None = None) -> dict[str, Any] | None:
+    def get(self, kind: str | ResourceKind, name: str, namespace: str | None = None) -> JsonDict | None:
         kind_value, namespace_value, name_value = resource_key(kind, name, namespace)
         with self.session() as session:
             record = session.scalar(
@@ -153,7 +162,7 @@ class ResourceStore:
             )
             return record.manifest if record else None
 
-    def list(self, kind: str | ResourceKind | None = None, namespace: str | None = None) -> list[dict[str, Any]]:
+    def list(self, kind: str | ResourceKind | None = None, namespace: str | None = None) -> JsonDictList:
         with self.session() as session:
             statement = select(ResourceRecord)
             if kind:
@@ -189,9 +198,7 @@ class ResourceStore:
 
     def _delete_workspace(self, session: Session, record: ResourceRecord, deleted_ids: set[int]) -> None:
         workspace_name = record.name
-        children = session.scalars(
-            select(ResourceRecord).where(ResourceRecord.namespace == workspace_name)
-        ).all()
+        children = session.scalars(select(ResourceRecord).where(ResourceRecord.namespace == workspace_name)).all()
         delete_order = {
             ResourceKind.AGENT.value: 0,
             ResourceKind.FLEET.value: 1,
@@ -251,44 +258,47 @@ class ResourceStore:
             )
         )
 
-    def _owned_fleets_for_mission(self, session: Session, namespace: str, mission: str) -> list[ResourceRecord]:
+    def _owned_fleets_for_mission(self, session: Session, namespace: str, mission: str) -> ResourceRecordList:
         records = session.scalars(
             select(ResourceRecord).where(
                 ResourceRecord.kind == ResourceKind.FLEET.value,
                 ResourceRecord.namespace == namespace,
             )
         ).all()
-        return [
-            record
-            for record in records
-            if parse_resource(record.manifest).spec.mission == mission
-        ]
+        owned: ResourceRecordList = []
+        for record in records:
+            resource = parse_resource(record.manifest)
+            if isinstance(resource, FleetResource) and resource.spec.mission == mission:
+                owned.append(record)
+        return owned
 
-    def _owned_agents_for_mission(self, session: Session, namespace: str, mission: str) -> list[ResourceRecord]:
+    def _owned_agents_for_mission(self, session: Session, namespace: str, mission: str) -> ResourceRecordList:
         records = session.scalars(
             select(ResourceRecord).where(
                 ResourceRecord.kind == ResourceKind.AGENT.value,
                 ResourceRecord.namespace == namespace,
             )
         ).all()
-        return [
-            record
-            for record in records
-            if parse_resource(record.manifest).spec.mission == mission
-        ]
+        owned: ResourceRecordList = []
+        for record in records:
+            resource = parse_resource(record.manifest)
+            if isinstance(resource, AgentResource) and resource.spec.mission == mission:
+                owned.append(record)
+        return owned
 
-    def _owned_agents_for_fleet(self, session: Session, namespace: str, fleet: str) -> list[ResourceRecord]:
+    def _owned_agents_for_fleet(self, session: Session, namespace: str, fleet: str) -> ResourceRecordList:
         records = session.scalars(
             select(ResourceRecord).where(
                 ResourceRecord.kind == ResourceKind.AGENT.value,
                 ResourceRecord.namespace == namespace,
             )
         ).all()
-        return [
-            record
-            for record in records
-            if parse_resource(record.manifest).spec.fleet == fleet
-        ]
+        owned: ResourceRecordList = []
+        for record in records:
+            resource = parse_resource(record.manifest)
+            if isinstance(resource, AgentResource) and resource.spec.fleet == fleet:
+                owned.append(record)
+        return owned
 
     def update_status(
         self,
@@ -299,7 +309,7 @@ class ResourceStore:
         message: str | None = None,
         data: dict[str, Any] | None = None,
         event_type: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> JsonDict:
         kind_value, namespace_value, name_value = resource_key(kind, name, namespace)
         with self.session() as session:
             record = session.scalar(
@@ -345,7 +355,7 @@ class ResourceStore:
         namespace: str | None = None,
         message: str = "",
         payload: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> JsonDict:
         kind_value = ResourceKind(resource_kind).value if resource_kind else None
         namespace_value = namespace or ""
         with self.session() as session:
@@ -367,7 +377,7 @@ class ResourceStore:
         resource_kind: str | ResourceKind | None = None,
         resource_name: str | None = None,
         limit: int = 100,
-    ) -> list[dict[str, Any]]:
+    ) -> JsonDictList:
         with self.session() as session:
             statement = select(EventRecord)
             if namespace is not None:
@@ -380,7 +390,7 @@ class ResourceStore:
             records = session.scalars(statement).all()
             return [self.event_to_dict(record) for record in records]
 
-    def record_artifact(self, namespace: str, mission: str, agent: str, path: Path) -> dict[str, Any]:
+    def record_artifact(self, namespace: str, mission: str, agent: str, path: Path) -> JsonDict:
         with self.session() as session:
             record = ArtifactRecord(namespace=namespace, mission=mission, agent=agent, path=str(path))
             session.add(record)
@@ -394,7 +404,7 @@ class ResourceStore:
                 "createdAt": record.created_at.isoformat(),
             }
 
-    def list_artifacts(self, namespace: str | None = None, mission: str | None = None) -> list[dict[str, Any]]:
+    def list_artifacts(self, namespace: str | None = None, mission: str | None = None) -> JsonDictList:
         with self.session() as session:
             statement = select(ArtifactRecord)
             if namespace is not None:
@@ -415,7 +425,7 @@ class ResourceStore:
             ]
 
     @staticmethod
-    def event_to_dict(record: EventRecord) -> dict[str, Any]:
+    def event_to_dict(record: EventRecord) -> JsonDict:
         return {
             "id": record.id,
             "type": record.type,

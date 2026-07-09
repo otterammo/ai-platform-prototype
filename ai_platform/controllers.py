@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import Any
 
 from .resources import (
     AgentResource,
@@ -16,7 +17,6 @@ from .resources import (
 )
 from .runtime import AgentRuntime
 from .storage import ResourceStore
-
 
 MISSION_GENERATION_ANNOTATION = "ai.platform/mission-generation"
 FLEET_GENERATION_ANNOTATION = "ai.platform/fleet-generation"
@@ -52,7 +52,11 @@ class MissionController:
             namespace = mission.metadata.namespace
             fleet_name = f"{mission.metadata.name}-fleet"
             fleet_manifest = self.store.get(ResourceKind.FLEET, fleet_name, namespace)
-            fleet = parse_resource(fleet_manifest) if fleet_manifest else None
+            fleet: FleetResource | None = None
+            if fleet_manifest:
+                parsed_fleet = parse_resource(fleet_manifest)
+                if isinstance(parsed_fleet, FleetResource):
+                    fleet = parsed_fleet
             if isinstance(fleet, FleetResource) and self._fleet_matches_mission(fleet, mission):
                 continue
 
@@ -91,7 +95,7 @@ class MissionController:
             changed += 1
         return ReconcileResult("mission", changed)
 
-    def _fleet_manifest(self, mission: MissionResource, fleet: FleetResource | None) -> dict:
+    def _fleet_manifest(self, mission: MissionResource, fleet: FleetResource | None) -> dict[str, Any]:
         namespace = mission.metadata.namespace
         fleet_name = f"{mission.metadata.name}-fleet"
         labels = dict(fleet.metadata.labels if fleet else {})
@@ -101,7 +105,7 @@ class MissionController:
         strategy = "single-agent"
         agent_count = 1
         template_name = None
-        agents: list[dict] = []
+        agents: list[dict[str, Any]] = []
         if mission.spec.template:
             template_manifest = self.store.get(ResourceKind.FLEET_TEMPLATE, mission.spec.template)
             if template_manifest is None:
@@ -115,7 +119,7 @@ class MissionController:
             agents = [agent.model_dump(mode="json") for agent in template.spec.agents]
             annotations[FLEET_TEMPLATE_GENERATION_ANNOTATION] = str(template.metadata.generation)
 
-        spec = {
+        spec: dict[str, Any] = {
             "workspace": namespace,
             "mission": mission.metadata.name,
             "strategy": strategy,
@@ -193,8 +197,14 @@ class FleetController:
             for desired_agent, tools, model_ref in resolved_agents:
                 agent_name = f"{fleet.metadata.name}-{desired_agent.name}"
                 agent_manifest = self.store.get(ResourceKind.AGENT, agent_name, fleet.metadata.namespace)
-                agent = parse_resource(agent_manifest) if agent_manifest else None
-                if isinstance(agent, AgentResource) and self._agent_matches_fleet(agent, fleet, desired_agent, tools, model_ref):
+                agent: AgentResource | None = None
+                if agent_manifest:
+                    parsed_agent = parse_resource(agent_manifest)
+                    if isinstance(parsed_agent, AgentResource):
+                        agent = parsed_agent
+                if isinstance(agent, AgentResource) and self._agent_matches_fleet(
+                    agent, fleet, desired_agent, tools, model_ref
+                ):
                     continue
                 model_config = None if model_ref else self._model_for_fleet(fleet)
                 self.store.apply(
@@ -229,7 +239,7 @@ class FleetController:
                 changed += fleet_changed
         return ReconcileResult("fleet", changed)
 
-    def _model_for_fleet(self, fleet: FleetResource) -> dict:
+    def _model_for_fleet(self, fleet: FleetResource) -> dict[str, Any]:
         namespace = fleet.metadata.namespace
         mission_manifest = self.store.get(ResourceKind.MISSION, fleet.spec.mission, namespace)
         workspace_manifest = self.store.get(ResourceKind.WORKSPACE, fleet.spec.workspace)
@@ -289,7 +299,7 @@ class FleetController:
         model_ref: str | None,
         model_config: dict | None,
         agent: AgentResource | None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         labels = dict(agent.metadata.labels if agent else {})
         labels["mission"] = fleet.spec.mission
         labels["fleet"] = fleet.metadata.name

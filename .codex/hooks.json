@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/quality_gate.py\"",
+            "timeout": 180,
+            "statusMessage": "Running repo quality gate"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -7,8 +7,7 @@ from typing import Annotated, Any, Literal, Union
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-
-API_VERSION = "ai.platform/v1"
+API_VERSION: Literal["ai.platform/v1"] = "ai.platform/v1"
 
 
 class ResourceKind(StrEnum):
@@ -210,7 +209,7 @@ class KnowledgeSpec(BaseModel):
 class BaseResource(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    apiVersion: Literal[API_VERSION] = API_VERSION
+    apiVersion: Literal["ai.platform/v1"] = API_VERSION
     kind: ResourceKind
     metadata: Metadata
     spec: BaseModel

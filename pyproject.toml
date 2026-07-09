@@ -17,7 +17,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "mypy>=1.10",
+    "pre-commit>=3.7",
     "pytest>=8.0",
+    "ruff>=0.5",
+    "types-PyYAML>=6.0",
 ]
 
 [project.scripts]
@@ -30,3 +34,19 @@ include = ["ai_platform*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["ai_platform"]
+warn_unused_configs = true
+check_untyped_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+show_error_codes = true

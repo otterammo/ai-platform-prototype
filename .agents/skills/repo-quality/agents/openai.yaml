@@ -1,0 +1,7 @@
+interface:
+  display_name: "Repo Quality"
+  short_description: "Run formatters, linters, type checks, tests, and repo hygiene checks."
+  default_prompt: "Verify this repository change with the standard quality workflow and report the commands that passed."
+
+policy:
+  allow_implicit_invocation: true

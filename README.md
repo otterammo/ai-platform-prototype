@@ -45,6 +45,31 @@ python3 -m venv .venv
 python -m pip install -e ".[dev]"
 ```
 
+## Development
+
+```bash
+make fmt
+make lint
+make typecheck
+make test
+make check
+```
+
+Install the local Git hooks with:
+
+```bash
+pre-commit install
+```
+
+## Codex Repo Tools
+
+- `AGENTS.md` defines persistent repository instructions for Codex agents.
+- `.agents/skills/repo-quality` defines the repeatable quality workflow.
+- `.codex/hooks.json` runs a repo quality gate on Codex stop events when project hooks are trusted.
+- `.codex/agents/quality-verifier.toml` defines a focused verifier subagent for explicit delegation.
+
+Use `/hooks` in Codex to review and trust project-local hooks after changes.
+
 ## Run The Prototype
 
 Apply the demo resources:

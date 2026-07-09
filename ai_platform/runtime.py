@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TypeVar
 
 from .models import Message, build_model_client
 from .resources import (
     AgentResource,
     KnowledgeRef,
     MissionResource,
+    ModelConfig,
     ModelResource,
     ResourceKind,
     WorkspaceResource,
     parse_resource,
 )
 from .storage import ResourceStore
+
+_ResourceT = TypeVar("_ResourceT")
 
 
 class AgentRuntime:
@@ -73,7 +77,13 @@ class AgentRuntime:
         )
         return {"artifactPath": str(artifact_path)}
 
-    def _load_resource(self, kind: ResourceKind, name: str, namespace: str | None, expected_type: type) -> object:
+    def _load_resource(
+        self,
+        kind: ResourceKind,
+        name: str,
+        namespace: str | None,
+        expected_type: type[_ResourceT],
+    ) -> _ResourceT:
         manifest = self.store.get(kind, name, namespace)
         if manifest is None:
             raise KeyError(f"{kind.value} {name} not found")
@@ -106,9 +116,7 @@ class AgentRuntime:
                 f"knowledge reference {knowledge_ref.ref} resolves outside workspace knowledge"
             ) from exc
         if not resolved_candidate.is_file():
-            raise FileNotFoundError(
-                f"knowledge reference {knowledge_ref.ref} not found at {candidate}"
-            )
+            raise FileNotFoundError(f"knowledge reference {knowledge_ref.ref} not found at {candidate}")
         return resolved_candidate.read_text(encoding="utf-8")
 
     def _model_for_agent(
@@ -116,7 +124,7 @@ class AgentRuntime:
         agent: AgentResource,
         mission: MissionResource,
         workspace: WorkspaceResource,
-    ):
+    ) -> ModelConfig:
         if agent.spec.pilot and agent.spec.pilot.modelRef:
             model = self._load_resource(ResourceKind.MODEL, agent.spec.pilot.modelRef, None, ModelResource)
             return model.spec.config

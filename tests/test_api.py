@@ -63,3 +63,64 @@ def test_api_approval_endpoint_rejects_pending_action(tmp_path: Path) -> None:
     assert mission["status"]["phase"] == "Failed"
     assert agent is not None
     assert agent["status"]["phase"] == "Failed"
+
+
+def test_api_knowledge_search_indexes_and_context_endpoint_returns_runtime_context(tmp_path: Path) -> None:
+    app = create_app(f"sqlite:///{tmp_path / 'platform.db'}", str(tmp_path / "platform"))
+    workspace_root = tmp_path / "workspace"
+    knowledge_dir = workspace_root / "knowledge"
+    knowledge_dir.mkdir(parents=True)
+    (knowledge_dir / "prd.md").write_text("# PRD\n\nShip authentication.", encoding="utf-8")
+    for manifest in [
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Workspace",
+            "metadata": {"name": "demo"},
+            "spec": {"rootPath": str(workspace_root)},
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Knowledge",
+            "metadata": {"name": "prd", "namespace": "demo"},
+            "spec": {"type": "PRD", "ref": "knowledge://prd.md"},
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "KnowledgeIndex",
+            "metadata": {"name": "default", "namespace": "demo"},
+            "spec": {"sources": ["knowledge://prd.md"]},
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Mission",
+            "metadata": {"name": "build-auth", "namespace": "demo"},
+            "spec": {"objective": "Build authentication", "brief": {"ref": "knowledge://prd.md"}},
+        },
+    ]:
+        app.state.store.apply(manifest)
+
+    with TestClient(app) as client:
+        knowledge_response = client.get("/knowledge", params={"namespace": "demo"})
+        assert knowledge_response.status_code == 200
+        assert knowledge_response.json()["items"][0]["metadata"]["name"] == "prd"
+
+        indexes_response = client.get("/knowledge/indexes", params={"namespace": "demo"})
+        assert indexes_response.status_code == 200
+        assert indexes_response.json()["items"][0]["metadata"]["name"] == "default"
+
+        search_response = client.get(
+            "/knowledge/search",
+            params={"namespace": "demo", "query": "authentication"},
+        )
+        assert search_response.status_code == 200
+        assert search_response.json()["items"][0]["document"] == "prd.md"
+
+        reconcile_response = client.post("/reconcile")
+        assert reconcile_response.status_code == 200
+
+        context_response = client.get("/contexts/build-auth", params={"namespace": "demo"})
+        assert context_response.status_code == 200
+        context = context_response.json()
+        assert context["kind"] == "Context"
+        assert context["status"]["data"]["chunkCount"] == 1
+        assert "Source: knowledge://prd.md" in context["status"]["data"]["renderedContext"]

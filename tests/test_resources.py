@@ -95,6 +95,37 @@ spec:
     assert resources[-1].metadata.namespace == "demo"
 
 
+def test_parse_knowledge_index_and_context_resources() -> None:
+    resources = parse_resource_documents(
+        """
+apiVersion: ai.platform/v1
+kind: KnowledgeIndex
+metadata:
+  name: default
+  namespace: demo
+spec:
+  sources:
+    - knowledge://prd.md
+    - ref: knowledge://architecture.md
+---
+apiVersion: ai.platform/v1
+kind: Context
+metadata:
+  name: build-auth
+  namespace: demo
+spec:
+  mission: build-auth
+  query: Build authentication
+  knowledgeIndex: default
+"""
+    )
+
+    assert [resource.kind for resource in resources] == ["KnowledgeIndex", "Context"]
+    assert resources[0].metadata.namespace == "demo"
+    assert resources[0].spec.sources[0].ref == "knowledge://prd.md"
+    assert resources[1].spec.knowledgeIndex == "default"
+
+
 def test_template_mission_does_not_require_legacy_objective() -> None:
     resources = parse_resource_documents(
         """
@@ -160,6 +191,33 @@ spec:
         )
 
 
+@pytest.mark.parametrize("kind", ["KnowledgeIndex", "Context"])
+def test_knowledge_index_and_context_require_workspace_namespace(kind: str) -> None:
+    spec = (
+        """
+spec:
+  sources:
+    - knowledge://prd.md
+"""
+        if kind == "KnowledgeIndex"
+        else """
+spec:
+  mission: build-auth
+  query: Build authentication
+"""
+    )
+    with pytest.raises(ValueError, match="metadata.namespace"):
+        parse_resource_documents(
+            f"""
+apiVersion: ai.platform/v1
+kind: {kind}
+metadata:
+  name: default
+{spec}
+"""
+        )
+
+
 @pytest.mark.parametrize(
     "ref",
     [
@@ -184,5 +242,21 @@ spec:
   objective: Build authentication
   brief:
     ref: {ref}
+"""
+        )
+
+
+def test_knowledge_index_sources_validate_refs() -> None:
+    with pytest.raises(ValueError, match="knowledge references"):
+        parse_resource_documents(
+            """
+apiVersion: ai.platform/v1
+kind: KnowledgeIndex
+metadata:
+  name: default
+  namespace: demo
+spec:
+  sources:
+    - knowledge://../secret.md
 """
         )

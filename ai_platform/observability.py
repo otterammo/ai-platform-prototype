@@ -23,6 +23,12 @@ DECISION_EVENT_TYPES = {
     "ApprovalRejected",
     "AgentPaused",
     "AgentResumed",
+    "KnowledgeIndexed",
+    "ChunkCreated",
+    "RetrievalStarted",
+    "RetrievalCompleted",
+    "ContextBuilt",
+    "ContextConsumed",
     "ReconciliationStarted",
     "ReconciliationCompleted",
 }
@@ -66,6 +72,7 @@ def build_trace(store: ResourceStore, mission_name: str, namespace: str | None) 
         "events": events,
         "decisions": [event for event in events if event["type"] in DECISION_EVENT_TYPES],
         "artifacts": artifacts,
+        "knowledge": _knowledge_trace(events),
     }
 
 
@@ -126,6 +133,7 @@ def format_trace(trace: JsonDict) -> str:
     ]
     if mission.get("correlationId"):
         lines.append(f"Correlation ID: {mission['correlationId']}")
+    lines.extend(_knowledge_detail_lines(trace))
     lines.append("Mission")
     fleets = trace["fleets"]
     for fleet_index, fleet in enumerate(fleets):
@@ -149,6 +157,57 @@ def format_trace(trace: JsonDict) -> str:
 
 def format_timeline(timeline: JsonDict) -> str:
     return "\n".join(f"{item['time']} {item['message']}" for item in timeline["items"])
+
+
+def _knowledge_trace(events: JsonDictList) -> JsonDict:
+    indexed = [event for event in events if event["type"] == "KnowledgeIndexed"]
+    retrievals = [event for event in events if event["type"] == "RetrievalCompleted"]
+    contexts = [event for event in events if event["type"] == "ContextBuilt"]
+    consumed = [event for event in events if event["type"] == "ContextConsumed"]
+    latest_index = indexed[-1]["payload"] if indexed else {}
+    latest_retrieval = retrievals[-1]["payload"] if retrievals else {}
+    latest_context = contexts[-1]["payload"] if contexts else {}
+    sources = latest_retrieval.get("sources") or latest_context.get("sources") or []
+    return {
+        "index": latest_retrieval.get("knowledgeIndex")
+        or latest_context.get("knowledgeIndex")
+        or latest_index.get("knowledgeIndex"),
+        "retrieved": sources,
+        "contextChunkCount": latest_context.get("chunkCount") or latest_retrieval.get("chunkCount") or 0,
+        "consumedBy": [event["payload"].get("agent") for event in consumed if event["payload"].get("agent")],
+    }
+
+
+def _knowledge_detail_lines(trace: JsonDict) -> list[str]:
+    knowledge = trace.get("knowledge") or {}
+    if not knowledge.get("index") and not knowledge.get("retrieved") and not knowledge.get("contextChunkCount"):
+        return []
+    lines = ["Knowledge"]
+    if knowledge.get("index"):
+        lines.append(f"Index: {knowledge['index']}")
+    lines.append("Retrieved:")
+    retrieved = knowledge.get("retrieved") or []
+    if retrieved:
+        for source in retrieved:
+            document = source.get("document") or source.get("sourceRef")
+            lines.append(f"{document}")
+            lines.append(f"  {source.get('chunkCount', 0)} chunks")
+    else:
+        lines.append("none")
+    lines.append("Context")
+    lines.append(f"{knowledge.get('contextChunkCount', 0)} chunks")
+    consumed_by = knowledge.get("consumedBy") or []
+    if consumed_by:
+        lines.append("Consumed by")
+        lines.extend(_consumer_label(str(agent)) for agent in consumed_by)
+    return lines
+
+
+def _consumer_label(agent_name: str) -> str:
+    short_name = _short_agent_name(agent_name)
+    if short_name.startswith("Agent "):
+        return short_name
+    return f"{short_name.replace('-', ' ').title()} Agent"
 
 
 def _mission_events(
@@ -308,6 +367,12 @@ def _timeline_message(event: JsonDict) -> str:
         "AgentFailed": f"{_short_agent_name(resource_name)} failed",
         "ArtifactCreated": "Artifact created",
         "KnowledgeLoaded": f"Knowledge loaded {payload.get('knowledgeRef')}",
+        "KnowledgeIndexed": f"Knowledge indexed {payload.get('knowledgeIndex')}",
+        "ChunkCreated": f"Knowledge chunk created {payload.get('document')}",
+        "RetrievalStarted": f"Retrieval started {payload.get('knowledgeIndex')}",
+        "RetrievalCompleted": f"Retrieval completed {payload.get('chunkCount')} chunks",
+        "ContextBuilt": f"Context built {payload.get('chunkCount')} chunks",
+        "ContextConsumed": f"Context consumed by {_short_agent_name(str(payload.get('agent') or ''))}",
         "ModelInvoked": f"Model invoked {payload.get('model')}",
         "PolicyEvaluated": f"Policy evaluated {_runtime_action_label(payload)}",
         "PolicyAllowed": f"Policy allowed {_runtime_action_label(payload)}",
@@ -423,6 +488,13 @@ def _referenced_resources(resource: JsonDict, kind: str) -> JsonDictList:
             references.append({"kind": "FleetTemplate", "name": spec["template"]})
         if spec.get("model"):
             references.append({"kind": "Model", "name": spec["model"].get("model"), "source": "mission"})
+    elif kind == ResourceKind.CONTEXT.value:
+        references.append({"kind": "Mission", "name": spec.get("mission")})
+        references.append({"kind": "KnowledgeIndex", "name": spec.get("knowledgeIndex")})
+    elif kind == ResourceKind.KNOWLEDGE_INDEX.value:
+        for source in spec.get("sources") or []:
+            ref = source.get("ref") if isinstance(source, dict) else source
+            references.append({"kind": "Knowledge", "ref": ref})
     elif kind == ResourceKind.FLEET.value:
         references.extend(
             [
@@ -478,6 +550,17 @@ def _knowledge_used(
                     "path": payload.get("path"),
                 }
             )
+        elif event["type"] == "ContextBuilt":
+            for source in payload.get("sources") or []:
+                if isinstance(source, dict) and source.get("sourceRef"):
+                    refs.append(
+                        {
+                            "ref": source["sourceRef"],
+                            "usage": "context",
+                            "document": source.get("document"),
+                            "chunkCount": source.get("chunkCount"),
+                        }
+                    )
     knowledge_names = _knowledge_names_by_ref(store, namespace)
     seen: set[tuple[str | None, str | None, str | None]] = set()
     unique: JsonDictList = []

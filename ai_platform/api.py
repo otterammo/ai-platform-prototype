@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
 from .controllers import ControlPlane
+from .knowledge import DEFAULT_INDEX_NAME, KeywordRetriever, KnowledgeIndexer
 from .observability import build_timeline, build_trace
 from .policy import ApprovalService
 from .resources import ResourceKind, parse_resource_documents
@@ -97,6 +98,32 @@ def create_app(
     ) -> dict[str, list[dict[str, Any]]]:
         return {"items": store.list_events(namespace, resourceKind, resourceName, limit, correlationId)}
 
+    @app.get("/knowledge")
+    async def list_knowledge(namespace: str | None = None) -> dict[str, list[dict[str, Any]]]:
+        return {"items": store.list(ResourceKind.KNOWLEDGE, namespace)}
+
+    @app.get("/knowledge/search")
+    async def search_knowledge(
+        namespace: str,
+        query: str,
+        index: str = DEFAULT_INDEX_NAME,
+        limit: int = Query(default=10, ge=1, le=100),
+    ) -> dict[str, list[dict[str, Any]]]:
+        KnowledgeIndexer(store).ensure_indexed(namespace, index)
+        results = KeywordRetriever(store).retrieve(namespace, index, query, limit=limit)
+        return {"items": [_search_result(item) for item in results]}
+
+    @app.get("/knowledge/indexes")
+    async def list_knowledge_indexes(namespace: str | None = None) -> dict[str, list[dict[str, Any]]]:
+        return {"items": store.list(ResourceKind.KNOWLEDGE_INDEX, namespace)}
+
+    @app.get("/contexts/{mission}")
+    async def get_context(mission: str, namespace: str) -> dict[str, Any]:
+        context = store.get(ResourceKind.CONTEXT, mission, namespace)
+        if context is None:
+            raise HTTPException(status_code=404, detail="context not found")
+        return context
+
     @app.get("/approvals")
     async def list_approvals() -> dict[str, list[dict[str, Any]]]:
         return {"items": store.list(ResourceKind.APPROVAL)}
@@ -164,6 +191,21 @@ def create_app(
         return Response(yaml.safe_dump(app.openapi(), sort_keys=False), media_type="application/yaml")
 
     return app
+
+
+def _search_result(chunk: dict[str, Any]) -> dict[str, Any]:
+    content = str(chunk.get("content") or "")
+    preview = " ".join(content.split())
+    if len(preview) > 160:
+        preview = f"{preview[:157]}..."
+    return {
+        "document": chunk["document"],
+        "section": chunk["section"],
+        "sourceRef": chunk["sourceRef"],
+        "chunkId": chunk["chunkId"],
+        "score": chunk["score"],
+        "preview": preview,
+    }
 
 
 app = create_app()

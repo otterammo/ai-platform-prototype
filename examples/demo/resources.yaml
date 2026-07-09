@@ -98,6 +98,35 @@ spec:
   ref: knowledge://prd.md
 ---
 apiVersion: ai.platform/v1
+kind: Knowledge
+metadata:
+  name: auth-architecture
+  namespace: demo
+spec:
+  type: Architecture
+  ref: knowledge://architecture.md
+---
+apiVersion: ai.platform/v1
+kind: Knowledge
+metadata:
+  name: auth-research
+  namespace: demo
+spec:
+  type: Research
+  ref: knowledge://research.md
+---
+apiVersion: ai.platform/v1
+kind: KnowledgeIndex
+metadata:
+  name: default
+  namespace: demo
+spec:
+  sources:
+    - knowledge://prd.md
+    - knowledge://architecture.md
+    - knowledge://research.md
+---
+apiVersion: ai.platform/v1
 kind: Policy
 metadata:
   name: default

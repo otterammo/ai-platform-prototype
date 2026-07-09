@@ -193,6 +193,9 @@ def test_reconcile_creates_fleet_agent_artifact_and_events(tmp_path: Path) -> No
     assert artifact_path.exists()
     artifact_text = artifact_path.read_text(encoding="utf-8")
     assert "Build authentication" in artifact_text
+    assert "Context:" in artifact_text
+    assert "Sources" in artifact_text
+    assert "Source: knowledge://prd.md" in artifact_text
     assert "Ship authentication" in artifact_text
 
     event_types = {event["type"] for event in store.list_events(limit=50)}
@@ -201,6 +204,10 @@ def test_reconcile_creates_fleet_agent_artifact_and_events(tmp_path: Path) -> No
         "FleetCreated",
         "AgentCreated",
         "AgentStarted",
+        "KnowledgeIndexed",
+        "RetrievalCompleted",
+        "ContextBuilt",
+        "ContextConsumed",
         "ModelInvoked",
         "ArtifactCreated",
         "MissionCompleted",
@@ -296,6 +303,11 @@ def test_trace_generation_reconstructs_execution_graph(tmp_path: Path) -> None:
     assert "Planner Agent" in formatted
     assert "Model stub-model" in formatted
     assert "Tool filesystem" in formatted
+    assert "Knowledge" in formatted
+    assert "Index: default" in formatted
+    assert "prd.md" in formatted
+    assert "Consumed by" in formatted
+    assert "Planner Agent" in formatted
 
 
 def test_timeline_orders_events_by_timestamp(tmp_path: Path) -> None:
@@ -477,7 +489,8 @@ def test_template_mission_creates_fleet_agents_artifacts_and_uses_inputs(tmp_pat
     assert len(artifacts) == 3
     artifact_text = Path(artifacts[0]["path"]).read_text(encoding="utf-8")
     assert "Template: software-feature" in artifact_text
-    assert "Input prd" in artifact_text
+    assert "Context:" in artifact_text
+    assert "Source: knowledge://prd.md" in artifact_text
     assert "Ship authentication" in artifact_text
     assert "Requested outputs: code, report" in artifact_text
 
@@ -519,6 +532,8 @@ def test_checked_in_demo_manifest_reconciles_end_to_end(tmp_path: Path) -> None:
     knowledge_dir = demo_root / "knowledge"
     knowledge_dir.mkdir(parents=True)
     (knowledge_dir / "prd.md").write_text("Demo PRD", encoding="utf-8")
+    (knowledge_dir / "architecture.md").write_text("Demo Architecture", encoding="utf-8")
+    (knowledge_dir / "research.md").write_text("Demo Research", encoding="utf-8")
     manifest_path = Path(__file__).parents[1] / "examples" / "demo" / "resources.yaml"
     resources = parse_resource_documents(manifest_path.read_text(encoding="utf-8"))
     store = ResourceStore(f"sqlite:///{tmp_path / 'platform.db'}", tmp_path / "platform")

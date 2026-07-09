@@ -4,11 +4,11 @@ from pathlib import Path
 from typing import TypeVar
 
 from .events import CORRELATION_ID_ANNOTATION, CORRELATION_ID_STATUS_KEY, EventContext
+from .knowledge import DEFAULT_CONTEXT_LIMIT, DEFAULT_INDEX_NAME, ContextBuilder, ContextBuildResult
 from .models import Message, build_model_client
 from .policy import PolicyEngine, RuntimeAction
 from .resources import (
     AgentResource,
-    KnowledgeRef,
     MissionResource,
     ModelConfig,
     ModelResource,
@@ -53,11 +53,25 @@ class AgentRuntime:
         )
 
         self._authorize_declared_tools(agent)
-        brief_text = self._load_brief(workspace, mission, agent)
-        input_texts = self._load_inputs(workspace, mission, agent)
+        self._authorize(
+            agent,
+            "knowledge",
+            "retrieve",
+            {
+                "knowledgeIndex": DEFAULT_INDEX_NAME,
+                "limit": DEFAULT_CONTEXT_LIMIT,
+            },
+        )
+        context_result = ContextBuilder(self.store).build_for_mission(
+            mission,
+            index_name=DEFAULT_INDEX_NAME,
+            limit=DEFAULT_CONTEXT_LIMIT,
+            correlation_id=agent_correlation_id(agent),
+        )
         model_config = self._model_for_agent(agent, mission, workspace)
-        messages = self._build_messages(mission, brief_text, input_texts)
+        messages = self._build_messages(mission, context_result.rendered_context)
         client = build_model_client(model_config, store=self.store)
+        self._emit_context_consumed(agent, mission, context_result)
 
         self._authorize(
             agent,
@@ -93,7 +107,7 @@ class AgentRuntime:
             namespace,
             "Succeeded",
             "Agent completed successfully",
-            data={"artifactPath": str(artifact_path)},
+            data={"artifactPath": str(artifact_path), "context": mission.metadata.name},
             event_type="AgentCompleted",
             event_context=self._context(agent, "CompleteAgent", "AgentCompleted"),
         )
@@ -147,59 +161,6 @@ class AgentRuntime:
             raise TypeError(f"expected {expected_type.__name__}, got {type(resource).__name__}")
         return resource
 
-    def _load_brief(self, workspace: WorkspaceResource, mission: MissionResource, agent: AgentResource) -> str:
-        if mission.spec.brief is None:
-            return ""
-
-        return self._load_knowledge_ref(workspace, mission.spec.brief, agent, "brief")
-
-    def _load_inputs(
-        self,
-        workspace: WorkspaceResource,
-        mission: MissionResource,
-        agent: AgentResource,
-    ) -> dict[str, str]:
-        return {
-            name: self._load_knowledge_ref(workspace, knowledge_ref, agent, f"input:{name}")
-            for name, knowledge_ref in mission.spec.inputs.items()
-        }
-
-    def _load_knowledge_ref(
-        self,
-        workspace: WorkspaceResource,
-        knowledge_ref: KnowledgeRef,
-        agent: AgentResource,
-        usage: str,
-    ) -> str:
-        self._authorize(agent, "knowledge", "read", {"knowledgeRef": knowledge_ref.ref, "usage": usage})
-        workspace_root = workspace.spec.resolved_root(self.store.platform_root, workspace.metadata.name)
-        knowledge_root = (workspace_root / "knowledge").resolve(strict=False)
-        candidate = knowledge_root / Path(knowledge_ref.path)
-        resolved_candidate = candidate.resolve(strict=False)
-        try:
-            resolved_candidate.relative_to(knowledge_root)
-        except ValueError as exc:
-            raise PermissionError(
-                f"knowledge reference {knowledge_ref.ref} resolves outside workspace knowledge"
-            ) from exc
-        if not resolved_candidate.is_file():
-            raise FileNotFoundError(f"knowledge reference {knowledge_ref.ref} not found at {candidate}")
-        text = resolved_candidate.read_text(encoding="utf-8")
-        self.store.emit_event(
-            "KnowledgeLoaded",
-            ResourceKind.AGENT,
-            agent.metadata.name,
-            agent.metadata.namespace,
-            f"Loaded {knowledge_ref.ref} for Agent {agent.metadata.name}",
-            {
-                "knowledgeRef": knowledge_ref.ref,
-                "path": str(resolved_candidate),
-                "usage": usage,
-            },
-            event_context=self._context(agent, "LoadKnowledge", "KnowledgeLoaded"),
-        )
-        return text
-
     def _model_for_agent(
         self,
         agent: AgentResource,
@@ -214,18 +175,15 @@ class AgentRuntime:
     def _build_messages(
         self,
         mission: MissionResource,
-        brief_text: str,
-        input_texts: dict[str, str],
+        rendered_context: str,
     ) -> list[Message]:
         user_parts = []
         if mission.spec.objective:
             user_parts.append(f"Objective: {mission.spec.objective}")
         if mission.spec.template:
             user_parts.append(f"Template: {mission.spec.template}")
-        if brief_text:
-            user_parts.append(f"Brief:\n{brief_text}")
-        for name, text in input_texts.items():
-            user_parts.append(f"Input {name}:\n{text}")
+        if rendered_context:
+            user_parts.append(f"Context:\n{rendered_context}")
         if mission.spec.outputs:
             outputs = ", ".join(name for name, enabled in mission.spec.outputs.items() if enabled)
             if outputs:
@@ -240,6 +198,27 @@ class AgentRuntime:
             },
             {"role": "user", "content": "\n\n".join(user_parts)},
         ]
+
+    def _emit_context_consumed(
+        self,
+        agent: AgentResource,
+        mission: MissionResource,
+        context_result: ContextBuildResult,
+    ) -> None:
+        self.store.emit_event(
+            "ContextConsumed",
+            ResourceKind.CONTEXT,
+            mission.metadata.name,
+            agent.metadata.namespace,
+            f"Context {mission.metadata.name} consumed by Agent {agent.metadata.name}",
+            {
+                "agent": agent.metadata.name,
+                "knowledgeIndex": DEFAULT_INDEX_NAME,
+                "chunkCount": len(context_result.chunks),
+                "sources": context_result.sources,
+            },
+            event_context=self._context(agent, "ConsumeContext", "ContextConsumed"),
+        )
 
     def _write_artifact(
         self,

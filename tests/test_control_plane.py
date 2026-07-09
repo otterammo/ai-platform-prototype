@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from ai_platform.controllers import ControlPlane
+from ai_platform.observability import build_timeline, build_trace, describe_resource, format_timeline, format_trace
 from ai_platform.resources import ResourceKind, parse_resource_documents
 from ai_platform.storage import ResourceStore
 
@@ -163,6 +164,13 @@ def make_store_with_template_mission(
     return store, workspace_root
 
 
+def condition_status(resource: dict, condition_type: str) -> str | None:
+    for condition in resource["status"].get("conditions", []):
+        if condition["type"] == condition_type:
+            return condition["status"]
+    return None
+
+
 def test_reconcile_creates_fleet_agent_artifact_and_events(tmp_path: Path) -> None:
     store, _workspace_root = make_store_with_mission(tmp_path)
 
@@ -194,9 +202,140 @@ def test_reconcile_creates_fleet_agent_artifact_and_events(tmp_path: Path) -> No
         "AgentCreated",
         "AgentStarted",
         "ModelInvoked",
-        "ArtifactWritten",
+        "ArtifactCreated",
         "MissionCompleted",
     }.issubset(event_types)
+
+
+def test_reconciliation_events_share_correlation_id_and_structured_fields(tmp_path: Path) -> None:
+    store, _workspace_root = make_store_with_template_mission(tmp_path)
+
+    asyncio.run(ControlPlane(store).reconcile_once())
+
+    mission = store.get(ResourceKind.MISSION, "build-auth", "demo")
+    assert mission is not None
+    correlation_id = mission["status"]["data"]["correlationId"]
+    events = store.list_events(namespace="demo", correlation_id=correlation_id, limit=None, ascending=True)
+
+    assert events
+    assert all(event["correlationId"] == correlation_id for event in events)
+    for event in events:
+        assert event["timestamp"]
+        assert event["workspace"] == "demo"
+        assert event["controller"]
+        assert event["action"]
+        assert event["reason"]
+        assert "correlationId" in event
+
+
+def test_conditions_are_updated_for_completed_resources(tmp_path: Path) -> None:
+    store, _workspace_root = make_store_with_template_mission(tmp_path)
+
+    asyncio.run(ControlPlane(store).reconcile_once())
+
+    mission = store.get(ResourceKind.MISSION, "build-auth", "demo")
+    fleet = store.get(ResourceKind.FLEET, "build-auth-fleet", "demo")
+    agent = store.get(ResourceKind.AGENT, "build-auth-fleet-planner", "demo")
+    assert mission is not None
+    assert fleet is not None
+    assert agent is not None
+
+    assert condition_status(mission, "Completed") == "True"
+    assert condition_status(mission, "Failed") == "False"
+    assert condition_status(fleet, "Completed") == "True"
+    assert condition_status(fleet, "Scheduled") == "True"
+    assert condition_status(agent, "Completed") == "True"
+    assert condition_status(agent, "Scheduled") == "True"
+
+
+def test_decision_events_record_template_capabilities_tools_and_models(tmp_path: Path) -> None:
+    store, _workspace_root = make_store_with_template_mission(tmp_path)
+
+    asyncio.run(ControlPlane(store).reconcile_once())
+
+    event_types = {event["type"] for event in store.list_events(namespace="demo", limit=200)}
+    assert {
+        "FleetTemplateSelected",
+        "CapabilityResolved",
+        "ToolResolved",
+        "ModelResolved",
+        "ReconciliationStarted",
+        "ReconciliationCompleted",
+    }.issubset(event_types)
+
+    model_events = [
+        event
+        for event in store.list_events(namespace="demo", limit=200)
+        if event["type"] == "ModelResolved" and event["resourceName"] == "build-auth-fleet-planner"
+    ]
+    assert model_events
+    assert model_events[0]["controller"] == "FleetController"
+    assert model_events[0]["reason"] == "CompatibleModelFound"
+    assert model_events[0]["payload"]["model"] == "stub-model"
+
+
+def test_trace_generation_reconstructs_execution_graph(tmp_path: Path) -> None:
+    store, _workspace_root = make_store_with_template_mission(tmp_path)
+
+    asyncio.run(ControlPlane(store).reconcile_once())
+
+    trace = build_trace(store, "build-auth", "demo")
+    assert trace is not None
+    assert trace["mission"]["status"] == "Completed"
+    assert trace["mission"]["correlationId"]
+    assert trace["fleets"][0]["template"] == "software-feature"
+    assert [agent["role"] for agent in trace["fleets"][0]["agents"]] == ["planner", "coder", "reviewer"]
+    assert trace["fleets"][0]["agents"][0]["capabilities"] == ["plan"]
+    assert trace["fleets"][0]["agents"][0]["model"] == "stub-model"
+    assert trace["fleets"][0]["agents"][1]["tools"] == ["git", "filesystem"]
+    assert len(trace["artifacts"]) == 3
+
+    formatted = format_trace(trace)
+    assert "Mission build-auth" in formatted
+    assert "Status: Completed" in formatted
+    assert "Planner Agent" in formatted
+    assert "Model stub-model" in formatted
+    assert "Tool filesystem" in formatted
+
+
+def test_timeline_orders_events_by_timestamp(tmp_path: Path) -> None:
+    store, _workspace_root = make_store_with_template_mission(tmp_path)
+
+    asyncio.run(ControlPlane(store).reconcile_once())
+
+    timeline = build_timeline(store, "build-auth", "demo")
+    assert timeline is not None
+    items = timeline["items"]
+    assert [item["id"] for item in items] == sorted(item["id"] for item in items)
+    assert any(item["message"] == "Mission created" for item in items)
+    assert any(item["message"] == "Fleet created" for item in items)
+    assert any(item["message"] == "Planner completed" for item in items)
+
+    formatted = format_timeline(timeline)
+    assert "Mission created" in formatted
+    assert "Mission completed" in formatted
+
+
+def test_describe_mission_includes_observability_sections(tmp_path: Path) -> None:
+    store, _workspace_root = make_store_with_template_mission(tmp_path)
+
+    asyncio.run(ControlPlane(store).reconcile_once())
+
+    description = describe_resource(store, ResourceKind.MISSION.value, "build-auth", "demo")
+    assert description is not None
+    assert description["desiredState"]["template"] == "software-feature"
+    assert description["observedState"]["phase"] == "Completed"
+    assert description["children"]["fleets"][0]["name"] == "build-auth-fleet"
+    assert {child["name"] for child in description["children"]["agents"]} == {
+        "build-auth-fleet-planner",
+        "build-auth-fleet-coder",
+        "build-auth-fleet-reviewer",
+    }
+    assert description["recentEvents"]
+    assert description["statusConditions"]
+    assert {"kind": "FleetTemplate", "name": "software-feature"} in description["referencedResources"]
+    assert len(description["artifactsProduced"]) == 3
+    assert any(item["ref"] == "knowledge://prd.md" for item in description["knowledgeUsed"])
 
 
 def test_reapplying_completed_mission_refreshes_children_and_reruns_agent(tmp_path: Path) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TypeVar
 
+from .events import CORRELATION_ID_ANNOTATION, CORRELATION_ID_STATUS_KEY, EventContext
 from .models import Message, build_model_client
 from .resources import (
     AgentResource,
@@ -17,6 +18,14 @@ from .resources import (
 from .storage import ResourceStore
 
 _ResourceT = TypeVar("_ResourceT")
+
+
+def agent_correlation_id(agent: AgentResource) -> str | None:
+    annotated = agent.metadata.annotations.get(CORRELATION_ID_ANNOTATION)
+    if annotated:
+        return annotated
+    value = agent.status.data.get(CORRELATION_ID_STATUS_KEY)
+    return value if isinstance(value, str) else None
 
 
 class AgentRuntime:
@@ -38,10 +47,11 @@ class AgentRuntime:
             "Running",
             "Agent execution started",
             event_type="AgentStarted",
+            event_context=self._context(agent, "StartAgent", "AgentExecutionStarted"),
         )
 
-        brief_text = self._load_brief(workspace, mission)
-        input_texts = self._load_inputs(workspace, mission)
+        brief_text = self._load_brief(workspace, mission, agent)
+        input_texts = self._load_inputs(workspace, mission, agent)
         model_config = self._model_for_agent(agent, mission, workspace)
         messages = self._build_messages(mission, brief_text, input_texts)
         client = build_model_client(model_config, store=self.store)
@@ -53,18 +63,20 @@ class AgentRuntime:
             namespace,
             f"Invoking {model_config.provider}:{model_config.model}",
             {"provider": model_config.provider, "model": model_config.model},
+            event_context=self._context(agent, "InvokeModel", "ModelInvoked"),
         )
         output = await client.generate(messages)
         artifact_path = self._write_artifact(workspace, mission, agent, output)
         artifact = self.store.record_artifact(namespace, mission.metadata.name, agent.metadata.name, artifact_path)
 
         self.store.emit_event(
-            "ArtifactWritten",
+            "ArtifactCreated",
             ResourceKind.AGENT,
             agent.metadata.name,
             namespace,
             f"Artifact written to {artifact_path}",
             artifact,
+            event_context=self._context(agent, "CreateArtifact", "ArtifactCreated"),
         )
         self.store.update_status(
             ResourceKind.AGENT,
@@ -74,8 +86,19 @@ class AgentRuntime:
             "Agent completed successfully",
             data={"artifactPath": str(artifact_path)},
             event_type="AgentCompleted",
+            event_context=self._context(agent, "CompleteAgent", "AgentCompleted"),
         )
         return {"artifactPath": str(artifact_path)}
+
+    def _context(self, agent: AgentResource, action: str, reason: str) -> EventContext:
+        return EventContext(
+            controller="AgentRuntime",
+            action=action,
+            reason=reason,
+            correlation_id=agent_correlation_id(agent),
+            workspace=agent.metadata.namespace,
+            mission=agent.spec.mission,
+        )
 
     def _load_resource(
         self,
@@ -92,19 +115,30 @@ class AgentRuntime:
             raise TypeError(f"expected {expected_type.__name__}, got {type(resource).__name__}")
         return resource
 
-    def _load_brief(self, workspace: WorkspaceResource, mission: MissionResource) -> str:
+    def _load_brief(self, workspace: WorkspaceResource, mission: MissionResource, agent: AgentResource) -> str:
         if mission.spec.brief is None:
             return ""
 
-        return self._load_knowledge_ref(workspace, mission.spec.brief)
+        return self._load_knowledge_ref(workspace, mission.spec.brief, agent, "brief")
 
-    def _load_inputs(self, workspace: WorkspaceResource, mission: MissionResource) -> dict[str, str]:
+    def _load_inputs(
+        self,
+        workspace: WorkspaceResource,
+        mission: MissionResource,
+        agent: AgentResource,
+    ) -> dict[str, str]:
         return {
-            name: self._load_knowledge_ref(workspace, knowledge_ref)
+            name: self._load_knowledge_ref(workspace, knowledge_ref, agent, f"input:{name}")
             for name, knowledge_ref in mission.spec.inputs.items()
         }
 
-    def _load_knowledge_ref(self, workspace: WorkspaceResource, knowledge_ref: KnowledgeRef) -> str:
+    def _load_knowledge_ref(
+        self,
+        workspace: WorkspaceResource,
+        knowledge_ref: KnowledgeRef,
+        agent: AgentResource,
+        usage: str,
+    ) -> str:
         workspace_root = workspace.spec.resolved_root(self.store.platform_root, workspace.metadata.name)
         knowledge_root = (workspace_root / "knowledge").resolve(strict=False)
         candidate = knowledge_root / Path(knowledge_ref.path)
@@ -117,7 +151,21 @@ class AgentRuntime:
             ) from exc
         if not resolved_candidate.is_file():
             raise FileNotFoundError(f"knowledge reference {knowledge_ref.ref} not found at {candidate}")
-        return resolved_candidate.read_text(encoding="utf-8")
+        text = resolved_candidate.read_text(encoding="utf-8")
+        self.store.emit_event(
+            "KnowledgeLoaded",
+            ResourceKind.AGENT,
+            agent.metadata.name,
+            agent.metadata.namespace,
+            f"Loaded {knowledge_ref.ref} for Agent {agent.metadata.name}",
+            {
+                "knowledgeRef": knowledge_ref.ref,
+                "path": str(resolved_candidate),
+                "usage": usage,
+            },
+            event_context=self._context(agent, "LoadKnowledge", "KnowledgeLoaded"),
+        )
+        return text
 
     def _model_for_agent(
         self,

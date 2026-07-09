@@ -11,6 +11,13 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.types import JSON
 
+from .events import (
+    CORRELATION_ID_ANNOTATION,
+    CORRELATION_ID_STATUS_KEY,
+    EventContext,
+    correlation_id_from_manifest,
+    new_correlation_id,
+)
 from .resources import (
     AgentResource,
     FleetResource,
@@ -102,9 +109,17 @@ class ResourceStore:
         finally:
             session.close()
 
-    def apply(self, manifest: JsonDict) -> JsonDict:
+    def apply(self, manifest: JsonDict, event_context: EventContext | None = None) -> JsonDict:
         resource = parse_resource(manifest)
         kind, namespace, name = resource_key(resource.kind, resource.metadata.name, resource.metadata.namespace)
+        correlation_id = event_context.correlation_id if event_context else None
+        if kind == ResourceKind.MISSION.value:
+            correlation_id = new_correlation_id()
+        elif correlation_id is None:
+            correlation_id = correlation_id_from_manifest(manifest)
+        if correlation_id:
+            resource.metadata.annotations[CORRELATION_ID_ANNOTATION] = correlation_id
+            resource.status.data[CORRELATION_ID_STATUS_KEY] = correlation_id
         with self.session() as session:
             record = session.scalar(
                 select(ResourceRecord).where(
@@ -117,6 +132,9 @@ class ResourceStore:
             if record:
                 resource.metadata.generation = record.generation + 1
                 resource.status = parse_resource(record.manifest).status
+                if correlation_id:
+                    resource.metadata.annotations[CORRELATION_ID_ANNOTATION] = correlation_id
+                    resource.status.data[CORRELATION_ID_STATUS_KEY] = correlation_id
                 resource.status.observedGeneration = min(
                     resource.status.observedGeneration,
                     resource.metadata.generation,
@@ -138,6 +156,16 @@ class ResourceStore:
                     manifest=dump_resource(resource),
                 )
                 session.add(record)
+            event_payload = self._structured_payload(
+                {"generation": resource.metadata.generation},
+                event_context,
+                default_controller="ResourceStore",
+                default_action=event_type,
+                default_reason="ResourceApplied",
+                namespace=namespace,
+                correlation_id=correlation_id,
+                mission=name if kind == ResourceKind.MISSION.value else None,
+            )
             session.add(
                 EventRecord(
                     type=event_type,
@@ -145,7 +173,7 @@ class ResourceStore:
                     namespace=namespace,
                     resource_name=name,
                     message=f"{kind} {self.display_name(namespace, name)} applied",
-                    payload={"generation": resource.metadata.generation},
+                    payload=event_payload,
                 )
             )
             return record.manifest
@@ -309,6 +337,7 @@ class ResourceStore:
         message: str | None = None,
         data: dict[str, Any] | None = None,
         event_type: str | None = None,
+        event_context: EventContext | None = None,
     ) -> JsonDict:
         kind_value, namespace_value, name_value = resource_key(kind, name, namespace)
         with self.session() as session:
@@ -322,19 +351,47 @@ class ResourceStore:
             if not record:
                 raise KeyError(f"{kind_value} {self.display_name(namespace_value, name_value)} not found")
             manifest = dict(record.manifest)
+            metadata = dict(manifest.get("metadata") or {})
+            annotations = dict(metadata.get("annotations") or {})
             status = dict(manifest.get("status") or {})
+            existing_data = dict(status.get("data") or {})
+            correlation_id = (
+                (event_context.correlation_id if event_context else None)
+                or annotations.get(CORRELATION_ID_ANNOTATION)
+                or existing_data.get(CORRELATION_ID_STATUS_KEY)
+            )
             status["phase"] = phase
             status["observedGeneration"] = record.generation
             if message is not None:
                 status["message"] = message
-            if data:
-                merged = dict(status.get("data") or {})
-                merged.update(data)
+            if data or correlation_id:
+                merged = dict(existing_data)
+                if correlation_id:
+                    merged[CORRELATION_ID_STATUS_KEY] = correlation_id
+                if data:
+                    merged.update(data)
                 status["data"] = merged
+            status["conditions"] = self._conditions_for_phase(
+                kind_value,
+                phase,
+                status.get("conditions") or [],
+                reason=event_context.reason if event_context else phase,
+                message=message,
+            )
             manifest["status"] = status
             record.manifest = manifest
             record.updated_at = utcnow()
             if event_type:
+                event_payload = self._structured_payload(
+                    {"phase": phase, "data": data or {}},
+                    event_context,
+                    default_controller="ResourceStore",
+                    default_action=event_type,
+                    default_reason=phase,
+                    namespace=namespace_value,
+                    correlation_id=correlation_id if isinstance(correlation_id, str) else None,
+                    mission=name_value if kind_value == ResourceKind.MISSION.value else None,
+                )
                 session.add(
                     EventRecord(
                         type=event_type,
@@ -342,7 +399,7 @@ class ResourceStore:
                         namespace=namespace_value,
                         resource_name=name_value,
                         message=message or f"{kind_value} {self.display_name(namespace_value, name_value)} is {phase}",
-                        payload={"phase": phase, "data": data or {}},
+                        payload=event_payload,
                     )
                 )
             return manifest
@@ -355,9 +412,24 @@ class ResourceStore:
         namespace: str | None = None,
         message: str = "",
         payload: dict[str, Any] | None = None,
+        event_context: EventContext | None = None,
+        controller: str | None = None,
+        action: str | None = None,
+        reason: str | None = None,
+        correlation_id: str | None = None,
     ) -> JsonDict:
         kind_value = ResourceKind(resource_kind).value if resource_kind else None
         namespace_value = namespace or ""
+        event_payload = self._structured_payload(
+            payload or {},
+            event_context,
+            default_controller=controller or "ResourceStore",
+            default_action=action or event_type,
+            default_reason=reason or event_type,
+            namespace=namespace_value,
+            correlation_id=correlation_id,
+            mission=(resource_name if kind_value == ResourceKind.MISSION.value else None),
+        )
         with self.session() as session:
             record = EventRecord(
                 type=event_type,
@@ -365,7 +437,7 @@ class ResourceStore:
                 namespace=namespace_value,
                 resource_name=resource_name,
                 message=message,
-                payload=payload or {},
+                payload=event_payload,
             )
             session.add(record)
             session.flush()
@@ -376,7 +448,9 @@ class ResourceStore:
         namespace: str | None = None,
         resource_kind: str | ResourceKind | None = None,
         resource_name: str | None = None,
-        limit: int = 100,
+        limit: int | None = 100,
+        correlation_id: str | None = None,
+        ascending: bool = False,
     ) -> JsonDictList:
         with self.session() as session:
             statement = select(EventRecord)
@@ -386,9 +460,19 @@ class ResourceStore:
                 statement = statement.where(EventRecord.resource_kind == ResourceKind(resource_kind).value)
             if resource_name is not None:
                 statement = statement.where(EventRecord.resource_name == resource_name)
-            statement = statement.order_by(EventRecord.created_at.desc(), EventRecord.id.desc()).limit(limit)
+            if ascending:
+                statement = statement.order_by(EventRecord.created_at.asc(), EventRecord.id.asc())
+            else:
+                statement = statement.order_by(EventRecord.created_at.desc(), EventRecord.id.desc())
+            if limit is not None and correlation_id is None:
+                statement = statement.limit(limit)
             records = session.scalars(statement).all()
-            return [self.event_to_dict(record) for record in records]
+            events = [self.event_to_dict(record) for record in records]
+            if correlation_id is not None:
+                events = [event for event in events if event["correlationId"] == correlation_id]
+                if limit is not None:
+                    events = events[:limit]
+            return events
 
     def record_artifact(self, namespace: str, mission: str, agent: str, path: Path) -> JsonDict:
         with self.session() as session:
@@ -426,17 +510,86 @@ class ResourceStore:
 
     @staticmethod
     def event_to_dict(record: EventRecord) -> JsonDict:
+        payload = record.payload or {}
+        timestamp = record.created_at.isoformat()
         return {
             "id": record.id,
             "type": record.type,
+            "timestamp": timestamp,
             "resourceKind": record.resource_kind,
             "namespace": record.namespace or None,
+            "workspace": payload.get("workspace") or record.namespace or None,
             "resourceName": record.resource_name,
+            "resource": record.resource_name,
+            "controller": payload.get("controller"),
+            "action": payload.get("action") or record.type,
+            "reason": payload.get("reason") or record.type,
+            "correlationId": payload.get("correlationId"),
             "message": record.message,
-            "payload": record.payload,
-            "createdAt": record.created_at.isoformat(),
+            "payload": payload,
+            "createdAt": timestamp,
         }
 
     @staticmethod
     def display_name(namespace: str | None, name: str) -> str:
         return f"{namespace}/{name}" if namespace else name
+
+    @staticmethod
+    def _structured_payload(
+        payload: dict[str, Any],
+        event_context: EventContext | None,
+        *,
+        default_controller: str,
+        default_action: str,
+        default_reason: str,
+        namespace: str | None,
+        correlation_id: str | None,
+        mission: str | None = None,
+    ) -> dict[str, Any]:
+        result = dict(payload)
+        result["controller"] = event_context.controller if event_context else default_controller
+        result["action"] = event_context.action if event_context else default_action
+        result["reason"] = event_context.reason if event_context else default_reason
+        result["correlationId"] = (
+            event_context.correlation_id if event_context and event_context.correlation_id else correlation_id
+        )
+        result["workspace"] = (event_context.workspace if event_context else None) or namespace or None
+        result["mission"] = (event_context.mission if event_context else None) or mission
+        return result
+
+    @staticmethod
+    def _conditions_for_phase(
+        kind: str,
+        phase: str,
+        existing_conditions: JsonDictList,
+        *,
+        reason: str,
+        message: str | None,
+    ) -> JsonDictList:
+        condition_values: dict[str, bool] = {
+            "Reconciling": phase == "Reconciling",
+            "Running": phase in {"Reconciling", "Running"},
+            "Completed": phase in {"Succeeded", "Completed"},
+            "Failed": phase == "Failed",
+        }
+        if kind in {ResourceKind.AGENT.value, ResourceKind.FLEET.value}:
+            condition_values["Scheduled"] = phase in {"Pending", "Running", "Succeeded", "Failed"}
+
+        by_type = {str(condition.get("type")): dict(condition) for condition in existing_conditions}
+        for condition_type, is_true in condition_values.items():
+            by_type[condition_type] = {
+                "type": condition_type,
+                "status": "True" if is_true else "False",
+                "reason": reason,
+                "message": message,
+            }
+        ordered_types = [
+            "Scheduled",
+            "Reconciling",
+            "Running",
+            "Completed",
+            "Failed",
+        ]
+        ordered = [by_type.pop(condition_type) for condition_type in ordered_types if condition_type in by_type]
+        ordered.extend(by_type.values())
+        return ordered

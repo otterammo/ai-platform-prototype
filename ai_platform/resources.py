@@ -15,6 +15,8 @@ class ResourceKind(StrEnum):
     MISSION = "Mission"
     FLEET = "Fleet"
     AGENT = "Agent"
+    POLICY = "Policy"
+    APPROVAL = "Approval"
     MODEL = "Model"
     TOOL = "Tool"
     CAPABILITY = "Capability"
@@ -24,6 +26,8 @@ class ResourceKind(StrEnum):
 
 CLUSTER_SCOPED_KINDS = {
     ResourceKind.WORKSPACE.value,
+    ResourceKind.POLICY.value,
+    ResourceKind.APPROVAL.value,
     ResourceKind.MODEL.value,
     ResourceKind.TOOL.value,
     ResourceKind.CAPABILITY.value,
@@ -174,6 +178,43 @@ class AgentSpec(BaseModel):
     pilot: PilotConfig | None = None
 
 
+class PolicyMatch(BaseModel):
+    tool: str | None = None
+    operation: str | None = None
+
+
+class PolicyRule(BaseModel):
+    match: PolicyMatch = Field(default_factory=PolicyMatch)
+    allow: bool | None = None
+    requiresApproval: bool | None = None
+    deny: bool | None = None
+
+    @model_validator(mode="after")
+    def require_single_effect(self) -> PolicyRule:
+        effects = [
+            self.allow is True,
+            self.requiresApproval is True,
+            self.deny is True,
+        ]
+        if sum(effects) != 1:
+            raise ValueError("Policy rule must set exactly one of allow, requiresApproval, or deny")
+        return self
+
+
+class PolicySpec(BaseModel):
+    rules: list[PolicyRule] = Field(default_factory=list)
+
+
+class ApprovalSpec(BaseModel):
+    workspace: str
+    mission: str
+    agent: str
+    action: dict[str, Any]
+    actionHash: str
+    policy: str | None = None
+    ruleIndex: int | None = None
+
+
 class ModelSpec(BaseModel):
     config: ModelConfig = Field(default_factory=ModelConfig)
 
@@ -303,6 +344,29 @@ class AgentResource(BaseResource):
         return self
 
 
+class PolicyResource(BaseResource):
+    kind: Literal[ResourceKind.POLICY] = ResourceKind.POLICY
+    spec: PolicySpec
+
+    @model_validator(mode="after")
+    def clear_namespace(self) -> PolicyResource:
+        self.metadata.namespace = None
+        return self
+
+
+class ApprovalResource(BaseResource):
+    kind: Literal[ResourceKind.APPROVAL] = ResourceKind.APPROVAL
+    spec: ApprovalSpec
+
+    @model_validator(mode="after")
+    def clear_namespace_and_validate_phase(self) -> ApprovalResource:
+        self.metadata.namespace = None
+        valid_phases = {"Pending", "Approved", "Rejected"}
+        if self.status.phase not in valid_phases:
+            raise ValueError(f"Approval status.phase must be one of: {', '.join(sorted(valid_phases))}")
+        return self
+
+
 class KnowledgeResource(BaseResource):
     kind: Literal[ResourceKind.KNOWLEDGE] = ResourceKind.KNOWLEDGE
     spec: KnowledgeSpec
@@ -320,6 +384,8 @@ Resource = Annotated[
         MissionResource,
         FleetResource,
         AgentResource,
+        PolicyResource,
+        ApprovalResource,
         ModelResource,
         ToolResource,
         CapabilityResource,
@@ -334,6 +400,8 @@ AnyResource = (
     | MissionResource
     | FleetResource
     | AgentResource
+    | PolicyResource
+    | ApprovalResource
     | ModelResource
     | ToolResource
     | CapabilityResource
@@ -347,6 +415,8 @@ RESOURCE_BY_KIND: dict[str, type[AnyResource]] = {
     ResourceKind.MISSION.value: MissionResource,
     ResourceKind.FLEET.value: FleetResource,
     ResourceKind.AGENT.value: AgentResource,
+    ResourceKind.POLICY.value: PolicyResource,
+    ResourceKind.APPROVAL.value: ApprovalResource,
     ResourceKind.MODEL.value: ModelResource,
     ResourceKind.TOOL.value: ToolResource,
     ResourceKind.CAPABILITY.value: CapabilityResource,

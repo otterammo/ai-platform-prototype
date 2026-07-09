@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .events import CORRELATION_ID_ANNOTATION, CORRELATION_ID_STATUS_KEY, EventContext
+from .policy import ApprovalRequired
 from .resources import (
     AgentResource,
     CapabilityResource,
@@ -540,6 +541,9 @@ class AgentController:
             )
             try:
                 await self.runtime.run(agent)
+            except ApprovalRequired:
+                changed += 1
+                continue
             except Exception as exc:
                 error = str(exc)
                 self.store.update_status(

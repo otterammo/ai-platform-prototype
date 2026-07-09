@@ -5,6 +5,7 @@ from typing import TypeVar
 
 from .events import CORRELATION_ID_ANNOTATION, CORRELATION_ID_STATUS_KEY, EventContext
 from .models import Message, build_model_client
+from .policy import PolicyEngine, RuntimeAction
 from .resources import (
     AgentResource,
     KnowledgeRef,
@@ -31,6 +32,7 @@ def agent_correlation_id(agent: AgentResource) -> str | None:
 class AgentRuntime:
     def __init__(self, store: ResourceStore) -> None:
         self.store = store
+        self.policy_engine = PolicyEngine(store)
 
     async def run(self, agent: AgentResource) -> dict[str, str]:
         namespace = agent.metadata.namespace
@@ -50,12 +52,19 @@ class AgentRuntime:
             event_context=self._context(agent, "StartAgent", "AgentExecutionStarted"),
         )
 
+        self._authorize_declared_tools(agent)
         brief_text = self._load_brief(workspace, mission, agent)
         input_texts = self._load_inputs(workspace, mission, agent)
         model_config = self._model_for_agent(agent, mission, workspace)
         messages = self._build_messages(mission, brief_text, input_texts)
         client = build_model_client(model_config, store=self.store)
 
+        self._authorize(
+            agent,
+            "model",
+            "invoke",
+            {"provider": model_config.provider, "model": model_config.model},
+        )
         self.store.emit_event(
             "ModelInvoked",
             ResourceKind.AGENT,
@@ -89,6 +98,29 @@ class AgentRuntime:
             event_context=self._context(agent, "CompleteAgent", "AgentCompleted"),
         )
         return {"artifactPath": str(artifact_path)}
+
+    def _authorize_declared_tools(self, agent: AgentResource) -> None:
+        for tool_name in agent.spec.tools:
+            self._authorize(agent, tool_name, "use", {"source": "agent.spec.tools"})
+
+    def _authorize(
+        self,
+        agent: AgentResource,
+        tool: str,
+        operation: str,
+        details: dict[str, object],
+    ) -> None:
+        self.policy_engine.authorize(
+            RuntimeAction(
+                tool=tool,
+                operation=operation,
+                details=details,
+                workspace=agent.metadata.namespace,
+                mission=agent.spec.mission,
+                agent=agent.metadata.name,
+                correlation_id=agent_correlation_id(agent),
+            )
+        )
 
     def _context(self, agent: AgentResource, action: str, reason: str) -> EventContext:
         return EventContext(
@@ -139,6 +171,7 @@ class AgentRuntime:
         agent: AgentResource,
         usage: str,
     ) -> str:
+        self._authorize(agent, "knowledge", "read", {"knowledgeRef": knowledge_ref.ref, "usage": usage})
         workspace_root = workspace.spec.resolved_root(self.store.platform_root, workspace.metadata.name)
         knowledge_root = (workspace_root / "knowledge").resolve(strict=False)
         candidate = knowledge_root / Path(knowledge_ref.path)
@@ -215,9 +248,18 @@ class AgentRuntime:
         agent: AgentResource,
         content: str,
     ) -> Path:
-        workspace_root = workspace.spec.resolved_root(self.store.platform_root, workspace.metadata.name)
-        artifact_dir = workspace_root / "artifacts" / mission.metadata.name
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        artifact_path = artifact_dir / f"{agent.metadata.name}.md"
+        artifact_path = self._artifact_path(workspace, mission, agent)
+        self._authorize(agent, "filesystem", "write", {"path": str(artifact_path), "artifact": True})
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
         artifact_path.write_text(content, encoding="utf-8")
         return artifact_path
+
+    def _artifact_path(
+        self,
+        workspace: WorkspaceResource,
+        mission: MissionResource,
+        agent: AgentResource,
+    ) -> Path:
+        workspace_root = workspace.spec.resolved_root(self.store.platform_root, workspace.metadata.name)
+        artifact_dir = workspace_root / "artifacts" / mission.metadata.name
+        return artifact_dir / f"{agent.metadata.name}.md"

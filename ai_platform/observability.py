@@ -15,6 +15,14 @@ DECISION_EVENT_TYPES = {
     "CapabilityResolved",
     "ToolResolved",
     "ModelResolved",
+    "PolicyEvaluated",
+    "PolicyAllowed",
+    "PolicyDenied",
+    "ApprovalRequested",
+    "ApprovalGranted",
+    "ApprovalRejected",
+    "AgentPaused",
+    "AgentResumed",
     "ReconciliationStarted",
     "ReconciliationCompleted",
 }
@@ -192,7 +200,7 @@ def _agent_trace(agent: AgentResource, artifacts: JsonDictList, events: JsonDict
         "model": agent.spec.pilot.modelRef if agent.spec.pilot and agent.spec.pilot.modelRef else _model_name(agent),
         "conditions": agent.status.model_dump(mode="json", exclude_none=True).get("conditions", []),
         "artifacts": [artifact for artifact in artifacts if artifact["agent"] == agent.metadata.name],
-        "events": _resource_events(events, ResourceKind.AGENT.value, agent.metadata.name),
+        "events": _agent_events(events, agent.metadata.name),
     }
 
 
@@ -206,6 +214,23 @@ def _resource_events(events: JsonDictList, kind: str, name: str) -> JsonDictList
     return [event for event in events if event["resourceKind"] == kind and event["resourceName"] == name]
 
 
+def _agent_events(events: JsonDictList, agent_name: str) -> JsonDictList:
+    return [
+        event
+        for event in events
+        if (event["resourceKind"] == ResourceKind.AGENT.value and event["resourceName"] == agent_name)
+        or _runtime_action_agent(event) == agent_name
+    ]
+
+
+def _runtime_action_agent(event: JsonDict) -> str | None:
+    payload = event.get("payload") or {}
+    runtime_action = payload.get("runtimeAction")
+    if isinstance(runtime_action, dict) and isinstance(runtime_action.get("agent"), str):
+        return runtime_action["agent"]
+    return None
+
+
 def _agent_label(agent: JsonDict) -> str:
     role = str(agent["role"]).replace("-", " ").title()
     return f"{role} Agent"
@@ -217,7 +242,36 @@ def _agent_detail_lines(agent: JsonDict) -> list[str]:
         lines.append(f"Model {agent['model']}")
     lines.append("Tools")
     lines.extend(f"Tool {tool}" for tool in agent["tools"])
+    lines.extend(_policy_detail_lines(agent["events"]))
     lines.append(_display_status(agent["status"]))
+    return lines
+
+
+def _policy_detail_lines(events: JsonDictList) -> list[str]:
+    lines: list[str] = []
+    for event in events:
+        payload = event["payload"]
+        event_type = event["type"]
+        runtime_action = payload.get("runtimeAction") or {}
+        tool = runtime_action.get("tool")
+        operation = runtime_action.get("operation")
+        policy = payload.get("policy")
+        approval_id = payload.get("approvalId")
+        if event_type == "PolicyEvaluated" and policy:
+            lines.append(f"Requested {tool} {operation}")
+            lines.append(f"Policy: {policy}")
+        elif event_type == "PolicyDenied":
+            lines.append("Policy denied")
+        elif event_type == "ApprovalRequested":
+            lines.append(f"Approval required {approval_id}")
+        elif event_type == "ApprovalGranted":
+            lines.append(f"Approval granted {approval_id}")
+        elif event_type == "ApprovalRejected":
+            lines.append(f"Approval rejected {approval_id}")
+        elif event_type == "AgentPaused":
+            lines.append("Agent paused")
+        elif event_type == "AgentResumed":
+            lines.append("Agent resumed")
     return lines
 
 
@@ -255,9 +309,28 @@ def _timeline_message(event: JsonDict) -> str:
         "ArtifactCreated": "Artifact created",
         "KnowledgeLoaded": f"Knowledge loaded {payload.get('knowledgeRef')}",
         "ModelInvoked": f"Model invoked {payload.get('model')}",
+        "PolicyEvaluated": f"Policy evaluated {_runtime_action_label(payload)}",
+        "PolicyAllowed": f"Policy allowed {_runtime_action_label(payload)}",
+        "PolicyDenied": f"Policy denied {_runtime_action_label(payload)}",
+        "ApprovalRequested": f"Approval requested {payload.get('approvalId')}",
+        "ApprovalGranted": f"Approval granted {payload.get('approvalId')}",
+        "ApprovalRejected": f"Approval rejected {payload.get('approvalId')}",
+        "AgentPaused": f"{_short_agent_name(resource_name)} paused for approval",
+        "AgentResumed": f"{_short_agent_name(resource_name)} resumed",
+        "FleetWaiting": "Fleet waiting for approval",
+        "MissionWaiting": "Mission waiting for approval",
     }
     fallback = event.get("message") or event_type
     return labels.get(event_type, str(fallback))
+
+
+def _runtime_action_label(payload: JsonDict) -> str:
+    runtime_action = payload.get("runtimeAction") or {}
+    tool = runtime_action.get("tool")
+    operation = runtime_action.get("operation")
+    if tool and operation:
+        return f"{tool}/{operation}"
+    return "action"
 
 
 def _short_agent_name(resource_name: str) -> str:

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator, TypeAlias
+from typing import Any, TypeAlias
 
 from sqlalchemy import DateTime, Integer, String, UniqueConstraint, create_engine, select
 from sqlalchemy import delete as sql_delete
@@ -338,6 +339,7 @@ class ResourceStore:
         data: dict[str, Any] | None = None,
         event_type: str | None = None,
         event_context: EventContext | None = None,
+        clear_data_keys: Sequence[str] | None = None,
     ) -> JsonDict:
         kind_value, namespace_value, name_value = resource_key(kind, name, namespace)
         with self.session() as session:
@@ -364,8 +366,10 @@ class ResourceStore:
             status["observedGeneration"] = record.generation
             if message is not None:
                 status["message"] = message
-            if data or correlation_id:
+            if data or correlation_id or clear_data_keys:
                 merged = dict(existing_data)
+                for key in clear_data_keys or []:
+                    merged.pop(key, None)
                 if correlation_id:
                     merged[CORRELATION_ID_STATUS_KEY] = correlation_id
                 if data:
@@ -382,8 +386,11 @@ class ResourceStore:
             record.manifest = manifest
             record.updated_at = utcnow()
             if event_type:
+                status_event_payload = {"phase": phase, "data": data or {}}
+                if data:
+                    status_event_payload.update(data)
                 event_payload = self._structured_payload(
-                    {"phase": phase, "data": data or {}},
+                    status_event_payload,
                     event_context,
                     default_controller="ResourceStore",
                     default_action=event_type,
@@ -567,6 +574,7 @@ class ResourceStore:
         message: str | None,
     ) -> JsonDictList:
         condition_values: dict[str, bool] = {
+            "WaitingForApproval": phase == "Waiting",
             "Reconciling": phase == "Reconciling",
             "Running": phase in {"Reconciling", "Running"},
             "Completed": phase in {"Succeeded", "Completed"},
@@ -585,6 +593,7 @@ class ResourceStore:
             }
         ordered_types = [
             "Scheduled",
+            "WaitingForApproval",
             "Reconciling",
             "Running",
             "Completed",

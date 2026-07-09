@@ -332,12 +332,13 @@ class KnowledgeIndexSpec(BaseModel):
 
 class ContextSpec(BaseModel):
     mission: str
+    agentRun: str | None = None
     query: str
     knowledgeIndex: str = "default"
 
-    @field_validator("mission", "knowledgeIndex")
+    @field_validator("mission", "agentRun", "knowledgeIndex")
     @classmethod
-    def validate_names(cls, value: str) -> str:
+    def validate_names(cls, value: str | None) -> str | None:
         return Metadata.validate_dnsish_name(value) or value
 
 

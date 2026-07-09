@@ -62,12 +62,12 @@ def owner_reference(kind: ResourceKind, name: str) -> list[dict[str, Any]]:
     return [{"kind": kind.value, "name": name, "controller": True}]
 
 
-def context_name_for_mission(mission_name: str) -> str:
-    return f"{mission_name}-context"
-
-
 def run_name_for_agent(agent: AgentResource) -> str:
     return f"{agent.metadata.name}-run-{agent.metadata.generation}"
+
+
+def context_name_for_agent_run(run_name: str) -> str:
+    return f"{run_name}-context"
 
 
 class MissionController:
@@ -641,8 +641,8 @@ class AgentController:
             )
             try:
                 mission = self._mission(agent)
-                context_name = self._ensure_context(mission)
-                run = self._ensure_agent_run(agent, mission, context_name)
+                run = self._ensure_agent_run(agent, mission)
+                self._ensure_context(agent, mission, run)
                 if self._aggregate_agent(agent, run):
                     changed += 1
             except Exception as exc:
@@ -687,9 +687,9 @@ class AgentController:
             raise TypeError(f"expected MissionResource, got {type(mission).__name__}")
         return mission
 
-    def _ensure_context(self, mission: MissionResource) -> str:
+    def _ensure_context(self, agent: AgentResource, mission: MissionResource, run: AgentRunResource) -> str:
         namespace = mission.metadata.namespace
-        context_name = context_name_for_mission(mission.metadata.name)
+        context_name = run.spec.contextRef.name
         self._ensure_knowledge_index(mission)
         manifest = {
             "apiVersion": "ai.platform/v1",
@@ -697,10 +697,20 @@ class AgentController:
             "metadata": {
                 "name": context_name,
                 "namespace": namespace,
-                "ownerReferences": owner_reference(ResourceKind.MISSION, mission.metadata.name),
+                "labels": {
+                    "agent": agent.metadata.name,
+                    "agentRun": run.metadata.name,
+                    "mission": mission.metadata.name,
+                    "fleet": agent.spec.fleet,
+                },
+                "annotations": {
+                    CORRELATION_ID_ANNOTATION: resource_correlation_id(agent) or "",
+                },
+                "ownerReferences": owner_reference(ResourceKind.AGENT_RUN, run.metadata.name),
             },
             "spec": {
                 "mission": mission.metadata.name,
+                "agentRun": run.metadata.name,
                 "query": mission_query(mission),
                 "knowledgeIndex": DEFAULT_INDEX_NAME,
             },
@@ -757,9 +767,10 @@ class AgentController:
                 field_manager=CONTROLLER_FIELD_MANAGER,
             )
 
-    def _ensure_agent_run(self, agent: AgentResource, mission: MissionResource, context_name: str) -> AgentRunResource:
+    def _ensure_agent_run(self, agent: AgentResource, mission: MissionResource) -> AgentRunResource:
         namespace = agent.metadata.namespace
         run_name = run_name_for_agent(agent)
+        context_name = context_name_for_agent_run(run_name)
         existing_manifest = self.store.get(ResourceKind.AGENT_RUN, run_name, namespace)
         run: AgentRunResource | None = None
         if existing_manifest:
@@ -913,6 +924,11 @@ class ContextController:
                 self._fail_context(context, f"Mission {context.spec.mission} could not be loaded")
                 changed += 1
                 continue
+            agent_run = self._agent_run_for_context(context)
+            if agent_run is None:
+                self._fail_context(context, "Context must be owned by an AgentRun")
+                changed += 1
+                continue
             try:
                 builder.build_for_mission(
                     mission,
@@ -920,6 +936,10 @@ class ContextController:
                     correlation_id=resource_correlation_id(mission),
                     ensure_indexed=False,
                     context_name=context.metadata.name,
+                    agent_run=agent_run,
+                    owner_references=[
+                        owner.model_dump(mode="json", exclude_none=True) for owner in context.metadata.ownerReferences
+                    ],
                 )
             except Exception as exc:
                 self._fail_context(context, str(exc))
@@ -927,6 +947,15 @@ class ContextController:
                 continue
             changed += 1
         return ReconcileResult("context", changed)
+
+    @staticmethod
+    def _agent_run_for_context(context: ContextResource) -> str | None:
+        if context.spec.agentRun:
+            return context.spec.agentRun
+        for owner in context.metadata.ownerReferences:
+            if owner.kind == ResourceKind.AGENT_RUN:
+                return owner.name
+        return None
 
     def _fail_context(self, context: ContextResource, error: str) -> None:
         self.store.update_status(

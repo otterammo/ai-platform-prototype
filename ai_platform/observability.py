@@ -578,6 +578,8 @@ def _referenced_resources(resource: JsonDict, kind: str) -> JsonDictList:
             references.append({"kind": "Model", "name": spec["model"].get("model"), "source": "mission"})
     elif kind == ResourceKind.CONTEXT.value:
         references.append({"kind": "Mission", "name": spec.get("mission")})
+        if spec.get("agentRun"):
+            references.append({"kind": "AgentRun", "name": spec.get("agentRun")})
         references.append({"kind": "KnowledgeIndex", "name": spec.get("knowledgeIndex")})
     elif kind == ResourceKind.KNOWLEDGE_INDEX.value:
         for source in spec.get("sources") or []:

@@ -46,6 +46,48 @@ def apply_index(store: ResourceStore, sources: list[str]) -> None:
     )
 
 
+def apply_execution_parent_chain(store: ResourceStore) -> str:
+    store.apply(
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Fleet",
+            "metadata": {"name": "build-auth-fleet", "namespace": "demo"},
+            "spec": {
+                "workspace": "demo",
+                "mission": "build-auth",
+                "strategy": "single-agent",
+                "agentCount": 1,
+            },
+        }
+    )
+    store.apply(
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Agent",
+            "metadata": {"name": "build-auth-agent", "namespace": "demo"},
+            "spec": {
+                "workspace": "demo",
+                "mission": "build-auth",
+                "fleet": "build-auth-fleet",
+            },
+        }
+    )
+    run_name = "build-auth-agent-run-1"
+    store.apply(
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "AgentRun",
+            "metadata": {"name": run_name, "namespace": "demo"},
+            "spec": {
+                "agentRef": {"name": "build-auth-agent"},
+                "missionRef": {"name": "build-auth"},
+                "contextRef": {"name": f"{run_name}-context"},
+            },
+        }
+    )
+    return run_name
+
+
 def test_markdown_chunker_splits_sections_deterministically(tmp_path: Path) -> None:
     document = KnowledgeDocument(
         ref="knowledge://prd.md",
@@ -127,8 +169,13 @@ def test_context_builder_deduplicates_chunks_and_records_provenance(tmp_path: Pa
         }
     )
     mission = parse_resource(mission_manifest)
+    run_name = apply_execution_parent_chain(store)
 
-    result = ContextBuilder(store).build_for_mission(mission)
+    result = ContextBuilder(store).build_for_mission(
+        mission,
+        context_name=f"{run_name}-context",
+        agent_run=run_name,
+    )
 
     assert len(result.chunks) == 2
     assert [chunk["document"] for chunk in result.chunks] == ["prd.md", "architecture.md"]
@@ -143,8 +190,10 @@ def test_context_builder_deduplicates_chunks_and_records_provenance(tmp_path: Pa
     ]
     assert "Context\nSources" in result.rendered_context
     assert "Source: knowledge://prd.md" in result.rendered_context
-    context = store.get(ResourceKind.CONTEXT, "build-auth", "demo")
+    context = store.get(ResourceKind.CONTEXT, f"{run_name}-context", "demo")
     assert context is not None
+    assert context["metadata"]["ownerReferences"] == [{"kind": "AgentRun", "name": run_name, "controller": True}]
+    assert context["spec"]["agentRun"] == run_name
     assert context["status"]["phase"] == "Ready"
     assert context["status"]["data"]["chunkCount"] == 2
 

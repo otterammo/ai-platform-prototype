@@ -118,9 +118,17 @@ def test_api_knowledge_search_indexes_and_context_endpoint_returns_runtime_conte
         reconcile_response = client.post("/reconcile")
         assert reconcile_response.status_code == 200
 
+        runs_response = client.get("/agentruns", params={"namespace": "demo"})
+        assert runs_response.status_code == 200
+        assert runs_response.json()["items"][0]["kind"] == "AgentRun"
+
         context_response = client.get("/contexts/build-auth", params={"namespace": "demo"})
         assert context_response.status_code == 200
         context = context_response.json()
         assert context["kind"] == "Context"
         assert context["status"]["data"]["chunkCount"] == 1
         assert "Source: knowledge://prd.md" in context["status"]["data"]["renderedContext"]
+
+        artifact_response = client.get("/artifact-resources", params={"namespace": "demo"})
+        assert artifact_response.status_code == 200
+        assert artifact_response.json()["items"][0]["kind"] == "Artifact"

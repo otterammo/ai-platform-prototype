@@ -11,10 +11,13 @@ API_VERSION: Literal["ai.platform/v1"] = "ai.platform/v1"
 
 
 class ResourceKind(StrEnum):
+    PLATFORM = "Platform"
     WORKSPACE = "Workspace"
     MISSION = "Mission"
     FLEET = "Fleet"
     AGENT = "Agent"
+    AGENT_RUN = "AgentRun"
+    ARTIFACT = "Artifact"
     POLICY = "Policy"
     APPROVAL = "Approval"
     MODEL = "Model"
@@ -27,6 +30,7 @@ class ResourceKind(StrEnum):
 
 
 CLUSTER_SCOPED_KINDS = {
+    ResourceKind.PLATFORM.value,
     ResourceKind.WORKSPACE.value,
     ResourceKind.POLICY.value,
     ResourceKind.APPROVAL.value,
@@ -35,6 +39,17 @@ CLUSTER_SCOPED_KINDS = {
     ResourceKind.CAPABILITY.value,
     ResourceKind.FLEET_TEMPLATE.value,
 }
+
+
+class OwnerReference(BaseModel):
+    kind: ResourceKind
+    name: str
+    controller: bool = False
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return Metadata.validate_dnsish_name(value) or value
 
 
 class Condition(BaseModel):
@@ -53,11 +68,28 @@ class Status(BaseModel):
 
 
 class Metadata(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     namespace: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     annotations: dict[str, str] = Field(default_factory=dict)
+    ownerReferences: list[OwnerReference] = Field(default_factory=list)
     generation: int = 1
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_workspace_alias(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        workspace = data.pop("workspace", None)
+        namespace = data.get("namespace")
+        if workspace is not None and namespace is not None and workspace != namespace:
+            raise ValueError("metadata.workspace must match metadata.namespace when both are provided")
+        if workspace is not None:
+            data["namespace"] = workspace
+        return data
 
     @field_validator("name", "namespace")
     @classmethod
@@ -111,6 +143,19 @@ class ModelConfig(BaseModel):
 class PilotConfig(BaseModel):
     strategy: str = "direct"
     modelRef: str | None = None
+
+
+class ResourceRef(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return Metadata.validate_dnsish_name(value) or value
+
+
+class PlatformSpec(BaseModel):
+    mode: Literal["local"] = "local"
 
 
 class WorkspaceSpec(BaseModel):
@@ -180,6 +225,28 @@ class AgentSpec(BaseModel):
     pilot: PilotConfig | None = None
 
 
+class AgentRunSpec(BaseModel):
+    agentRef: ResourceRef
+    missionRef: ResourceRef
+    contextRef: ResourceRef
+
+
+class ProducedByRef(BaseModel):
+    kind: Literal[ResourceKind.AGENT_RUN] = ResourceKind.AGENT_RUN
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return Metadata.validate_dnsish_name(value) or value
+
+
+class ArtifactSpec(BaseModel):
+    type: str = "markdown"
+    path: str
+    producedBy: ProducedByRef
+
+
 class PolicyMatch(BaseModel):
     tool: str | None = None
     operation: str | None = None
@@ -211,6 +278,7 @@ class ApprovalSpec(BaseModel):
     workspace: str
     mission: str
     agent: str
+    agentRun: str | None = None
     action: dict[str, Any]
     actionHash: str
     policy: str | None = None
@@ -281,6 +349,16 @@ class BaseResource(BaseModel):
     metadata: Metadata
     spec: BaseModel
     status: Status = Field(default_factory=Status)
+
+
+class PlatformResource(BaseResource):
+    kind: Literal[ResourceKind.PLATFORM] = ResourceKind.PLATFORM
+    spec: PlatformSpec = Field(default_factory=PlatformSpec)
+
+    @model_validator(mode="after")
+    def clear_namespace(self) -> PlatformResource:
+        self.metadata.namespace = None
+        return self
 
 
 class WorkspaceResource(BaseResource):
@@ -370,6 +448,28 @@ class AgentResource(BaseResource):
         return self
 
 
+class AgentRunResource(BaseResource):
+    kind: Literal[ResourceKind.AGENT_RUN] = ResourceKind.AGENT_RUN
+    spec: AgentRunSpec
+
+    @model_validator(mode="after")
+    def require_namespace(self) -> AgentRunResource:
+        if not self.metadata.namespace:
+            raise ValueError("AgentRun metadata.namespace must name a Workspace")
+        return self
+
+
+class ArtifactResource(BaseResource):
+    kind: Literal[ResourceKind.ARTIFACT] = ResourceKind.ARTIFACT
+    spec: ArtifactSpec
+
+    @model_validator(mode="after")
+    def require_namespace(self) -> ArtifactResource:
+        if not self.metadata.namespace:
+            raise ValueError("Artifact metadata.namespace must name a Workspace")
+        return self
+
+
 class PolicyResource(BaseResource):
     kind: Literal[ResourceKind.POLICY] = ResourceKind.POLICY
     spec: PolicySpec
@@ -428,10 +528,13 @@ class ContextResource(BaseResource):
 
 Resource = Annotated[
     Union[
+        PlatformResource,
         WorkspaceResource,
         MissionResource,
         FleetResource,
         AgentResource,
+        AgentRunResource,
+        ArtifactResource,
         PolicyResource,
         ApprovalResource,
         ModelResource,
@@ -446,10 +549,13 @@ Resource = Annotated[
 ]
 
 AnyResource = (
-    WorkspaceResource
+    PlatformResource
+    | WorkspaceResource
     | MissionResource
     | FleetResource
     | AgentResource
+    | AgentRunResource
+    | ArtifactResource
     | PolicyResource
     | ApprovalResource
     | ModelResource
@@ -463,10 +569,13 @@ AnyResource = (
 
 
 RESOURCE_BY_KIND: dict[str, type[AnyResource]] = {
+    ResourceKind.PLATFORM.value: PlatformResource,
     ResourceKind.WORKSPACE.value: WorkspaceResource,
     ResourceKind.MISSION.value: MissionResource,
     ResourceKind.FLEET.value: FleetResource,
     ResourceKind.AGENT.value: AgentResource,
+    ResourceKind.AGENT_RUN.value: AgentRunResource,
+    ResourceKind.ARTIFACT.value: ArtifactResource,
     ResourceKind.POLICY.value: PolicyResource,
     ResourceKind.APPROVAL.value: ApprovalResource,
     ResourceKind.MODEL.value: ModelResource,

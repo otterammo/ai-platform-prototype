@@ -121,12 +121,18 @@ def create_app(
     async def get_context(mission: str, namespace: str) -> dict[str, Any]:
         context = store.get(ResourceKind.CONTEXT, mission, namespace)
         if context is None:
+            context = store.get(ResourceKind.CONTEXT, f"{mission}-context", namespace)
+        if context is None:
             raise HTTPException(status_code=404, detail="context not found")
         return context
 
     @app.get("/approvals")
     async def list_approvals() -> dict[str, list[dict[str, Any]]]:
         return {"items": store.list(ResourceKind.APPROVAL)}
+
+    @app.get("/agentruns")
+    async def list_agent_runs(namespace: str | None = None) -> dict[str, list[dict[str, Any]]]:
+        return {"items": store.list(ResourceKind.AGENT_RUN, namespace)}
 
     @app.get("/approvals/{approval_id}")
     async def get_approval(approval_id: str) -> dict[str, Any]:
@@ -185,6 +191,10 @@ def create_app(
         mission: str | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         return {"items": store.list_artifacts(namespace, mission)}
+
+    @app.get("/artifact-resources")
+    async def list_artifact_resources(namespace: str | None = None) -> dict[str, list[dict[str, Any]]]:
+        return {"items": store.list(ResourceKind.ARTIFACT, namespace)}
 
     @app.get("/openapi.yaml", include_in_schema=False)
     async def openapi_yaml() -> Response:

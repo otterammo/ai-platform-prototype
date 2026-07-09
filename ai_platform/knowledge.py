@@ -19,7 +19,7 @@ from .resources import (
     WorkspaceResource,
     parse_resource,
 )
-from .storage import ResourceStore
+from .storage import CONTROLLER_FIELD_MANAGER, ResourceStore
 
 JsonDict = dict[str, Any]
 JsonDictList = list[JsonDict]
@@ -162,7 +162,20 @@ class KnowledgeIndexer:
     ) -> JsonDict:
         workspace = self._workspace(namespace)
         sources = self._ensure_index_resource(namespace, index_name, extra_sources or [], correlation_id)
-        documents = [self.knowledge_store.load(workspace, source) for source in sources]
+        try:
+            documents = [self.knowledge_store.load(workspace, source) for source in sources]
+        except Exception as exc:
+            self.store.update_status(
+                ResourceKind.KNOWLEDGE_INDEX,
+                index_name,
+                namespace,
+                "Failed",
+                str(exc),
+                {"error": str(exc)},
+                event_type="KnowledgeIndexFailed",
+                event_context=self._context(namespace, "IndexKnowledge", "IndexFailed", correlation_id),
+            )
+            raise
         source_hashes = _source_hashes(documents)
         manifest = self.store.get(ResourceKind.KNOWLEDGE_INDEX, index_name, namespace)
         chunks = self.store.list_knowledge_chunks(namespace, index_name)
@@ -292,6 +305,7 @@ class KnowledgeIndexer:
                     "KnowledgeIndexConfigured",
                     correlation_id,
                 ),
+                field_manager=CONTROLLER_FIELD_MANAGER,
             )
         return sources
 
@@ -398,13 +412,24 @@ class ContextBuilder:
         preferred_sources: list[KnowledgeRef] | None = None,
         limit: int = DEFAULT_CONTEXT_LIMIT,
         correlation_id: str | None = None,
+        ensure_indexed: bool = True,
+        context_name: str | None = None,
     ) -> ContextBuildResult:
         namespace = mission.metadata.namespace
         if namespace is None:
             raise ValueError("Mission must have a namespace")
         query = mission_query(mission)
         preferred = preferred_sources or mission_knowledge_refs(mission)
-        self.indexer.ensure_indexed(namespace, index_name, preferred, correlation_id=correlation_id)
+        if ensure_indexed:
+            self.indexer.ensure_indexed(namespace, index_name, preferred, correlation_id=correlation_id)
+        else:
+            index_manifest = self.store.get(ResourceKind.KNOWLEDGE_INDEX, index_name, namespace)
+            if index_manifest is None:
+                raise KeyError(f"KnowledgeIndex {namespace}/{index_name} not found")
+            index_status = index_manifest.get("status") or {}
+            if index_status.get("phase") != "Ready":
+                detail = index_status.get("message") or f"KnowledgeIndex {namespace}/{index_name} is not Ready"
+                raise RuntimeError(str(detail))
         self.store.emit_event(
             "RetrievalStarted",
             ResourceKind.CONTEXT,
@@ -455,6 +480,7 @@ class ContextBuilder:
         )
         context = self._persist_context(
             mission,
+            context_name or mission.metadata.name,
             index_name,
             query,
             sources,
@@ -473,6 +499,7 @@ class ContextBuilder:
     def _persist_context(
         self,
         mission: MissionResource,
+        context_name: str,
         index_name: str,
         query: str,
         sources: JsonDictList,
@@ -487,7 +514,17 @@ class ContextBuilder:
             {
                 "apiVersion": "ai.platform/v1",
                 "kind": "Context",
-                "metadata": {"name": mission.metadata.name, "namespace": namespace},
+                "metadata": {
+                    "name": context_name,
+                    "namespace": namespace,
+                    "ownerReferences": [
+                        {
+                            "kind": "Mission",
+                            "name": mission.metadata.name,
+                            "controller": True,
+                        }
+                    ],
+                },
                 "spec": {
                     "mission": mission.metadata.name,
                     "query": query,
@@ -501,10 +538,11 @@ class ContextBuilder:
                 "ContextConfigured",
                 correlation_id,
             ),
+            field_manager=CONTROLLER_FIELD_MANAGER,
         )
         return self.store.update_status(
             ResourceKind.CONTEXT,
-            mission.metadata.name,
+            context_name,
             namespace,
             "Ready",
             f"Context built with {len(chunks)} chunks",

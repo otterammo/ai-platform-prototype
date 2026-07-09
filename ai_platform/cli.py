@@ -10,6 +10,7 @@ from typing import Any
 import yaml
 
 from .controllers import ControlPlane
+from .observability import build_timeline, build_trace, describe_resource, format_timeline, format_trace
 from .resources import ResourceKind, parse_resource_documents
 from .storage import DEFAULT_DB_URL, ResourceStore
 
@@ -88,6 +89,20 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_parser.add_argument("--watch", action="store_true", help="Run continuously")
     reconcile_parser.add_argument("--interval", type=float, default=2.0)
 
+    trace_parser = subparsers.add_parser("trace", help="Show an execution trace")
+    trace_subparsers = trace_parser.add_subparsers(dest="trace_kind", required=True)
+    trace_mission_parser = trace_subparsers.add_parser("mission", help="Trace a Mission execution")
+    trace_mission_parser.add_argument("name")
+    trace_mission_parser.add_argument("-n", "--namespace", required=True)
+    trace_mission_parser.add_argument("-o", "--output", choices=["text", "yaml", "json"], default="text")
+
+    timeline_parser = subparsers.add_parser("timeline", help="Show an event timeline")
+    timeline_subparsers = timeline_parser.add_subparsers(dest="timeline_kind", required=True)
+    timeline_mission_parser = timeline_subparsers.add_parser("mission", help="Timeline a Mission execution")
+    timeline_mission_parser.add_argument("name")
+    timeline_mission_parser.add_argument("-n", "--namespace", required=True)
+    timeline_mission_parser.add_argument("-o", "--output", choices=["text", "yaml", "json"], default="text")
+
     subparsers.add_parser("events", help="List recent events")
 
     serve_parser = subparsers.add_parser("serve", help="Run the FastAPI server with uvicorn")
@@ -107,28 +122,6 @@ def print_data(data: Any, output: str = "yaml") -> None:
         print(json.dumps(data, indent=2))
         return
     print(yaml.safe_dump(data, sort_keys=False))
-
-
-def describe_resource(store: ResourceStore, kind: str, name: str, namespace: str | None) -> dict[str, Any] | None:
-    resource = store.get(kind, name, namespace)
-    if resource is None:
-        return None
-    if kind == ResourceKind.MISSION.value:
-        events = store.list_events(namespace=namespace, limit=50)
-        artifacts = store.list_artifacts(namespace=namespace, mission=name)
-    else:
-        events = store.list_events(
-            namespace=namespace,
-            resource_kind=kind,
-            resource_name=name,
-            limit=50,
-        )
-        artifacts = []
-    return {
-        "resource": resource,
-        "events": events,
-        "artifacts": artifacts,
-    }
 
 
 async def run_async(args: argparse.Namespace) -> int:
@@ -180,6 +173,28 @@ async def run_async(args: argparse.Namespace) -> int:
             return 0
         results = await control_plane.reconcile_once()
         print_data({"controllers": [result.__dict__ for result in results]})
+        return 0
+
+    if args.command == "trace":
+        trace = build_trace(store, args.name, args.namespace)
+        if trace is None:
+            print(f"Mission {args.name} not found", file=sys.stderr)
+            return 1
+        if args.output == "text":
+            print(format_trace(trace))
+        else:
+            print_data(trace, args.output)
+        return 0
+
+    if args.command == "timeline":
+        timeline = build_timeline(store, args.name, args.namespace)
+        if timeline is None:
+            print(f"Mission {args.name} not found", file=sys.stderr)
+            return 1
+        if args.output == "text":
+            print(format_timeline(timeline))
+        else:
+            print_data(timeline, args.output)
         return 0
 
     if args.command == "events":

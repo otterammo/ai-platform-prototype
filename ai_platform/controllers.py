@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+from .events import CORRELATION_ID_ANNOTATION, CORRELATION_ID_STATUS_KEY, EventContext
 from .resources import (
     AgentResource,
     CapabilityResource,
@@ -33,6 +34,14 @@ class ReconcileResult:
     changed: int = 0
 
 
+def resource_correlation_id(resource: MissionResource | FleetResource | AgentResource) -> str | None:
+    annotated = resource.metadata.annotations.get(CORRELATION_ID_ANNOTATION)
+    if annotated:
+        return annotated
+    value = resource.status.data.get(CORRELATION_ID_STATUS_KEY)
+    return value if isinstance(value, str) else None
+
+
 def is_current(resource: MissionResource | FleetResource | AgentResource) -> bool:
     return resource.status.observedGeneration == resource.metadata.generation
 
@@ -50,6 +59,14 @@ class MissionController:
             if mission.status.phase in {"Completed", "Failed"} and is_current(mission):
                 continue
             namespace = mission.metadata.namespace
+            self.store.emit_event(
+                "ReconciliationStarted",
+                ResourceKind.MISSION,
+                mission.metadata.name,
+                namespace,
+                f"MissionController started reconciling Mission {mission.metadata.name}",
+                event_context=self._context(mission, "ReconcileMission", "ReconciliationStarted"),
+            )
             fleet_name = f"{mission.metadata.name}-fleet"
             fleet_manifest = self.store.get(ResourceKind.FLEET, fleet_name, namespace)
             fleet: FleetResource | None = None
@@ -58,6 +75,15 @@ class MissionController:
                 if isinstance(parsed_fleet, FleetResource):
                     fleet = parsed_fleet
             if isinstance(fleet, FleetResource) and self._fleet_matches_mission(fleet, mission):
+                self.store.emit_event(
+                    "ReconciliationCompleted",
+                    ResourceKind.MISSION,
+                    mission.metadata.name,
+                    namespace,
+                    f"Fleet {fleet_name} already matches Mission {mission.metadata.name}",
+                    {"fleet": fleet_name},
+                    event_context=self._context(mission, "SkipResource", "FleetCurrent"),
+                )
                 continue
 
             try:
@@ -70,20 +96,29 @@ class MissionController:
                     "Failed",
                     str(exc),
                     event_type="MissionFailed",
+                    event_context=self._context(mission, "ReconcileMission", "ReconcileError"),
                 )
                 changed += 1
                 continue
 
-            self.store.apply(desired_fleet)
-            if fleet_manifest is None:
+            if desired_fleet["spec"].get("template"):
                 self.store.emit_event(
-                    "FleetCreated",
+                    "FleetTemplateSelected",
                     ResourceKind.MISSION,
                     mission.metadata.name,
                     namespace,
-                    f"Created Fleet {fleet_name}",
-                    {"fleet": fleet_name},
+                    f"Selected FleetTemplate {desired_fleet['spec']['template']} for Mission {mission.metadata.name}",
+                    {"fleetTemplate": desired_fleet["spec"]["template"], "fleet": fleet_name},
+                    event_context=self._context(mission, "SelectFleetTemplate", "FleetTemplateSelected"),
                 )
+            self.store.apply(
+                desired_fleet,
+                event_context=self._context(
+                    mission,
+                    "CreateFleet" if fleet_manifest is None else "UpdateFleet",
+                    "FleetMissing" if fleet_manifest is None else "FleetOutdated",
+                ),
+            )
             self.store.update_status(
                 ResourceKind.MISSION,
                 mission.metadata.name,
@@ -91,9 +126,21 @@ class MissionController:
                 "Reconciling",
                 "Mission controller reconciled Fleet",
                 {"fleet": fleet_name},
+                event_type="ReconciliationCompleted",
+                event_context=self._context(mission, "ReconcileMission", "FleetReconciled"),
             )
             changed += 1
         return ReconcileResult("mission", changed)
+
+    def _context(self, mission: MissionResource, action: str, reason: str) -> EventContext:
+        return EventContext(
+            controller="MissionController",
+            action=action,
+            reason=reason,
+            correlation_id=resource_correlation_id(mission),
+            workspace=mission.metadata.namespace,
+            mission=mission.metadata.name,
+        )
 
     def _fleet_manifest(self, mission: MissionResource, fleet: FleetResource | None) -> dict[str, Any]:
         namespace = mission.metadata.namespace
@@ -178,6 +225,14 @@ class FleetController:
                 continue
             if fleet.status.phase in {"Succeeded", "Failed"} and is_current(fleet):
                 continue
+            self.store.emit_event(
+                "ReconciliationStarted",
+                ResourceKind.FLEET,
+                fleet.metadata.name,
+                fleet.metadata.namespace,
+                f"FleetController started reconciling Fleet {fleet.metadata.name}",
+                event_context=self._context(fleet, "ReconcileFleet", "ReconciliationStarted"),
+            )
             fleet_changed = 0
             try:
                 desired_agents = self._desired_agents(fleet)
@@ -187,7 +242,14 @@ class FleetController:
                 continue
             try:
                 resolved_agents = [
-                    (desired_agent, *self._resolve_capabilities(desired_agent.capabilities))
+                    (
+                        desired_agent,
+                        *self._resolve_capabilities(
+                            desired_agent.capabilities,
+                            f"{fleet.metadata.name}-{desired_agent.name}",
+                            fleet,
+                        ),
+                    )
                     for desired_agent in desired_agents
                 ]
             except ReconcileError as exc:
@@ -205,8 +267,34 @@ class FleetController:
                 if isinstance(agent, AgentResource) and self._agent_matches_fleet(
                     agent, fleet, desired_agent, tools, model_ref
                 ):
+                    self.store.emit_event(
+                        "ReconciliationCompleted",
+                        ResourceKind.AGENT,
+                        agent_name,
+                        fleet.metadata.namespace,
+                        f"Agent {agent_name} already matches Fleet {fleet.metadata.name}",
+                        {"agent": agent_name, "fleet": fleet.metadata.name},
+                        event_context=self._context(fleet, "SkipResource", "AgentCurrent"),
+                    )
                     continue
-                model_config = None if model_ref else self._model_for_fleet(fleet)
+                model_config = None
+                if model_ref is None:
+                    model_config, model_reason = self._model_for_fleet(fleet)
+                    if model_config:
+                        self.store.emit_event(
+                            "ModelResolved",
+                            ResourceKind.AGENT,
+                            agent_name,
+                            fleet.metadata.namespace,
+                            f"Selected {model_config['model']} for Agent {agent_name}",
+                            {
+                                "agent": agent_name,
+                                "model": model_config["model"],
+                                "provider": model_config.get("provider"),
+                                "source": model_reason,
+                            },
+                            event_context=self._context(fleet, "ResolveModel", model_reason),
+                        )
                 self.store.apply(
                     self._agent_manifest(
                         fleet,
@@ -216,17 +304,23 @@ class FleetController:
                         model_ref,
                         model_config,
                         agent,
-                    )
+                    ),
+                    event_context=self._context(
+                        fleet,
+                        "CreateAgent" if agent_manifest is None else "UpdateAgent",
+                        "AgentMissing" if agent_manifest is None else "AgentOutdated",
+                    ),
                 )
-                if agent_manifest is None:
-                    self.store.emit_event(
-                        "AgentCreated",
-                        ResourceKind.FLEET,
-                        fleet.metadata.name,
-                        fleet.metadata.namespace,
-                        f"Created Agent {agent_name}",
-                        {"agent": agent_name},
-                    )
+                self.store.update_status(
+                    ResourceKind.AGENT,
+                    agent_name,
+                    fleet.metadata.namespace,
+                    "Pending",
+                    "Agent scheduled by Fleet controller",
+                    {"fleet": fleet.metadata.name, "mission": fleet.spec.mission},
+                    event_type="AgentScheduled",
+                    event_context=self._context(fleet, "ScheduleAgent", "AgentScheduled"),
+                )
                 fleet_changed += 1
             if fleet_changed:
                 self.store.update_status(
@@ -235,21 +329,42 @@ class FleetController:
                     fleet.metadata.namespace,
                     "Running",
                     "Fleet controller created Agents",
+                    event_type="FleetStarted",
+                    event_context=self._context(fleet, "ReconcileFleet", "AgentsScheduled"),
                 )
                 changed += fleet_changed
+            self.store.emit_event(
+                "ReconciliationCompleted",
+                ResourceKind.FLEET,
+                fleet.metadata.name,
+                fleet.metadata.namespace,
+                f"FleetController completed reconciling Fleet {fleet.metadata.name}",
+                {"changed": fleet_changed},
+                event_context=self._context(fleet, "ReconcileFleet", "ReconciliationCompleted"),
+            )
         return ReconcileResult("fleet", changed)
 
-    def _model_for_fleet(self, fleet: FleetResource) -> dict[str, Any]:
+    def _context(self, fleet: FleetResource, action: str, reason: str) -> EventContext:
+        return EventContext(
+            controller="FleetController",
+            action=action,
+            reason=reason,
+            correlation_id=resource_correlation_id(fleet),
+            workspace=fleet.metadata.namespace,
+            mission=fleet.spec.mission,
+        )
+
+    def _model_for_fleet(self, fleet: FleetResource) -> tuple[dict[str, Any], str]:
         namespace = fleet.metadata.namespace
         mission_manifest = self.store.get(ResourceKind.MISSION, fleet.spec.mission, namespace)
         workspace_manifest = self.store.get(ResourceKind.WORKSPACE, fleet.spec.workspace)
         mission = parse_resource(mission_manifest) if mission_manifest else None
         workspace = parse_resource(workspace_manifest) if workspace_manifest else None
         if isinstance(mission, MissionResource) and mission.spec.model:
-            return mission.spec.model.model_dump(mode="json", exclude_none=True)
+            return mission.spec.model.model_dump(mode="json", exclude_none=True), "MissionModelSelected"
         if isinstance(workspace, WorkspaceResource):
-            return workspace.spec.model.model_dump(mode="json", exclude_none=True)
-        return {}
+            return workspace.spec.model.model_dump(mode="json", exclude_none=True), "WorkspaceDefaultModelSelected"
+        return {}, "NoModelConfig"
 
     def _desired_agents(self, fleet: FleetResource) -> list[FleetTemplateAgentSpec]:
         if fleet.spec.agents:
@@ -263,7 +378,12 @@ class FleetController:
             for index in range(fleet.spec.agentCount)
         ]
 
-    def _resolve_capabilities(self, capabilities: list[str]) -> tuple[list[str], str | None]:
+    def _resolve_capabilities(
+        self,
+        capabilities: list[str],
+        agent_name: str,
+        fleet: FleetResource,
+    ) -> tuple[list[str], str | None]:
         if not capabilities:
             return [], None
         tool_names: list[str] = []
@@ -275,11 +395,29 @@ class FleetController:
             capability = parse_resource(capability_manifest)
             if not isinstance(capability, CapabilityResource):
                 raise ReconcileError(f"Capability {capability_name} could not be loaded")
+            self.store.emit_event(
+                "CapabilityResolved",
+                ResourceKind.AGENT,
+                agent_name,
+                fleet.metadata.namespace,
+                f"Resolved Capability {capability_name} for Agent {agent_name}",
+                {"agent": agent_name, "capability": capability_name},
+                event_context=self._context(fleet, "ResolveCapability", "CapabilityResolved"),
+            )
             for tool_name in capability.spec.requires.tools:
                 if self.store.get(ResourceKind.TOOL, tool_name) is None:
                     raise ReconcileError(f"Tool {tool_name} required by Capability {capability_name} not found")
                 if tool_name not in tool_names:
                     tool_names.append(tool_name)
+                    self.store.emit_event(
+                        "ToolResolved",
+                        ResourceKind.AGENT,
+                        agent_name,
+                        fleet.metadata.namespace,
+                        f"Resolved Tool {tool_name} for Agent {agent_name}",
+                        {"agent": agent_name, "capability": capability_name, "tool": tool_name},
+                        event_context=self._context(fleet, "ResolveTool", "ToolResolved"),
+                    )
             if capability.spec.compatibleModels:
                 compatible_sets.append(capability.spec.compatibleModels)
         if not compatible_sets:
@@ -287,6 +425,15 @@ class FleetController:
         for model_name in compatible_sets[0]:
             if all(model_name in compatible_models for compatible_models in compatible_sets):
                 if self.store.get(ResourceKind.MODEL, model_name):
+                    self.store.emit_event(
+                        "ModelResolved",
+                        ResourceKind.AGENT,
+                        agent_name,
+                        fleet.metadata.namespace,
+                        f"Selected {model_name} for Agent {agent_name}",
+                        {"agent": agent_name, "model": model_name, "source": "compatibleModels"},
+                        event_context=self._context(fleet, "ResolveModel", "CompatibleModelFound"),
+                    )
                     return tool_names, model_name
         raise ReconcileError(f"No available Model is compatible with capabilities: {', '.join(capabilities)}")
 
@@ -356,6 +503,7 @@ class FleetController:
             message,
             {"error": error},
             event_type="FleetFailed",
+            event_context=self._context(fleet, "ReconcileFleet", "ReconcileError"),
         )
         self.store.update_status(
             ResourceKind.MISSION,
@@ -365,6 +513,7 @@ class FleetController:
             message,
             {"fleet": fleet.metadata.name, "error": error},
             event_type="MissionFailed",
+            event_context=self._context(fleet, "ReconcileFleet", "ReconcileError"),
         )
 
 
@@ -381,6 +530,14 @@ class AgentController:
                 continue
             if agent.status.phase != "Pending" and is_current(agent):
                 continue
+            self.store.emit_event(
+                "ReconciliationStarted",
+                ResourceKind.AGENT,
+                agent.metadata.name,
+                agent.metadata.namespace,
+                f"AgentController started reconciling Agent {agent.metadata.name}",
+                event_context=self._context(agent, "ReconcileAgent", "ReconciliationStarted"),
+            )
             try:
                 await self.runtime.run(agent)
             except Exception as exc:
@@ -392,13 +549,32 @@ class AgentController:
                     "Failed",
                     error,
                     event_type="AgentFailed",
+                    event_context=self._context(agent, "ReconcileAgent", "ReconcileError"),
                 )
                 self._fail_parents(agent, error)
                 changed += 1
                 continue
             changed += 1
             self._complete_parents(agent)
+            self.store.emit_event(
+                "ReconciliationCompleted",
+                ResourceKind.AGENT,
+                agent.metadata.name,
+                agent.metadata.namespace,
+                f"AgentController completed reconciling Agent {agent.metadata.name}",
+                event_context=self._context(agent, "ReconcileAgent", "ReconciliationCompleted"),
+            )
         return ReconcileResult("agent", changed)
+
+    def _context(self, agent: AgentResource, action: str, reason: str) -> EventContext:
+        return EventContext(
+            controller="AgentController",
+            action=action,
+            reason=reason,
+            correlation_id=resource_correlation_id(agent),
+            workspace=agent.metadata.namespace,
+            mission=agent.spec.mission,
+        )
 
     def _complete_parents(self, agent: AgentResource) -> None:
         namespace = agent.metadata.namespace
@@ -433,6 +609,14 @@ class AgentController:
             "Succeeded",
             "All Agents completed successfully",
             event_type="FleetCompleted",
+            event_context=EventContext(
+                controller="AgentController",
+                action="CompleteFleet",
+                reason="AllAgentsCompleted",
+                correlation_id=resource_correlation_id(agent),
+                workspace=namespace,
+                mission=fleet.spec.mission,
+            ),
         )
         self.store.update_status(
             ResourceKind.MISSION,
@@ -442,6 +626,14 @@ class AgentController:
             "Mission completed by Fleet",
             {"fleet": fleet.metadata.name},
             event_type="MissionCompleted",
+            event_context=EventContext(
+                controller="AgentController",
+                action="CompleteMission",
+                reason="FleetCompleted",
+                correlation_id=resource_correlation_id(agent),
+                workspace=namespace,
+                mission=fleet.spec.mission,
+            ),
         )
 
     def _fail_parents(self, agent: AgentResource, error: str) -> None:
@@ -463,6 +655,14 @@ class AgentController:
             message,
             {"agent": agent.metadata.name, "error": error},
             event_type="FleetFailed",
+            event_context=EventContext(
+                controller="AgentController",
+                action="FailFleet",
+                reason="AgentFailed",
+                correlation_id=resource_correlation_id(agent),
+                workspace=namespace,
+                mission=fleet.spec.mission,
+            ),
         )
         self.store.update_status(
             ResourceKind.MISSION,
@@ -472,6 +672,14 @@ class AgentController:
             message,
             {"fleet": fleet.metadata.name, "agent": agent.metadata.name, "error": error},
             event_type="MissionFailed",
+            event_context=EventContext(
+                controller="AgentController",
+                action="FailMission",
+                reason="AgentFailed",
+                correlation_id=resource_correlation_id(agent),
+                workspace=namespace,
+                mission=fleet.spec.mission,
+            ),
         )
 
 

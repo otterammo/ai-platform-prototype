@@ -8,6 +8,7 @@ import yaml
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 
 from .controllers import ControlPlane
+from .observability import build_timeline, build_trace
 from .resources import ResourceKind, parse_resource_documents
 from .storage import DEFAULT_DB_URL, ResourceStore
 
@@ -84,9 +85,24 @@ def create_app(
         namespace: str | None = None,
         resourceKind: ResourceKind | None = None,
         resourceName: str | None = None,
+        correlationId: str | None = None,
         limit: int = Query(default=100, ge=1, le=1000),
     ) -> dict[str, list[dict[str, Any]]]:
-        return {"items": store.list_events(namespace, resourceKind, resourceName, limit)}
+        return {"items": store.list_events(namespace, resourceKind, resourceName, limit, correlationId)}
+
+    @app.get("/trace/{mission}")
+    async def trace_mission(mission: str, namespace: str) -> dict[str, Any]:
+        trace = build_trace(store, mission, namespace)
+        if trace is None:
+            raise HTTPException(status_code=404, detail="mission not found")
+        return trace
+
+    @app.get("/timeline/{mission}")
+    async def timeline_mission(mission: str, namespace: str) -> dict[str, Any]:
+        timeline = build_timeline(store, mission, namespace)
+        if timeline is None:
+            raise HTTPException(status_code=404, detail="mission not found")
+        return timeline
 
     @app.get("/artifacts")
     async def list_artifacts(

@@ -22,6 +22,8 @@ class ResourceKind(StrEnum):
     CAPABILITY = "Capability"
     FLEET_TEMPLATE = "FleetTemplate"
     KNOWLEDGE = "Knowledge"
+    KNOWLEDGE_INDEX = "KnowledgeIndex"
+    CONTEXT = "Context"
 
 
 CLUSTER_SCOPED_KINDS = {
@@ -247,6 +249,30 @@ class KnowledgeSpec(BaseModel):
         return value
 
 
+class KnowledgeIndexSpec(BaseModel):
+    sources: list[KnowledgeRef] = Field(default_factory=list)
+
+    @field_validator("sources", mode="before")
+    @classmethod
+    def coerce_sources(cls, value: Any) -> Any:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [{"ref": item} if isinstance(item, str) else item for item in value]
+        return value
+
+
+class ContextSpec(BaseModel):
+    mission: str
+    query: str
+    knowledgeIndex: str = "default"
+
+    @field_validator("mission", "knowledgeIndex")
+    @classmethod
+    def validate_names(cls, value: str) -> str:
+        return Metadata.validate_dnsish_name(value) or value
+
+
 class BaseResource(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -378,6 +404,28 @@ class KnowledgeResource(BaseResource):
         return self
 
 
+class KnowledgeIndexResource(BaseResource):
+    kind: Literal[ResourceKind.KNOWLEDGE_INDEX] = ResourceKind.KNOWLEDGE_INDEX
+    spec: KnowledgeIndexSpec = Field(default_factory=KnowledgeIndexSpec)
+
+    @model_validator(mode="after")
+    def require_namespace(self) -> KnowledgeIndexResource:
+        if not self.metadata.namespace:
+            raise ValueError("KnowledgeIndex metadata.namespace must name a Workspace")
+        return self
+
+
+class ContextResource(BaseResource):
+    kind: Literal[ResourceKind.CONTEXT] = ResourceKind.CONTEXT
+    spec: ContextSpec
+
+    @model_validator(mode="after")
+    def require_namespace(self) -> ContextResource:
+        if not self.metadata.namespace:
+            raise ValueError("Context metadata.namespace must name a Workspace")
+        return self
+
+
 Resource = Annotated[
     Union[
         WorkspaceResource,
@@ -391,6 +439,8 @@ Resource = Annotated[
         CapabilityResource,
         FleetTemplateResource,
         KnowledgeResource,
+        KnowledgeIndexResource,
+        ContextResource,
     ],
     Field(discriminator="kind"),
 ]
@@ -407,6 +457,8 @@ AnyResource = (
     | CapabilityResource
     | FleetTemplateResource
     | KnowledgeResource
+    | KnowledgeIndexResource
+    | ContextResource
 )
 
 
@@ -422,6 +474,8 @@ RESOURCE_BY_KIND: dict[str, type[AnyResource]] = {
     ResourceKind.CAPABILITY.value: CapabilityResource,
     ResourceKind.FLEET_TEMPLATE.value: FleetTemplateResource,
     ResourceKind.KNOWLEDGE.value: KnowledgeResource,
+    ResourceKind.KNOWLEDGE_INDEX.value: KnowledgeIndexResource,
+    ResourceKind.CONTEXT.value: ContextResource,
 }
 
 

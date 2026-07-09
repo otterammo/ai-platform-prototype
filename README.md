@@ -13,6 +13,8 @@ The prototype treats AI work as resources:
 - `Approval` records a pending, approved, or rejected action decision.
 - `Agent` is created by the Fleet controller and executes through an embedded `Pilot`.
 - `Knowledge` records describe workspace knowledge nodes separately from manifests.
+- `KnowledgeIndex` manages indexed markdown knowledge sources for retrieval.
+- `Context` records the assembled knowledge context consumed by a Mission run.
 
 Resources use the shape:
 
@@ -43,6 +45,12 @@ Runtime actions pass through the policy engine before side effects occur:
 
 ```text
 Agent -> Policy Engine -> Approval Service (optional) -> Runtime
+```
+
+Knowledge now flows through an indexed retrieval path before model invocation:
+
+```text
+Knowledge Storage -> KnowledgeIndex -> Retriever -> Context -> Model Invocation
 ```
 
 ## Install
@@ -102,7 +110,12 @@ platform --db sqlite:///./platform.db --root .platform get models
 platform --db sqlite:///./platform.db --root .platform get tools
 platform --db sqlite:///./platform.db --root .platform get policies
 platform --db sqlite:///./platform.db --root .platform get knowledge -n demo
+platform --db sqlite:///./platform.db --root .platform get knowledgeindexes -n demo
+platform --db sqlite:///./platform.db --root .platform knowledge index -n demo
+platform --db sqlite:///./platform.db --root .platform knowledge search "authentication" -n demo
 platform --db sqlite:///./platform.db --root .platform describe mission implement-auth -n demo
+platform --db sqlite:///./platform.db --root .platform describe knowledgeindex default -n demo
+platform --db sqlite:///./platform.db --root .platform get contexts -n demo
 platform --db sqlite:///./platform.db --root .platform events
 ```
 
@@ -120,6 +133,10 @@ Useful endpoints:
 - `DELETE /resources/{kind}/{name}?namespace=demo`
 - `POST /reconcile`
 - `GET /events`
+- `GET /knowledge`
+- `GET /knowledge/search`
+- `GET /knowledge/indexes`
+- `GET /contexts/{mission}`
 - `GET /approvals`
 - `GET /approvals/{id}`
 - `POST /approvals/{id}/approve`
@@ -127,6 +144,25 @@ Useful endpoints:
 - `GET /artifacts`
 
 Deleting a Mission or Workspace removes the corresponding resource and artifact records from SQLite, but it does not delete artifact files from disk.
+
+## Knowledge Index And Retrieval
+
+`KnowledgeIndex` resources declare markdown sources under a workspace `knowledge/` directory:
+
+```yaml
+apiVersion: ai.platform/v1
+kind: KnowledgeIndex
+metadata:
+  name: default
+  namespace: demo
+spec:
+  sources:
+    - knowledge://prd.md
+    - knowledge://architecture.md
+    - knowledge://research.md
+```
+
+Indexes are deterministic and keyword-searchable in this prototype. They can be rebuilt explicitly with `platform knowledge index`; search and runtime execution lazily refresh missing or stale indexes. During execution, the Agent receives an assembled `Context` with sources, chunks, and provenance instead of raw file contents.
 
 ## Model Providers
 

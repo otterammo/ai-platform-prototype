@@ -80,6 +80,26 @@ class ArtifactRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
+class KnowledgeChunkRecord(Base):
+    __tablename__ = "knowledge_chunks"
+    __table_args__ = (UniqueConstraint("namespace", "index_name", "chunk_id", name="uq_knowledge_chunk_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    namespace: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    index_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    source_ref: Mapped[str] = mapped_column(String(2000), nullable=False)
+    document: Mapped[str] = mapped_column(String(2000), nullable=False, index=True)
+    source_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    source_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    section: Mapped[str] = mapped_column(String(1000), nullable=False, default="")
+    chunk_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    content: Mapped[str] = mapped_column(String, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    chunk_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 JsonDict: TypeAlias = dict[str, Any]
 JsonDictList: TypeAlias = list[JsonDict]
 ResourceRecordList: TypeAlias = list[ResourceRecord]
@@ -221,6 +241,14 @@ class ResourceStore:
                 self._delete_mission(session, record, deleted_ids)
             elif kind_value == ResourceKind.FLEET.value:
                 self._delete_fleet(session, record, deleted_ids)
+            elif kind_value == ResourceKind.KNOWLEDGE_INDEX.value:
+                session.execute(
+                    sql_delete(KnowledgeChunkRecord).where(
+                        KnowledgeChunkRecord.namespace == namespace_value,
+                        KnowledgeChunkRecord.index_name == name_value,
+                    )
+                )
+                self._delete_record(session, record, deleted_ids)
             else:
                 self._delete_record(session, record, deleted_ids)
             return True
@@ -236,6 +264,7 @@ class ResourceStore:
         for child in sorted(children, key=lambda item: delete_order.get(item.kind, 99)):
             self._delete_record(session, child, deleted_ids, cascade="workspace")
         session.execute(sql_delete(ArtifactRecord).where(ArtifactRecord.namespace == workspace_name))
+        session.execute(sql_delete(KnowledgeChunkRecord).where(KnowledgeChunkRecord.namespace == workspace_name))
         self._delete_record(session, record, deleted_ids)
 
     def _delete_mission(self, session: Session, record: ResourceRecord, deleted_ids: set[int]) -> None:
@@ -247,6 +276,15 @@ class ResourceStore:
             self._delete_record(session, agent, deleted_ids, cascade="mission")
         for fleet in fleets:
             self._delete_record(session, fleet, deleted_ids, cascade="mission")
+        context = session.scalar(
+            select(ResourceRecord).where(
+                ResourceRecord.kind == ResourceKind.CONTEXT.value,
+                ResourceRecord.namespace == namespace,
+                ResourceRecord.name == mission_name,
+            )
+        )
+        if context:
+            self._delete_record(session, context, deleted_ids, cascade="mission")
         session.execute(
             sql_delete(ArtifactRecord).where(
                 ArtifactRecord.namespace == namespace,
@@ -514,6 +552,78 @@ class ResourceStore:
                 }
                 for record in session.scalars(statement).all()
             ]
+
+    def replace_knowledge_chunks(
+        self,
+        namespace: str,
+        index_name: str,
+        chunks: JsonDictList,
+    ) -> JsonDictList:
+        with self.session() as session:
+            session.execute(
+                sql_delete(KnowledgeChunkRecord).where(
+                    KnowledgeChunkRecord.namespace == namespace,
+                    KnowledgeChunkRecord.index_name == index_name,
+                )
+            )
+            records = []
+            for chunk in chunks:
+                record = KnowledgeChunkRecord(
+                    namespace=namespace,
+                    index_name=index_name,
+                    source_ref=str(chunk["sourceRef"]),
+                    document=str(chunk["document"]),
+                    source_order=int(chunk.get("sourceOrder", 0)),
+                    source_hash=str(chunk["sourceHash"]),
+                    section=str(chunk.get("section") or ""),
+                    chunk_id=str(chunk["chunkId"]),
+                    chunk_index=int(chunk.get("chunkIndex", 0)),
+                    content=str(chunk["content"]),
+                    content_hash=str(chunk["contentHash"]),
+                    chunk_metadata=dict(chunk.get("metadata") or {}),
+                )
+                session.add(record)
+                records.append(record)
+            session.flush()
+            return [self.knowledge_chunk_to_dict(record) for record in records]
+
+    def list_knowledge_chunks(self, namespace: str, index_name: str) -> JsonDictList:
+        with self.session() as session:
+            records = session.scalars(
+                select(KnowledgeChunkRecord)
+                .where(
+                    KnowledgeChunkRecord.namespace == namespace,
+                    KnowledgeChunkRecord.index_name == index_name,
+                )
+                .order_by(KnowledgeChunkRecord.source_order, KnowledgeChunkRecord.chunk_index, KnowledgeChunkRecord.id)
+            ).all()
+            return [self.knowledge_chunk_to_dict(record) for record in records]
+
+    def delete_knowledge_chunks(self, namespace: str, index_name: str | None = None) -> None:
+        with self.session() as session:
+            statement = sql_delete(KnowledgeChunkRecord).where(KnowledgeChunkRecord.namespace == namespace)
+            if index_name is not None:
+                statement = statement.where(KnowledgeChunkRecord.index_name == index_name)
+            session.execute(statement)
+
+    @staticmethod
+    def knowledge_chunk_to_dict(record: KnowledgeChunkRecord) -> JsonDict:
+        return {
+            "id": record.id,
+            "namespace": record.namespace,
+            "index": record.index_name,
+            "sourceRef": record.source_ref,
+            "document": record.document,
+            "sourceOrder": record.source_order,
+            "sourceHash": record.source_hash,
+            "section": record.section,
+            "chunkId": record.chunk_id,
+            "chunkIndex": record.chunk_index,
+            "content": record.content,
+            "contentHash": record.content_hash,
+            "metadata": record.chunk_metadata,
+            "createdAt": record.created_at.isoformat(),
+        }
 
     @staticmethod
     def event_to_dict(record: EventRecord) -> JsonDict:

@@ -10,6 +10,7 @@ from typing import Any
 import yaml
 
 from .controllers import ControlPlane
+from .knowledge import DEFAULT_INDEX_NAME, KeywordRetriever, KnowledgeIndexer
 from .observability import build_timeline, build_trace, describe_resource, format_timeline, format_trace
 from .policy import ApprovalService
 from .resources import ResourceKind, parse_resource_documents
@@ -39,6 +40,12 @@ RESOURCE_ALIASES = {
     "fleet-template": ResourceKind.FLEET_TEMPLATE.value,
     "fleet-templates": ResourceKind.FLEET_TEMPLATE.value,
     "knowledge": ResourceKind.KNOWLEDGE.value,
+    "knowledgeindex": ResourceKind.KNOWLEDGE_INDEX.value,
+    "knowledgeindexes": ResourceKind.KNOWLEDGE_INDEX.value,
+    "knowledge-index": ResourceKind.KNOWLEDGE_INDEX.value,
+    "knowledge-indexes": ResourceKind.KNOWLEDGE_INDEX.value,
+    "context": ResourceKind.CONTEXT.value,
+    "contexts": ResourceKind.CONTEXT.value,
 }
 
 
@@ -107,6 +114,19 @@ def build_parser() -> argparse.ArgumentParser:
     timeline_mission_parser.add_argument("name")
     timeline_mission_parser.add_argument("-n", "--namespace", required=True)
     timeline_mission_parser.add_argument("-o", "--output", choices=["text", "yaml", "json"], default="text")
+
+    knowledge_parser = subparsers.add_parser("knowledge", help="Manage and search workspace knowledge")
+    knowledge_subparsers = knowledge_parser.add_subparsers(dest="knowledge_command", required=True)
+    knowledge_index_parser = knowledge_subparsers.add_parser("index", help="Build a KnowledgeIndex")
+    knowledge_index_parser.add_argument("-n", "--namespace", required=True)
+    knowledge_index_parser.add_argument("--index", default=DEFAULT_INDEX_NAME)
+    knowledge_index_parser.add_argument("-o", "--output", choices=["yaml", "json"], default="yaml")
+    knowledge_search_parser = knowledge_subparsers.add_parser("search", help="Search indexed knowledge")
+    knowledge_search_parser.add_argument("query")
+    knowledge_search_parser.add_argument("-n", "--namespace", required=True)
+    knowledge_search_parser.add_argument("--index", default=DEFAULT_INDEX_NAME)
+    knowledge_search_parser.add_argument("--limit", type=int, default=10)
+    knowledge_search_parser.add_argument("-o", "--output", choices=["yaml", "json"], default="yaml")
 
     subparsers.add_parser("events", help="List recent events")
 
@@ -215,6 +235,17 @@ async def run_async(args: argparse.Namespace) -> int:
             print_data(timeline, args.output)
         return 0
 
+    if args.command == "knowledge":
+        if args.knowledge_command == "index":
+            index = KnowledgeIndexer(store).index(args.namespace, args.index)
+            print_data({"index": index}, args.output)
+            return 0
+        if args.knowledge_command == "search":
+            KnowledgeIndexer(store).ensure_indexed(args.namespace, args.index)
+            search_results = KeywordRetriever(store).retrieve(args.namespace, args.index, args.query, limit=args.limit)
+            print_data({"items": [_search_result(item) for item in search_results]}, args.output)
+            return 0
+
     if args.command == "events":
         print_data({"items": store.list_events()})
         return 0
@@ -257,6 +288,21 @@ async def run_async(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     return asyncio.run(run_async(args))
+
+
+def _search_result(chunk: dict[str, Any]) -> dict[str, Any]:
+    content = str(chunk.get("content") or "")
+    preview = " ".join(content.split())
+    if len(preview) > 160:
+        preview = f"{preview[:157]}..."
+    return {
+        "document": chunk["document"],
+        "section": chunk["section"],
+        "sourceRef": chunk["sourceRef"],
+        "chunkId": chunk["chunkId"],
+        "score": chunk["score"],
+        "preview": preview,
+    }
 
 
 if __name__ == "__main__":

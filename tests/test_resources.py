@@ -374,3 +374,158 @@ def test_store_admission_rejects_orphan_children(tmp_path) -> None:
                 "spec": {"objective": "Build authentication"},
             }
         )
+
+
+def apply_workspace_and_mission(store: ResourceStore, mission_name: str = "build-auth") -> None:
+    store.apply(
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Workspace",
+            "metadata": {"name": "demo"},
+            "spec": {},
+        }
+    )
+    store.apply(
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Mission",
+            "metadata": {"name": mission_name, "namespace": "demo"},
+            "spec": {"objective": "Build authentication"},
+        }
+    )
+
+
+def apply_agent_parent_chain(store: ResourceStore) -> None:
+    apply_workspace_and_mission(store)
+    store.apply(
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Fleet",
+            "metadata": {"name": "build-auth-fleet", "namespace": "demo"},
+            "spec": {
+                "workspace": "demo",
+                "mission": "build-auth",
+                "strategy": "single-agent",
+                "agentCount": 1,
+            },
+        }
+    )
+    store.apply(
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Agent",
+            "metadata": {"name": "build-auth-agent", "namespace": "demo"},
+            "spec": {
+                "workspace": "demo",
+                "mission": "build-auth",
+                "fleet": "build-auth-fleet",
+            },
+        }
+    )
+
+
+def test_store_admission_rejects_owner_spec_parent_mismatch(tmp_path) -> None:
+    store = ResourceStore(f"sqlite:///{tmp_path / 'platform.db'}", tmp_path / "platform")
+    apply_workspace_and_mission(store, "mission-a")
+    store.apply(
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Mission",
+            "metadata": {"name": "mission-b", "namespace": "demo"},
+            "spec": {"objective": "Other mission"},
+        }
+    )
+
+    with pytest.raises(ValueError, match="Fleet ownerReference must match spec.mission"):
+        store.apply(
+            {
+                "apiVersion": "ai.platform/v1",
+                "kind": "Fleet",
+                "metadata": {
+                    "name": "bad-fleet",
+                    "namespace": "demo",
+                    "ownerReferences": [{"kind": "Mission", "name": "mission-b", "controller": True}],
+                },
+                "spec": {
+                    "workspace": "demo",
+                    "mission": "mission-a",
+                    "strategy": "single-agent",
+                    "agentCount": 1,
+                },
+            }
+        )
+
+
+def test_store_admission_rejects_illegal_owner_cycle_shape(tmp_path) -> None:
+    store = ResourceStore(f"sqlite:///{tmp_path / 'platform.db'}", tmp_path / "platform")
+    apply_agent_parent_chain(store)
+
+    with pytest.raises(ValueError, match="Mission ownerReference must be one of: Workspace"):
+        store.apply(
+            {
+                "apiVersion": "ai.platform/v1",
+                "kind": "Mission",
+                "metadata": {
+                    "name": "build-auth",
+                    "namespace": "demo",
+                    "ownerReferences": [{"kind": "Agent", "name": "build-auth-agent", "controller": True}],
+                },
+                "spec": {"objective": "Build authentication"},
+            }
+        )
+
+
+def test_store_admits_agent_run_before_context_and_requires_context_owner_match(tmp_path) -> None:
+    store = ResourceStore(f"sqlite:///{tmp_path / 'platform.db'}", tmp_path / "platform")
+    apply_agent_parent_chain(store)
+
+    run = store.apply(
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "AgentRun",
+            "metadata": {"name": "build-auth-agent-run-1", "namespace": "demo"},
+            "spec": {
+                "agentRef": {"name": "build-auth-agent"},
+                "missionRef": {"name": "build-auth"},
+                "contextRef": {"name": "build-auth-agent-run-1-context"},
+            },
+        }
+    )
+
+    assert run["status"]["phase"] == "Pending"
+    assert store.get(ResourceKind.CONTEXT, "build-auth-agent-run-1-context", "demo") is None
+
+    with pytest.raises(ValueError, match="Context metadata.name must match owning AgentRun spec.contextRef"):
+        store.apply(
+            {
+                "apiVersion": "ai.platform/v1",
+                "kind": "Context",
+                "metadata": {
+                    "name": "wrong-context",
+                    "namespace": "demo",
+                    "ownerReferences": [{"kind": "AgentRun", "name": "build-auth-agent-run-1", "controller": True}],
+                },
+                "spec": {
+                    "mission": "build-auth",
+                    "agentRun": "build-auth-agent-run-1",
+                    "query": "Build authentication",
+                },
+            }
+        )
+
+    context = store.apply(
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Context",
+            "metadata": {"name": "build-auth-agent-run-1-context", "namespace": "demo"},
+            "spec": {
+                "mission": "build-auth",
+                "agentRun": "build-auth-agent-run-1",
+                "query": "Build authentication",
+            },
+        }
+    )
+
+    assert context["metadata"]["ownerReferences"] == [
+        {"kind": "AgentRun", "name": "build-auth-agent-run-1", "controller": True}
+    ]

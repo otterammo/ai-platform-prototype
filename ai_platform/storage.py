@@ -4,7 +4,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, TypeVar
 
 from sqlalchemy import DateTime, Integer, String, UniqueConstraint, create_engine, select
 from sqlalchemy import delete as sql_delete
@@ -39,6 +39,18 @@ from .resources import (
 
 DEFAULT_DB_URL = "sqlite:///./platform.db"
 CONTROLLER_FIELD_MANAGER = "controller"
+
+LEGAL_OWNER_KINDS: dict[ResourceKind, set[ResourceKind]] = {
+    ResourceKind.WORKSPACE: {ResourceKind.PLATFORM},
+    ResourceKind.MISSION: {ResourceKind.WORKSPACE},
+    ResourceKind.FLEET: {ResourceKind.MISSION},
+    ResourceKind.AGENT: {ResourceKind.FLEET},
+    ResourceKind.AGENT_RUN: {ResourceKind.AGENT},
+    ResourceKind.CONTEXT: {ResourceKind.AGENT_RUN},
+    ResourceKind.ARTIFACT: {ResourceKind.AGENT_RUN},
+    ResourceKind.KNOWLEDGE: {ResourceKind.WORKSPACE},
+    ResourceKind.KNOWLEDGE_INDEX: {ResourceKind.WORKSPACE},
+}
 
 
 def utcnow() -> datetime:
@@ -113,6 +125,7 @@ class KnowledgeChunkRecord(Base):
 JsonDict: TypeAlias = dict[str, Any]
 JsonDictList: TypeAlias = list[JsonDict]
 ResourceRecordList: TypeAlias = list[ResourceRecord]
+_ResourceT = TypeVar("_ResourceT")
 
 
 def make_engine(database_url: str = DEFAULT_DB_URL) -> Engine:
@@ -280,8 +293,8 @@ class ResourceStore:
             owner = OwnerReference(kind=ResourceKind.PLATFORM, name="local", controller=True)
         elif isinstance(resource, MissionResource | KnowledgeResource | KnowledgeIndexResource):
             owner = OwnerReference(kind=ResourceKind.WORKSPACE, name=namespace or "", controller=True)
-        elif isinstance(resource, ContextResource):
-            owner = OwnerReference(kind=ResourceKind.MISSION, name=resource.spec.mission, controller=True)
+        elif isinstance(resource, ContextResource) and resource.spec.agentRun:
+            owner = OwnerReference(kind=ResourceKind.AGENT_RUN, name=resource.spec.agentRun, controller=True)
         elif isinstance(resource, FleetResource):
             owner = OwnerReference(kind=ResourceKind.MISSION, name=resource.spec.mission, controller=True)
         elif isinstance(resource, AgentResource):
@@ -317,7 +330,6 @@ class ResourceStore:
         elif isinstance(resource, AgentRunResource):
             self._require_exists(ResourceKind.AGENT, resource.spec.agentRef.name, namespace)
             self._require_exists(ResourceKind.MISSION, resource.spec.missionRef.name, namespace)
-            self._require_exists(ResourceKind.CONTEXT, resource.spec.contextRef.name, namespace)
         elif isinstance(resource, ArtifactResource):
             self._require_exists(ResourceKind.AGENT_RUN, resource.spec.producedBy.name, namespace)
             artifact_path = Path(resource.spec.path)
@@ -325,6 +337,8 @@ class ResourceStore:
                 raise ValueError("Artifact spec.path must be a normalized workspace-relative path")
         elif isinstance(resource, ContextResource):
             self._require_exists(ResourceKind.MISSION, resource.spec.mission, namespace)
+            if resource.spec.agentRun:
+                self._require_exists(ResourceKind.AGENT_RUN, resource.spec.agentRun, namespace)
 
         if resource.kind == ResourceKind.APPROVAL:
             agent_run = getattr(resource.spec, "agentRun", None)
@@ -334,19 +348,130 @@ class ResourceStore:
         self._validate_owner_references(resource)
 
     def _validate_owner_references(self, resource: AnyResource) -> None:
+        self._validate_legal_owner_reference(resource)
         namespace = resource.metadata.namespace
         for owner in resource.metadata.ownerReferences:
-            owner_kind = ResourceKind(owner.kind).value
-            owner_namespace: str | None = namespace
-            if owner_kind == ResourceKind.WORKSPACE.value:
-                owner_namespace = None
-                if namespace and owner.name != namespace:
-                    raise ValueError("Workspace ownerReference must match metadata.namespace")
-            elif owner_kind in CLUSTER_SCOPED_KINDS:
-                owner_namespace = None
-            elif namespace is None:
-                raise ValueError(f"{resource.kind.value} cannot reference namespaced owner {owner_kind}")
+            owner_kind = ResourceKind(owner.kind)
+            owner_namespace = self._owner_namespace(namespace, owner_kind)
             self._require_exists(owner.kind, owner.name, owner_namespace)
+        self._validate_owner_matches_spec(resource)
+        self._validate_ownership_acyclic(resource)
+
+    def _validate_legal_owner_reference(self, resource: AnyResource) -> None:
+        allowed = LEGAL_OWNER_KINDS.get(resource.kind)
+        owners = resource.metadata.ownerReferences
+        if allowed is None:
+            if owners:
+                raise ValueError(f"{resource.kind.value} cannot set ownerReferences")
+            return
+        if len(owners) != 1 or not owners[0].controller:
+            raise ValueError(f"{resource.kind.value} requires exactly one controller ownerReference")
+        if owners[0].kind not in allowed:
+            allowed_names = ", ".join(sorted(kind.value for kind in allowed))
+            raise ValueError(f"{resource.kind.value} ownerReference must be one of: {allowed_names}")
+
+    def _validate_owner_matches_spec(self, resource: AnyResource) -> None:
+        if not resource.metadata.ownerReferences:
+            return
+        owner = resource.metadata.ownerReferences[0]
+        namespace = resource.metadata.namespace
+        if resource.kind == ResourceKind.WORKSPACE:
+            if owner.kind != ResourceKind.PLATFORM or owner.name != "local":
+                raise ValueError("Workspace ownerReference must be Platform local")
+        elif isinstance(resource, MissionResource | KnowledgeResource | KnowledgeIndexResource):
+            if owner.kind != ResourceKind.WORKSPACE or owner.name != namespace:
+                raise ValueError(f"{resource.kind.value} ownerReference must match metadata.namespace")
+        elif isinstance(resource, FleetResource):
+            if owner.kind != ResourceKind.MISSION or owner.name != resource.spec.mission:
+                raise ValueError("Fleet ownerReference must match spec.mission")
+        elif isinstance(resource, AgentResource):
+            if owner.kind != ResourceKind.FLEET or owner.name != resource.spec.fleet:
+                raise ValueError("Agent ownerReference must match spec.fleet")
+            fleet = self._load_resource(ResourceKind.FLEET, resource.spec.fleet, namespace, FleetResource)
+            if fleet.spec.mission != resource.spec.mission or fleet.spec.workspace != resource.spec.workspace:
+                raise ValueError("Agent spec must match owning Fleet workspace and mission")
+        elif isinstance(resource, AgentRunResource):
+            if owner.kind != ResourceKind.AGENT or owner.name != resource.spec.agentRef.name:
+                raise ValueError("AgentRun ownerReference must match spec.agentRef.name")
+            agent = self._load_resource(ResourceKind.AGENT, resource.spec.agentRef.name, namespace, AgentResource)
+            if agent.spec.mission != resource.spec.missionRef.name:
+                raise ValueError("AgentRun spec.missionRef must match owning Agent mission")
+        elif isinstance(resource, ContextResource):
+            if owner.kind != ResourceKind.AGENT_RUN:
+                raise ValueError("Context ownerReference must be AgentRun")
+            if resource.spec.agentRun and resource.spec.agentRun != owner.name:
+                raise ValueError("Context spec.agentRun must match ownerReference")
+            run = self._load_resource(ResourceKind.AGENT_RUN, owner.name, namespace, AgentRunResource)
+            if run.spec.contextRef.name != resource.metadata.name:
+                raise ValueError("Context metadata.name must match owning AgentRun spec.contextRef")
+            if run.spec.missionRef.name != resource.spec.mission:
+                raise ValueError("Context spec.mission must match owning AgentRun missionRef")
+        elif isinstance(resource, ArtifactResource):
+            if owner.kind != ResourceKind.AGENT_RUN or owner.name != resource.spec.producedBy.name:
+                raise ValueError("Artifact ownerReference must match spec.producedBy.name")
+
+    def _load_resource(
+        self,
+        kind: ResourceKind,
+        name: str,
+        namespace: str | None,
+        expected_type: type[_ResourceT],
+    ) -> _ResourceT:
+        manifest = self.get(kind, name, namespace)
+        if manifest is None:
+            display = self.display_name(namespace, name)
+            raise ValueError(f"{kind.value} {display} does not exist")
+        resource = parse_resource(manifest)
+        if not isinstance(resource, expected_type):
+            raise TypeError(f"expected {expected_type.__name__}, got {type(resource).__name__}")
+        return resource
+
+    def _validate_ownership_acyclic(self, resource: AnyResource) -> None:
+        kind_value, namespace_value, name_value = resource_key(
+            resource.kind,
+            resource.metadata.name,
+            resource.metadata.namespace,
+        )
+        target_key = (kind_value, namespace_value, name_value)
+        seen: set[tuple[str, str, str]] = set()
+        stack = [
+            (
+                ResourceKind(owner.kind).value,
+                self._owner_namespace(resource.metadata.namespace, ResourceKind(owner.kind)) or "",
+                owner.name,
+            )
+            for owner in resource.metadata.ownerReferences
+        ]
+        while stack:
+            current = stack.pop()
+            if current == target_key:
+                raise ValueError("ownerReferences must not create an ownership cycle")
+            if current in seen:
+                continue
+            seen.add(current)
+            owner_kind, owner_namespace, owner_name = current
+            manifest = self.get(owner_kind, owner_name, owner_namespace or None)
+            if manifest is None:
+                continue
+            owner_metadata = manifest.get("metadata") or {}
+            owner_resource = parse_resource(manifest)
+            for next_owner in owner_metadata.get("ownerReferences") or []:
+                next_kind = ResourceKind(next_owner.get("kind"))
+                stack.append(
+                    (
+                        next_kind.value,
+                        self._owner_namespace(owner_resource.metadata.namespace, next_kind) or "",
+                        str(next_owner.get("name")),
+                    )
+                )
+
+    @staticmethod
+    def _owner_namespace(child_namespace: str | None, owner_kind: ResourceKind) -> str | None:
+        if owner_kind == ResourceKind.WORKSPACE or owner_kind.value in CLUSTER_SCOPED_KINDS:
+            return None
+        if child_namespace is None:
+            raise ValueError(f"cannot reference namespaced owner {owner_kind.value} from a cluster-scoped resource")
+        return child_namespace
 
     def _require_exists(self, kind: str | ResourceKind, name: str | None, namespace: str | None) -> None:
         if not name:

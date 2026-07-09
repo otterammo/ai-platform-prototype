@@ -123,6 +123,14 @@ def create_app(
         if context is None:
             context = store.get(ResourceKind.CONTEXT, f"{mission}-context", namespace)
         if context is None:
+            contexts = [
+                item
+                for item in store.list(ResourceKind.CONTEXT, namespace)
+                if (item.get("spec") or {}).get("mission") == mission
+            ]
+            if contexts:
+                context = contexts[0]
+        if context is None:
             raise HTTPException(status_code=404, detail="context not found")
         return context
 

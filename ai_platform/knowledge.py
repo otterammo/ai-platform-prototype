@@ -414,10 +414,14 @@ class ContextBuilder:
         correlation_id: str | None = None,
         ensure_indexed: bool = True,
         context_name: str | None = None,
+        agent_run: str | None = None,
+        owner_references: list[JsonDict] | None = None,
     ) -> ContextBuildResult:
         namespace = mission.metadata.namespace
         if namespace is None:
             raise ValueError("Mission must have a namespace")
+        if not agent_run:
+            raise ValueError("Context builds must target an AgentRun")
         query = mission_query(mission)
         preferred = preferred_sources or mission_knowledge_refs(mission)
         if ensure_indexed:
@@ -487,6 +491,8 @@ class ContextBuilder:
             ordered,
             rendered_context,
             correlation_id,
+            agent_run,
+            owner_references,
         )
         return ContextBuildResult(
             context=context,
@@ -506,10 +512,19 @@ class ContextBuilder:
         chunks: JsonDictList,
         rendered_context: str,
         correlation_id: str | None,
+        agent_run: str,
+        owner_references: list[JsonDict] | None,
     ) -> JsonDict:
         namespace = mission.metadata.namespace
         if namespace is None:
             raise ValueError("Mission must have a namespace")
+        owners = owner_references or [
+            {
+                "kind": "AgentRun",
+                "name": agent_run,
+                "controller": True,
+            }
+        ]
         self.store.apply(
             {
                 "apiVersion": "ai.platform/v1",
@@ -517,16 +532,11 @@ class ContextBuilder:
                 "metadata": {
                     "name": context_name,
                     "namespace": namespace,
-                    "ownerReferences": [
-                        {
-                            "kind": "Mission",
-                            "name": mission.metadata.name,
-                            "controller": True,
-                        }
-                    ],
+                    "ownerReferences": owners,
                 },
                 "spec": {
                     "mission": mission.metadata.name,
+                    "agentRun": agent_run,
                     "query": query,
                     "knowledgeIndex": index_name,
                 },

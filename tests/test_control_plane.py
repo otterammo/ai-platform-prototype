@@ -355,7 +355,7 @@ def test_trace_generation_reconstructs_execution_graph(tmp_path: Path) -> None:
     assert trace["fleets"][0]["agents"][0]["capabilities"] == ["plan"]
     assert trace["fleets"][0]["agents"][0]["model"] == "stub-model"
     assert trace["fleets"][0]["agents"][0]["agentRuns"][0]["status"] == "Succeeded"
-    assert trace["fleets"][0]["agents"][0]["agentRuns"][0]["context"] == "build-auth-context"
+    assert trace["fleets"][0]["agents"][0]["agentRuns"][0]["context"] == "build-auth-fleet-planner-run-1-context"
     assert trace["fleets"][0]["agents"][1]["tools"] == ["git", "filesystem"]
     assert len(trace["artifacts"]) == 3
 
@@ -365,7 +365,7 @@ def test_trace_generation_reconstructs_execution_graph(tmp_path: Path) -> None:
     assert "Planner Agent" in formatted
     assert "Model stub-model" in formatted
     assert "AgentRun build-auth-fleet-planner-run-1" in formatted
-    assert "Context build-auth-context" in formatted
+    assert "Context build-auth-fleet-planner-run-1-context" in formatted
     assert "Tool filesystem" in formatted
     assert "Knowledge" in formatted
     assert "Index: default" in formatted

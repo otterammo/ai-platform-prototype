@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any
 
 from .events import correlation_id_from_manifest
-from .resources import AgentResource, FleetResource, MissionResource, ResourceKind, parse_resource
+from .resources import AgentResource, AgentRunResource, FleetResource, MissionResource, ResourceKind, parse_resource
 from .storage import ResourceStore
 
 JsonDict = dict[str, Any]
@@ -55,7 +55,7 @@ def build_trace(store: ResourceStore, mission_name: str, namespace: str | None) 
                 "strategy": fleet.spec.strategy,
                 "template": fleet.spec.template,
                 "conditions": fleet.status.model_dump(mode="json", exclude_none=True).get("conditions", []),
-                "agents": [_agent_trace(agent, artifacts, events) for agent in agents],
+                "agents": [_agent_trace(store, agent, artifacts, events) for agent in agents],
                 "events": _resource_events(events, ResourceKind.FLEET.value, fleet.metadata.name),
             }
         )
@@ -249,7 +249,8 @@ def _fleet_agents(store: ResourceStore, fleet: FleetResource) -> list[AgentResou
     )
 
 
-def _agent_trace(agent: AgentResource, artifacts: JsonDictList, events: JsonDictList) -> JsonDict:
+def _agent_trace(store: ResourceStore, agent: AgentResource, artifacts: JsonDictList, events: JsonDictList) -> JsonDict:
+    runs = _agent_runs(store, agent)
     return {
         "name": agent.metadata.name,
         "role": agent.spec.role,
@@ -259,7 +260,27 @@ def _agent_trace(agent: AgentResource, artifacts: JsonDictList, events: JsonDict
         "model": agent.spec.pilot.modelRef if agent.spec.pilot and agent.spec.pilot.modelRef else _model_name(agent),
         "conditions": agent.status.model_dump(mode="json", exclude_none=True).get("conditions", []),
         "artifacts": [artifact for artifact in artifacts if artifact["agent"] == agent.metadata.name],
+        "agentRuns": [_agent_run_trace(run, artifacts, events) for run in runs],
         "events": _agent_events(events, agent.metadata.name),
+    }
+
+
+def _agent_runs(store: ResourceStore, agent: AgentResource) -> list[AgentRunResource]:
+    runs: list[AgentRunResource] = []
+    for manifest in store.list(ResourceKind.AGENT_RUN, agent.metadata.namespace):
+        candidate = parse_resource(manifest)
+        if isinstance(candidate, AgentRunResource) and candidate.spec.agentRef.name == agent.metadata.name:
+            runs.append(candidate)
+    return sorted(runs, key=lambda item: item.metadata.name)
+
+
+def _agent_run_trace(run: AgentRunResource, artifacts: JsonDictList, events: JsonDictList) -> JsonDict:
+    return {
+        "name": run.metadata.name,
+        "status": run.status.phase,
+        "context": run.spec.contextRef.name,
+        "artifacts": [artifact for artifact in artifacts if artifact.get("agentRun") == run.metadata.name],
+        "events": _resource_events(events, ResourceKind.AGENT_RUN.value, run.metadata.name),
     }
 
 
@@ -302,6 +323,13 @@ def _agent_detail_lines(agent: JsonDict) -> list[str]:
     lines.append("Tools")
     lines.extend(f"Tool {tool}" for tool in agent["tools"])
     lines.extend(_policy_detail_lines(agent["events"]))
+    for run in agent.get("agentRuns") or []:
+        lines.append(f"AgentRun {run['name']}")
+        lines.append(f"Context {run['context']}")
+        for artifact in run.get("artifacts") or []:
+            lines.append(f"Artifact {artifact.get('name') or artifact.get('path')}")
+        lines.extend(_policy_detail_lines(run.get("events") or []))
+        lines.append(_display_status(run["status"]))
     lines.append(_display_status(agent["status"]))
     return lines
 
@@ -327,9 +355,9 @@ def _policy_detail_lines(events: JsonDictList) -> list[str]:
             lines.append(f"Approval granted {approval_id}")
         elif event_type == "ApprovalRejected":
             lines.append(f"Approval rejected {approval_id}")
-        elif event_type == "AgentPaused":
+        elif event_type in {"AgentPaused", "AgentRunWaiting"}:
             lines.append("Agent paused")
-        elif event_type == "AgentResumed":
+        elif event_type in {"AgentResumed", "AgentRunResumed"}:
             lines.append("Agent resumed")
     return lines
 
@@ -365,7 +393,15 @@ def _timeline_message(event: JsonDict) -> str:
         "AgentStarted": f"{_short_agent_name(resource_name)} started",
         "AgentCompleted": f"{_short_agent_name(resource_name)} completed",
         "AgentFailed": f"{_short_agent_name(resource_name)} failed",
+        "AgentRunCreated": f"AgentRun {resource_name} created",
+        "AgentRunScheduled": f"AgentRun {resource_name} scheduled",
+        "AgentRunStarted": f"AgentRun {resource_name} started",
+        "AgentRunCompleted": f"AgentRun {resource_name} completed",
+        "AgentRunFailed": f"AgentRun {resource_name} failed",
+        "AgentRunWaiting": f"AgentRun {resource_name} waiting for approval",
+        "AgentRunResumed": f"AgentRun {resource_name} resumed",
         "ArtifactCreated": "Artifact created",
+        "ArtifactReady": "Artifact ready",
         "KnowledgeLoaded": f"Knowledge loaded {payload.get('knowledgeRef')}",
         "KnowledgeIndexed": f"Knowledge indexed {payload.get('knowledgeIndex')}",
         "ChunkCreated": f"Knowledge chunk created {payload.get('document')}",
@@ -440,6 +476,19 @@ def _artifacts_for_resource(
         if not isinstance(mission_name, str):
             return []
         return [artifact for artifact in store.list_artifacts(namespace, mission_name) if artifact["agent"] == name]
+    if kind == ResourceKind.AGENT_RUN.value:
+        spec = resource.get("spec") or {}
+        mission_ref = spec.get("missionRef") or {}
+        mission_name = mission_ref.get("name")
+        if not isinstance(mission_name, str):
+            return []
+        return [
+            artifact for artifact in store.list_artifacts(namespace, mission_name) if artifact.get("agentRun") == name
+        ]
+    if kind == ResourceKind.ARTIFACT.value:
+        spec = resource.get("spec") or {}
+        produced_by = spec.get("producedBy") or {}
+        return [{"name": name, "path": spec.get("path"), "agentRun": produced_by.get("name")}]
     return []
 
 
@@ -453,6 +502,9 @@ def _children_for_resource(
     if kind == ResourceKind.MISSION.value:
         fleets = []
         agents = []
+        agent_runs = []
+        contexts = []
+        artifacts = []
         for fleet_manifest in store.list(ResourceKind.FLEET, namespace):
             fleet = parse_resource(fleet_manifest)
             if isinstance(fleet, FleetResource) and fleet.spec.mission == name:
@@ -468,7 +520,36 @@ def _children_for_resource(
                         "phase": agent.status.phase,
                     }
                 )
-        return {"fleets": fleets, "agents": agents}
+        for run_manifest in store.list(ResourceKind.AGENT_RUN, namespace):
+            run = parse_resource(run_manifest)
+            if isinstance(run, AgentRunResource) and run.spec.missionRef.name == name:
+                agent_runs.append(
+                    {
+                        "kind": "AgentRun",
+                        "name": run.metadata.name,
+                        "agent": run.spec.agentRef.name,
+                        "phase": run.status.phase,
+                    }
+                )
+        for context_manifest in store.list(ResourceKind.CONTEXT, namespace):
+            spec = context_manifest.get("spec") or {}
+            if spec.get("mission") == name:
+                contexts.append(
+                    {
+                        "kind": "Context",
+                        "name": (context_manifest.get("metadata") or {}).get("name"),
+                        "phase": (context_manifest.get("status") or {}).get("phase"),
+                    }
+                )
+        for artifact in store.list_artifacts(namespace, name):
+            artifacts.append({"kind": "Artifact", "name": artifact.get("name"), "path": artifact.get("path")})
+        return {
+            "fleets": fleets,
+            "agents": agents,
+            "agentRuns": agent_runs,
+            "contexts": contexts,
+            "artifacts": artifacts,
+        }
     if kind == ResourceKind.FLEET.value:
         agents = []
         for agent_manifest in store.list(ResourceKind.AGENT, namespace):
@@ -476,6 +557,13 @@ def _children_for_resource(
             if isinstance(agent, AgentResource) and agent.spec.fleet == name:
                 agents.append({"kind": "Agent", "name": agent.metadata.name, "phase": agent.status.phase})
         return {"agents": agents}
+    if kind == ResourceKind.AGENT.value:
+        runs = []
+        for run_manifest in store.list(ResourceKind.AGENT_RUN, namespace):
+            run = parse_resource(run_manifest)
+            if isinstance(run, AgentRunResource) and run.spec.agentRef.name == name:
+                runs.append({"kind": "AgentRun", "name": run.metadata.name, "phase": run.status.phase})
+        return {"agentRuns": runs}
     return {}
 
 
@@ -519,6 +607,17 @@ def _referenced_resources(resource: JsonDict, kind: str) -> JsonDictList:
         pilot = spec.get("pilot") or {}
         if pilot.get("modelRef"):
             references.append({"kind": "Model", "name": pilot["modelRef"]})
+    elif kind == ResourceKind.AGENT_RUN.value:
+        references.extend(
+            [
+                {"kind": "Agent", "name": (spec.get("agentRef") or {}).get("name")},
+                {"kind": "Mission", "name": (spec.get("missionRef") or {}).get("name")},
+                {"kind": "Context", "name": (spec.get("contextRef") or {}).get("name")},
+            ]
+        )
+    elif kind == ResourceKind.ARTIFACT.value:
+        produced_by = spec.get("producedBy") or {}
+        references.append({"kind": produced_by.get("kind"), "name": produced_by.get("name")})
     return references
 
 

@@ -1,4 +1,11 @@
 apiVersion: ai.platform/v1
+kind: Platform
+metadata:
+  name: local
+spec:
+  mode: local
+---
+apiVersion: ai.platform/v1
 kind: Workspace
 metadata:
   name: demo

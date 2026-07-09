@@ -9,12 +9,14 @@ The prototype treats AI work as resources:
 - `FleetTemplate` declares the Agent topology for a class of work.
 - `Fleet` is instantiated from a Mission and FleetTemplate.
 - `Capability`, `Tool`, and `Model` describe what Agents need and how the platform can satisfy it.
+- `AgentRun` records a scheduled execution for an Agent.
 - `Policy` declares admission rules for runtime actions.
 - `Approval` records a pending, approved, or rejected action decision.
 - `Agent` is created by the Fleet controller and executes through an embedded `Pilot`.
 - `Knowledge` records describe workspace knowledge nodes separately from manifests.
 - `KnowledgeIndex` manages indexed markdown knowledge sources for retrieval.
 - `Context` records the assembled knowledge context consumed by a Mission run.
+- `Artifact` records files produced by AgentRuns.
 
 Resources use the shape:
 
@@ -38,19 +40,19 @@ status:
 The registry-driven reconciliation flow is:
 
 ```text
-Mission -> FleetTemplate -> Fleet -> Agents -> Capabilities -> Tools/Pilot/Model
+Platform -> Workspace -> Mission -> FleetTemplate -> Fleet -> Agent -> AgentRun -> Pilot/Model
 ```
 
 Runtime actions pass through the policy engine before side effects occur:
 
 ```text
-Agent -> Policy Engine -> Approval Service (optional) -> Runtime
+AgentRun Worker -> Policy Engine -> Approval Service (optional) -> Runtime
 ```
 
 Knowledge now flows through an indexed retrieval path before model invocation:
 
 ```text
-Knowledge Storage -> KnowledgeIndex -> Retriever -> Context -> Model Invocation
+Knowledge Storage -> KnowledgeIndexController -> ContextController -> Context -> AgentRun Worker
 ```
 
 ## Install
@@ -108,6 +110,8 @@ platform --db sqlite:///./platform.db --root .platform get fleettemplates
 platform --db sqlite:///./platform.db --root .platform get capabilities
 platform --db sqlite:///./platform.db --root .platform get models
 platform --db sqlite:///./platform.db --root .platform get tools
+platform --db sqlite:///./platform.db --root .platform get agentruns -n demo
+platform --db sqlite:///./platform.db --root .platform get artifacts -n demo
 platform --db sqlite:///./platform.db --root .platform get policies
 platform --db sqlite:///./platform.db --root .platform get knowledge -n demo
 platform --db sqlite:///./platform.db --root .platform get knowledgeindexes -n demo
@@ -133,6 +137,7 @@ Useful endpoints:
 - `DELETE /resources/{kind}/{name}?namespace=demo`
 - `POST /reconcile`
 - `GET /events`
+- `GET /agentruns`
 - `GET /knowledge`
 - `GET /knowledge/search`
 - `GET /knowledge/indexes`
@@ -142,8 +147,11 @@ Useful endpoints:
 - `POST /approvals/{id}/approve`
 - `POST /approvals/{id}/reject`
 - `GET /artifacts`
+- `GET /artifact-resources`
 
-Deleting a Mission or Workspace removes the corresponding resource and artifact records from SQLite, but it does not delete artifact files from disk.
+Deleting a Mission or Workspace removes the corresponding resource and Artifact records from SQLite, but it does not delete artifact files from disk.
+
+The local prototype keeps the scheduler and worker in process. Controllers create desired resources; the scheduler marks Pending AgentRuns as Scheduled; the local worker executes only Scheduled AgentRuns and records Artifact resources.
 
 ## Knowledge Index And Retrieval
 

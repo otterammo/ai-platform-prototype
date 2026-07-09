@@ -10,15 +10,14 @@ from uuid import uuid4
 
 from .events import CORRELATION_ID_STATUS_KEY, EventContext, correlation_id_from_manifest
 from .resources import (
-    AgentResource,
+    AgentRunResource,
     ApprovalResource,
-    FleetResource,
     PolicyResource,
     PolicyRule,
     ResourceKind,
     parse_resource,
 )
-from .storage import ResourceStore
+from .storage import CONTROLLER_FIELD_MANAGER, ResourceStore
 
 
 class PolicyEffect(StrEnum):
@@ -35,6 +34,7 @@ class RuntimeAction:
     workspace: str | None = None
     mission: str | None = None
     agent: str | None = None
+    agentRun: str | None = None
     correlation_id: str | None = None
 
     @property
@@ -46,6 +46,7 @@ class RuntimeAction:
             "workspace": self.workspace,
             "mission": self.mission,
             "agent": self.agent,
+            "agentRun": self.agentRun,
         }
         encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
@@ -63,6 +64,8 @@ class RuntimeAction:
             payload["mission"] = self.mission
         if self.agent:
             payload["agent"] = self.agent
+        if self.agentRun:
+            payload["agentRun"] = self.agentRun
         if self.correlation_id:
             payload["correlationId"] = self.correlation_id
         return payload
@@ -159,7 +162,7 @@ class PolicyEngine:
                     f"Approval {approval.metadata.name} requested",
                     approval_id=approval.metadata.name,
                 )
-            self._pause_agent(action, decision, approval.metadata.name)
+            self._pause_agent_run(action, decision, approval.metadata.name)
             raise ApprovalRequired(approval.metadata.name, action)
 
         self._emit_policy_event("PolicyDenied", action, decision, f"Denied {action.tool}/{action.operation}")
@@ -213,6 +216,7 @@ class PolicyEngine:
                 "workspace": action.workspace or "",
                 "mission": action.mission or "",
                 "agent": action.agent or "",
+                "agentRun": action.agentRun,
                 "action": action.to_payload(),
                 "actionHash": action.action_hash,
                 "policy": decision.policy_name,
@@ -220,7 +224,11 @@ class PolicyEngine:
             },
             "status": {"phase": "Pending"},
         }
-        applied = self.store.apply(manifest, event_context=self._context(action, "CreateApproval", decision.reason))
+        applied = self.store.apply(
+            manifest,
+            event_context=self._context(action, "CreateApproval", decision.reason),
+            field_manager=CONTROLLER_FIELD_MANAGER,
+        )
         self.store.update_status(
             ResourceKind.APPROVAL,
             name,
@@ -250,17 +258,17 @@ class PolicyEngine:
             if self.store.get(ResourceKind.APPROVAL, name) is None:
                 return name
 
-    def _pause_agent(self, action: RuntimeAction, decision: PolicyDecision, approval_id: str) -> None:
-        if not action.agent or not action.workspace:
+    def _pause_agent_run(self, action: RuntimeAction, decision: PolicyDecision, approval_id: str) -> None:
+        if not action.agentRun or not action.workspace:
             return
-        agent_manifest = self.store.get(ResourceKind.AGENT, action.agent, action.workspace)
-        if agent_manifest is None:
+        run_manifest = self.store.get(ResourceKind.AGENT_RUN, action.agentRun, action.workspace)
+        if run_manifest is None:
             return
-        agent = parse_resource(agent_manifest)
-        if not isinstance(agent, AgentResource):
+        run = parse_resource(run_manifest)
+        if not isinstance(run, AgentRunResource):
             return
 
-        message = f"Agent paused pending approval {approval_id}"
+        message = f"AgentRun paused pending approval {approval_id}"
         pause_data = {
             "pendingApproval": approval_id,
             "approval": approval_id,
@@ -269,49 +277,14 @@ class PolicyEngine:
             "ruleIndex": decision.rule_index,
         }
         self.store.update_status(
-            ResourceKind.AGENT,
-            agent.metadata.name,
-            agent.metadata.namespace,
-            "Waiting",
+            ResourceKind.AGENT_RUN,
+            run.metadata.name,
+            run.metadata.namespace,
+            "WaitingForApproval",
             message,
             pause_data,
-            event_type="AgentPaused",
-            event_context=self._context(action, "PauseAgent", "ApprovalRequired"),
-        )
-        self._mark_parents_waiting(agent, approval_id, action)
-
-    def _mark_parents_waiting(self, agent: AgentResource, approval_id: str, action: RuntimeAction) -> None:
-        namespace = agent.metadata.namespace
-        if not namespace:
-            return
-        fleet_manifest = self.store.get(ResourceKind.FLEET, agent.spec.fleet, namespace)
-        if fleet_manifest is None:
-            return
-        fleet = parse_resource(fleet_manifest)
-        if not isinstance(fleet, FleetResource):
-            return
-
-        message = f"Waiting for approval {approval_id} for Agent {agent.metadata.name}"
-        data = {"agent": agent.metadata.name, "approval": approval_id, "approvalId": approval_id}
-        self.store.update_status(
-            ResourceKind.FLEET,
-            fleet.metadata.name,
-            namespace,
-            "Waiting",
-            message,
-            data,
-            event_type="FleetWaiting",
-            event_context=self._context(action, "PauseFleet", "AgentWaitingForApproval"),
-        )
-        self.store.update_status(
-            ResourceKind.MISSION,
-            fleet.spec.mission,
-            namespace,
-            "Waiting",
-            message,
-            {"fleet": fleet.metadata.name, **data},
-            event_type="MissionWaiting",
-            event_context=self._context(action, "PauseMission", "AgentWaitingForApproval"),
+            event_type="AgentRunWaiting",
+            event_context=self._context(action, "PauseAgentRun", "ApprovalRequired"),
         )
 
     def _emit_policy_event(
@@ -326,8 +299,8 @@ class PolicyEngine:
         payload = self._event_payload(action, decision, approval_id)
         self.store.emit_event(
             event_type,
-            ResourceKind.AGENT if action.agent else None,
-            action.agent,
+            ResourceKind.AGENT_RUN if action.agentRun else (ResourceKind.AGENT if action.agent else None),
+            action.agentRun or action.agent,
             action.workspace,
             message,
             payload,
@@ -394,7 +367,7 @@ class ApprovalService:
             payload,
             event_context=self._context(approval, "GrantApproval", "ApprovalGranted"),
         )
-        self._resume_agent(approval, actor)
+        self._resume_agent_run(approval, actor)
         refreshed = self.store.get(ResourceKind.APPROVAL, approval.metadata.name)
         if refreshed is None:
             raise KeyError(f"Approval {name} not found after approval")
@@ -426,7 +399,7 @@ class ApprovalService:
             payload,
             event_context=self._context(approval, "RejectApproval", "ApprovalRejected"),
         )
-        self._fail_agent_and_parents(approval, actor, decision_reason)
+        self._fail_agent_run(approval, actor, decision_reason)
         refreshed = self.store.get(ResourceKind.APPROVAL, approval.metadata.name)
         if refreshed is None:
             raise KeyError(f"Approval {name} not found after rejection")
@@ -443,37 +416,41 @@ class ApprovalService:
             raise ValueError(f"Approval {name} is {resource.status.phase}, not Pending")
         return resource
 
-    def _resume_agent(self, approval: ApprovalResource, actor: str) -> None:
-        agent_manifest = self.store.get(ResourceKind.AGENT, approval.spec.agent, approval.spec.workspace)
-        if agent_manifest is None:
+    def _resume_agent_run(self, approval: ApprovalResource, actor: str) -> None:
+        if not approval.spec.agentRun:
             return
-        agent = parse_resource(agent_manifest)
-        if not isinstance(agent, AgentResource):
+        run_manifest = self.store.get(ResourceKind.AGENT_RUN, approval.spec.agentRun, approval.spec.workspace)
+        if run_manifest is None:
+            return
+        run = parse_resource(run_manifest)
+        if not isinstance(run, AgentRunResource):
             return
         self.store.update_status(
-            ResourceKind.AGENT,
-            agent.metadata.name,
-            agent.metadata.namespace,
+            ResourceKind.AGENT_RUN,
+            run.metadata.name,
+            run.metadata.namespace,
             "Pending",
-            f"Approval {approval.metadata.name} granted by {actor}; agent resumed",
+            f"Approval {approval.metadata.name} granted by {actor}; AgentRun resumed",
             {"approval": approval.metadata.name, "approvalId": approval.metadata.name, "approvedBy": actor},
-            event_type="AgentResumed",
-            event_context=self._context(approval, "ResumeAgent", "ApprovalGranted"),
+            event_type="AgentRunResumed",
+            event_context=self._context(approval, "ResumeAgentRun", "ApprovalGranted"),
             clear_data_keys=["pendingApproval"],
         )
 
-    def _fail_agent_and_parents(self, approval: ApprovalResource, actor: str, reason: str) -> None:
-        agent_manifest = self.store.get(ResourceKind.AGENT, approval.spec.agent, approval.spec.workspace)
-        if agent_manifest is None:
+    def _fail_agent_run(self, approval: ApprovalResource, actor: str, reason: str) -> None:
+        if not approval.spec.agentRun:
             return
-        agent = parse_resource(agent_manifest)
-        if not isinstance(agent, AgentResource):
+        run_manifest = self.store.get(ResourceKind.AGENT_RUN, approval.spec.agentRun, approval.spec.workspace)
+        if run_manifest is None:
+            return
+        run = parse_resource(run_manifest)
+        if not isinstance(run, AgentRunResource):
             return
         message = f"Approval {approval.metadata.name} rejected by {actor}: {reason}"
         self.store.update_status(
-            ResourceKind.AGENT,
-            agent.metadata.name,
-            agent.metadata.namespace,
+            ResourceKind.AGENT_RUN,
+            run.metadata.name,
+            run.metadata.namespace,
             "Failed",
             message,
             {
@@ -482,47 +459,9 @@ class ApprovalService:
                 "rejectedBy": actor,
                 "error": reason,
             },
-            event_type="AgentFailed",
-            event_context=self._context(approval, "FailAgent", "ApprovalRejected"),
+            event_type="AgentRunFailed",
+            event_context=self._context(approval, "FailAgentRun", "ApprovalRejected"),
             clear_data_keys=["pendingApproval"],
-        )
-        self._fail_parents(agent, approval, message, reason)
-
-    def _fail_parents(self, agent: AgentResource, approval: ApprovalResource, message: str, reason: str) -> None:
-        namespace = agent.metadata.namespace
-        if not namespace:
-            return
-        fleet_manifest = self.store.get(ResourceKind.FLEET, agent.spec.fleet, namespace)
-        if fleet_manifest is None:
-            return
-        fleet = parse_resource(fleet_manifest)
-        if not isinstance(fleet, FleetResource):
-            return
-        data = {
-            "agent": agent.metadata.name,
-            "approval": approval.metadata.name,
-            "approvalId": approval.metadata.name,
-            "error": reason,
-        }
-        self.store.update_status(
-            ResourceKind.FLEET,
-            fleet.metadata.name,
-            namespace,
-            "Failed",
-            message,
-            data,
-            event_type="FleetFailed",
-            event_context=self._context(approval, "FailFleet", "ApprovalRejected"),
-        )
-        self.store.update_status(
-            ResourceKind.MISSION,
-            fleet.spec.mission,
-            namespace,
-            "Failed",
-            message,
-            {"fleet": fleet.metadata.name, **data},
-            event_type="MissionFailed",
-            event_context=self._context(approval, "FailMission", "ApprovalRejected"),
         )
 
     @staticmethod

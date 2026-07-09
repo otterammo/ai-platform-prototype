@@ -242,7 +242,7 @@ def test_protected_action_creates_approval_pauses_and_does_not_duplicate(tmp_pat
 
     assert len(store.list(ResourceKind.APPROVAL)) == 1
     event_types = {event["type"] for event in store.list_events(namespace="demo", limit=100)}
-    assert {"PolicyEvaluated", "ApprovalRequested", "AgentPaused", "FleetWaiting", "MissionWaiting"}.issubset(
+    assert {"PolicyEvaluated", "ApprovalRequested", "AgentRunWaiting", "FleetWaiting", "MissionWaiting"}.issubset(
         event_types
     )
 
@@ -270,7 +270,7 @@ def test_approval_workflow_resumes_and_completes(tmp_path: Path) -> None:
     correlation_id = mission["status"]["data"]["correlationId"]
     events = store.list_events(namespace="demo", correlation_id=correlation_id, limit=None, ascending=True)
     event_types = {event["type"] for event in events}
-    assert {"ApprovalGranted", "AgentResumed", "PolicyAllowed", "AgentCompleted", "MissionCompleted"}.issubset(
+    assert {"ApprovalGranted", "AgentRunResumed", "PolicyAllowed", "AgentCompleted", "MissionCompleted"}.issubset(
         event_types
     )
     for event in events:
@@ -279,8 +279,8 @@ def test_approval_workflow_resumes_and_completes(tmp_path: Path) -> None:
             "PolicyAllowed",
             "ApprovalRequested",
             "ApprovalGranted",
-            "AgentPaused",
-            "AgentResumed",
+            "AgentRunWaiting",
+            "AgentRunResumed",
         }:
             assert event["controller"]
             assert event["action"]
@@ -295,6 +295,7 @@ def test_rejection_workflow_fails_agent_fleet_and_mission(tmp_path: Path) -> Non
     approval_id = approval_name(store)
 
     ApprovalService(store).reject(approval_id, actor="bob", reason="too risky")
+    asyncio.run(ControlPlane(store).reconcile_once())
 
     approval = store.get(ResourceKind.APPROVAL, approval_id)
     mission = store.get(ResourceKind.MISSION, "implement-auth", "demo")
@@ -311,7 +312,7 @@ def test_rejection_workflow_fails_agent_fleet_and_mission(tmp_path: Path) -> Non
     assert "pendingApproval" not in agent["status"]["data"]
 
     event_types = {event["type"] for event in store.list_events(namespace="demo", limit=100)}
-    assert {"ApprovalRejected", "AgentFailed", "FleetFailed", "MissionFailed"}.issubset(event_types)
+    assert {"ApprovalRejected", "AgentRunFailed", "AgentFailed", "FleetFailed", "MissionFailed"}.issubset(event_types)
 
 
 def test_policy_denial_fails_without_creating_approval(tmp_path: Path) -> None:

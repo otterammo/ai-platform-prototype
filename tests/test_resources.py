@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from ai_platform.resources import parse_resource_documents
+from ai_platform.resources import ResourceKind, parse_resource_documents
+from ai_platform.storage import ResourceStore
 
 
 def test_parse_resource_documents_validates_hierarchy() -> None:
@@ -27,6 +28,87 @@ spec:
 
     assert [resource.kind for resource in resources] == ["Workspace", "Mission"]
     assert resources[1].metadata.namespace == "demo"
+
+
+def test_parse_platform_owner_references_agent_run_and_artifact() -> None:
+    resources = parse_resource_documents(
+        """
+apiVersion: ai.platform/v1
+kind: Platform
+metadata:
+  name: local
+spec:
+  mode: local
+---
+apiVersion: ai.platform/v1
+kind: AgentRun
+metadata:
+  name: coder-run-1
+  workspace: demo
+  ownerReferences:
+    - kind: Agent
+      name: coder
+      controller: true
+spec:
+  agentRef:
+    name: coder
+  missionRef:
+    name: implement-auth
+  contextRef:
+    name: implement-auth-context
+---
+apiVersion: ai.platform/v1
+kind: Artifact
+metadata:
+  name: coder-output
+  namespace: demo
+  ownerReferences:
+    - kind: AgentRun
+      name: coder-run-1
+      controller: true
+spec:
+  type: markdown
+  path: artifacts/coder-output.md
+  producedBy:
+    kind: AgentRun
+    name: coder-run-1
+"""
+    )
+
+    assert [resource.kind for resource in resources] == ["Platform", "AgentRun", "Artifact"]
+    assert resources[1].metadata.namespace == "demo"
+    assert resources[1].metadata.ownerReferences[0].kind == ResourceKind.AGENT
+    assert resources[2].spec.producedBy.name == "coder-run-1"
+
+
+def test_metadata_workspace_alias_must_match_namespace() -> None:
+    resources = parse_resource_documents(
+        """
+apiVersion: ai.platform/v1
+kind: Mission
+metadata:
+  name: build-auth
+  workspace: demo
+spec:
+  objective: Build authentication
+"""
+    )
+
+    assert resources[0].metadata.namespace == "demo"
+
+    with pytest.raises(ValueError, match="workspace must match"):
+        parse_resource_documents(
+            """
+apiVersion: ai.platform/v1
+kind: Mission
+metadata:
+  name: build-auth
+  namespace: demo
+  workspace: other
+spec:
+  objective: Build authentication
+"""
+        )
 
 
 def test_parse_v1_registry_and_knowledge_resources() -> None:
@@ -259,4 +341,36 @@ spec:
   sources:
     - knowledge://../secret.md
 """
+        )
+
+
+def test_store_bootstraps_platform_and_rejects_status_apply(tmp_path) -> None:
+    store = ResourceStore(f"sqlite:///{tmp_path / 'platform.db'}", tmp_path / "platform")
+
+    platform = store.get(ResourceKind.PLATFORM, "local")
+    assert platform is not None
+    assert platform["status"]["phase"] == "Ready"
+
+    with pytest.raises(ValueError, match="status is controller-owned"):
+        store.apply(
+            {
+                "apiVersion": "ai.platform/v1",
+                "kind": "Workspace",
+                "metadata": {"name": "demo"},
+                "status": {"phase": "Ready"},
+            }
+        )
+
+
+def test_store_admission_rejects_orphan_children(tmp_path) -> None:
+    store = ResourceStore(f"sqlite:///{tmp_path / 'platform.db'}", tmp_path / "platform")
+
+    with pytest.raises(ValueError, match="Workspace demo does not exist"):
+        store.apply(
+            {
+                "apiVersion": "ai.platform/v1",
+                "kind": "Mission",
+                "metadata": {"name": "build-auth", "namespace": "demo"},
+                "spec": {"objective": "Build authentication"},
+            }
         )

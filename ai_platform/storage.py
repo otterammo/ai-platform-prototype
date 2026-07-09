@@ -20,8 +20,17 @@ from .events import (
     new_correlation_id,
 )
 from .resources import (
+    CLUSTER_SCOPED_KINDS,
     AgentResource,
+    AgentRunResource,
+    AnyResource,
+    ArtifactResource,
+    ContextResource,
     FleetResource,
+    KnowledgeIndexResource,
+    KnowledgeResource,
+    MissionResource,
+    OwnerReference,
     ResourceKind,
     dump_resource,
     parse_resource,
@@ -29,6 +38,7 @@ from .resources import (
 )
 
 DEFAULT_DB_URL = "sqlite:///./platform.db"
+CONTROLLER_FIELD_MANAGER = "controller"
 
 
 def utcnow() -> datetime:
@@ -110,6 +120,22 @@ def make_engine(database_url: str = DEFAULT_DB_URL) -> Engine:
     return create_engine(database_url, connect_args=connect_args)
 
 
+def _is_default_status(value: Any) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, dict):
+        return False
+    allowed_keys = {"phase", "observedGeneration", "conditions", "data"}
+    if any(key not in allowed_keys for key in value):
+        return False
+    return (
+        value.get("phase", "Pending") == "Pending"
+        and value.get("observedGeneration", 0) == 0
+        and value.get("conditions", []) == []
+        and value.get("data", {}) == {}
+    )
+
+
 class ResourceStore:
     def __init__(self, database_url: str = DEFAULT_DB_URL, platform_root: str | Path = ".platform") -> None:
         self.database_url = database_url
@@ -117,6 +143,7 @@ class ResourceStore:
         self.engine = make_engine(database_url)
         self.session_factory = sessionmaker(self.engine, expire_on_commit=False)
         Base.metadata.create_all(self.engine)
+        self._ensure_platform()
 
     @contextmanager
     def session(self) -> Iterator[Session]:
@@ -130,8 +157,18 @@ class ResourceStore:
         finally:
             session.close()
 
-    def apply(self, manifest: JsonDict, event_context: EventContext | None = None) -> JsonDict:
+    def apply(
+        self,
+        manifest: JsonDict,
+        event_context: EventContext | None = None,
+        *,
+        field_manager: str = "user",
+    ) -> JsonDict:
+        if field_manager == "user" and "status" in manifest and not _is_default_status(manifest.get("status")):
+            raise ValueError("status is controller-owned and cannot be set during apply")
         resource = parse_resource(manifest)
+        self._default_owner_references(resource)
+        self._admit(resource)
         kind, namespace, name = resource_key(resource.kind, resource.metadata.name, resource.metadata.namespace)
         correlation_id = event_context.correlation_id if event_context else None
         if kind == ResourceKind.MISSION.value:
@@ -150,7 +187,9 @@ class ResourceStore:
                 )
             )
             event_type = f"{kind}Created"
+            previous_manifest: JsonDict | None = None
             if record:
+                previous_manifest = dict(record.manifest)
                 resource.metadata.generation = record.generation + 1
                 resource.status = parse_resource(record.manifest).status
                 if correlation_id:
@@ -178,7 +217,11 @@ class ResourceStore:
                 )
                 session.add(record)
             event_payload = self._structured_payload(
-                {"generation": resource.metadata.generation},
+                {
+                    "generation": resource.metadata.generation,
+                    "resourceSnapshot": dump_resource(resource),
+                    **({"previousResourceSnapshot": previous_manifest} if previous_manifest else {}),
+                },
                 event_context,
                 default_controller="ResourceStore",
                 default_action=event_type,
@@ -198,6 +241,119 @@ class ResourceStore:
                 )
             )
             return record.manifest
+
+    def _ensure_platform(self) -> None:
+        with self.session() as session:
+            existing = session.scalar(
+                select(ResourceRecord).where(
+                    ResourceRecord.kind == ResourceKind.PLATFORM.value,
+                    ResourceRecord.namespace == "",
+                    ResourceRecord.name == "local",
+                )
+            )
+            if existing:
+                return
+            manifest = {
+                "apiVersion": "ai.platform/v1",
+                "kind": "Platform",
+                "metadata": {"name": "local"},
+                "spec": {"mode": "local"},
+                "status": {"phase": "Ready", "observedGeneration": 1},
+            }
+            session.add(
+                ResourceRecord(
+                    api_version="ai.platform/v1",
+                    kind=ResourceKind.PLATFORM.value,
+                    namespace="",
+                    name="local",
+                    generation=1,
+                    manifest=manifest,
+                )
+            )
+
+    def _default_owner_references(self, resource: AnyResource) -> None:
+        if resource.metadata.ownerReferences:
+            return
+        owner: OwnerReference | None = None
+        namespace = resource.metadata.namespace
+        if resource.kind == ResourceKind.WORKSPACE:
+            owner = OwnerReference(kind=ResourceKind.PLATFORM, name="local", controller=True)
+        elif isinstance(resource, MissionResource | KnowledgeResource | KnowledgeIndexResource):
+            owner = OwnerReference(kind=ResourceKind.WORKSPACE, name=namespace or "", controller=True)
+        elif isinstance(resource, ContextResource):
+            owner = OwnerReference(kind=ResourceKind.MISSION, name=resource.spec.mission, controller=True)
+        elif isinstance(resource, FleetResource):
+            owner = OwnerReference(kind=ResourceKind.MISSION, name=resource.spec.mission, controller=True)
+        elif isinstance(resource, AgentResource):
+            owner = OwnerReference(kind=ResourceKind.FLEET, name=resource.spec.fleet, controller=True)
+        elif isinstance(resource, AgentRunResource):
+            owner = OwnerReference(kind=ResourceKind.AGENT, name=resource.spec.agentRef.name, controller=True)
+        elif isinstance(resource, ArtifactResource):
+            owner = OwnerReference(kind=ResourceKind.AGENT_RUN, name=resource.spec.producedBy.name, controller=True)
+        if owner is not None:
+            resource.metadata.ownerReferences = [owner]
+
+    def _admit(self, resource: AnyResource) -> None:
+        namespace = resource.metadata.namespace
+        if resource.kind == ResourceKind.PLATFORM:
+            self._validate_owner_references(resource)
+            return
+
+        if resource.kind == ResourceKind.WORKSPACE:
+            self._require_exists(ResourceKind.PLATFORM, "local", None)
+            self._validate_owner_references(resource)
+            return
+
+        if resource.kind.value not in CLUSTER_SCOPED_KINDS:
+            if not namespace:
+                raise ValueError(f"{resource.kind.value} must name a workspace")
+            self._require_exists(ResourceKind.WORKSPACE, namespace, None)
+
+        if isinstance(resource, FleetResource):
+            self._require_exists(ResourceKind.MISSION, resource.spec.mission, namespace)
+        elif isinstance(resource, AgentResource):
+            self._require_exists(ResourceKind.MISSION, resource.spec.mission, namespace)
+            self._require_exists(ResourceKind.FLEET, resource.spec.fleet, namespace)
+        elif isinstance(resource, AgentRunResource):
+            self._require_exists(ResourceKind.AGENT, resource.spec.agentRef.name, namespace)
+            self._require_exists(ResourceKind.MISSION, resource.spec.missionRef.name, namespace)
+            self._require_exists(ResourceKind.CONTEXT, resource.spec.contextRef.name, namespace)
+        elif isinstance(resource, ArtifactResource):
+            self._require_exists(ResourceKind.AGENT_RUN, resource.spec.producedBy.name, namespace)
+            artifact_path = Path(resource.spec.path)
+            if artifact_path.is_absolute() or any(part in {"", ".", ".."} for part in artifact_path.parts):
+                raise ValueError("Artifact spec.path must be a normalized workspace-relative path")
+        elif isinstance(resource, ContextResource):
+            self._require_exists(ResourceKind.MISSION, resource.spec.mission, namespace)
+
+        if resource.kind == ResourceKind.APPROVAL:
+            agent_run = getattr(resource.spec, "agentRun", None)
+            if agent_run:
+                self._require_exists(ResourceKind.AGENT_RUN, agent_run, resource.spec.workspace)
+
+        self._validate_owner_references(resource)
+
+    def _validate_owner_references(self, resource: AnyResource) -> None:
+        namespace = resource.metadata.namespace
+        for owner in resource.metadata.ownerReferences:
+            owner_kind = ResourceKind(owner.kind).value
+            owner_namespace: str | None = namespace
+            if owner_kind == ResourceKind.WORKSPACE.value:
+                owner_namespace = None
+                if namespace and owner.name != namespace:
+                    raise ValueError("Workspace ownerReference must match metadata.namespace")
+            elif owner_kind in CLUSTER_SCOPED_KINDS:
+                owner_namespace = None
+            elif namespace is None:
+                raise ValueError(f"{resource.kind.value} cannot reference namespaced owner {owner_kind}")
+            self._require_exists(owner.kind, owner.name, owner_namespace)
+
+    def _require_exists(self, kind: str | ResourceKind, name: str | None, namespace: str | None) -> None:
+        if not name:
+            raise ValueError(f"{ResourceKind(kind).value} reference must include a name")
+        if self.get(kind, name, namespace) is None:
+            display = self.display_name(namespace, name)
+            raise ValueError(f"{ResourceKind(kind).value} {display} does not exist")
 
     def get(self, kind: str | ResourceKind, name: str, namespace: str | None = None) -> JsonDict | None:
         kind_value, namespace_value, name_value = resource_key(kind, name, namespace)
@@ -257,9 +413,14 @@ class ResourceStore:
         workspace_name = record.name
         children = session.scalars(select(ResourceRecord).where(ResourceRecord.namespace == workspace_name)).all()
         delete_order = {
-            ResourceKind.AGENT.value: 0,
-            ResourceKind.FLEET.value: 1,
-            ResourceKind.MISSION.value: 2,
+            ResourceKind.ARTIFACT.value: 0,
+            ResourceKind.AGENT_RUN.value: 1,
+            ResourceKind.CONTEXT.value: 2,
+            ResourceKind.AGENT.value: 3,
+            ResourceKind.FLEET.value: 4,
+            ResourceKind.MISSION.value: 5,
+            ResourceKind.KNOWLEDGE_INDEX.value: 6,
+            ResourceKind.KNOWLEDGE.value: 7,
         }
         for child in sorted(children, key=lambda item: delete_order.get(item.kind, 99)):
             self._delete_record(session, child, deleted_ids, cascade="workspace")
@@ -270,6 +431,7 @@ class ResourceStore:
     def _delete_mission(self, session: Session, record: ResourceRecord, deleted_ids: set[int]) -> None:
         namespace = record.namespace
         mission_name = record.name
+        self._delete_owned_children(session, record, deleted_ids, cascade="mission")
         agents = self._owned_agents_for_mission(session, namespace, mission_name)
         fleets = self._owned_fleets_for_mission(session, namespace, mission_name)
         for agent in agents:
@@ -294,9 +456,32 @@ class ResourceStore:
         self._delete_record(session, record, deleted_ids)
 
     def _delete_fleet(self, session: Session, record: ResourceRecord, deleted_ids: set[int]) -> None:
+        self._delete_owned_children(session, record, deleted_ids, cascade="fleet")
         for agent in self._owned_agents_for_fleet(session, record.namespace, record.name):
             self._delete_record(session, agent, deleted_ids, cascade="fleet")
         self._delete_record(session, record, deleted_ids)
+
+    def _delete_owned_children(
+        self,
+        session: Session,
+        record: ResourceRecord,
+        deleted_ids: set[int],
+        cascade: str,
+    ) -> None:
+        records = session.scalars(select(ResourceRecord)).all()
+        for candidate in records:
+            if candidate.id == record.id:
+                continue
+            manifest = candidate.manifest
+            metadata = manifest.get("metadata") or {}
+            owners = metadata.get("ownerReferences") or []
+            for owner in owners:
+                if owner.get("kind") == record.kind and owner.get("name") == record.name:
+                    if record.kind not in CLUSTER_SCOPED_KINDS and candidate.namespace != record.namespace:
+                        continue
+                    self._delete_owned_children(session, candidate, deleted_ids, cascade)
+                    self._delete_record(session, candidate, deleted_ids, cascade=cascade)
+                    break
 
     def _delete_record(
         self,
@@ -313,6 +498,7 @@ class ResourceStore:
         if cascade:
             message = f"{message} by {cascade} cascade"
             payload["cascade"] = cascade
+        payload["resourceSnapshot"] = record.manifest
         session.delete(record)
         session.add(
             EventRecord(
@@ -424,7 +610,11 @@ class ResourceStore:
             record.manifest = manifest
             record.updated_at = utcnow()
             if event_type:
-                status_event_payload = {"phase": phase, "data": data or {}}
+                status_event_payload = {
+                    "phase": phase,
+                    "data": data or {},
+                    "resourceSnapshot": manifest,
+                }
                 if data:
                     status_event_payload.update(data)
                 event_payload = self._structured_payload(
@@ -535,23 +725,35 @@ class ResourceStore:
 
     def list_artifacts(self, namespace: str | None = None, mission: str | None = None) -> JsonDictList:
         with self.session() as session:
-            statement = select(ArtifactRecord)
+            statement = select(ResourceRecord).where(ResourceRecord.kind == ResourceKind.ARTIFACT.value)
             if namespace is not None:
-                statement = statement.where(ArtifactRecord.namespace == namespace)
-            if mission is not None:
-                statement = statement.where(ArtifactRecord.mission == mission)
-            statement = statement.order_by(ArtifactRecord.created_at.desc(), ArtifactRecord.id.desc())
-            return [
-                {
-                    "id": record.id,
-                    "namespace": record.namespace,
-                    "mission": record.mission,
-                    "agent": record.agent,
-                    "path": record.path,
-                    "createdAt": record.created_at.isoformat(),
-                }
-                for record in session.scalars(statement).all()
-            ]
+                statement = statement.where(ResourceRecord.namespace == namespace)
+            statement = statement.order_by(ResourceRecord.updated_at.desc(), ResourceRecord.id.desc())
+            artifacts = []
+            for record in session.scalars(statement).all():
+                manifest = record.manifest
+                status = manifest.get("status") or {}
+                spec = manifest.get("spec") or {}
+                artifact_mission = status.get("data", {}).get("mission")
+                if mission is not None and artifact_mission != mission:
+                    continue
+                artifacts.append(
+                    {
+                        "id": record.id,
+                        "namespace": record.namespace,
+                        "mission": artifact_mission,
+                        "agent": status.get("data", {}).get("agent"),
+                        "agentRun": status.get("data", {}).get("agentRun") or spec.get("producedBy", {}).get("name"),
+                        "name": record.name,
+                        "path": (
+                            status.get("data", {}).get("absolutePath")
+                            or status.get("data", {}).get("path")
+                            or spec.get("path")
+                        ),
+                        "createdAt": record.created_at.isoformat(),
+                    }
+                )
+            return artifacts
 
     def replace_knowledge_chunks(
         self,

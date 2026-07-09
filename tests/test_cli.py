@@ -246,13 +246,33 @@ spec:
     assert main(["--db", db, "--root", root, "knowledge", "search", "authentication", "-n", "demo"]) == 0
     assert main(["--db", db, "--root", root, "describe", "knowledgeindex", "default", "-n", "demo"]) == 0
     assert main(["--db", db, "--root", root, "reconcile"]) == 0
+    assert main(["--db", db, "--root", root, "get", "agentruns", "-n", "demo"]) == 0
     assert main(["--db", db, "--root", root, "get", "contexts", "-n", "demo"]) == 0
+    assert main(["--db", db, "--root", root, "get", "artifacts", "-n", "demo"]) == 0
+    assert (
+        main(
+            [
+                "--db",
+                db,
+                "--root",
+                root,
+                "describe",
+                "artifact",
+                "build-auth-fleet-agent-1-run-1-artifact",
+                "-n",
+                "demo",
+            ]
+        )
+        == 0
+    )
 
     output = capsys.readouterr().out
     assert "kind: KnowledgeIndex" in output
     assert "document: prd.md" in output
     assert "preview: '# PRD Ship authentication.'" in output
+    assert "kind: AgentRun" in output
     assert "kind: Context" in output
+    assert "kind: Artifact" in output
 
 
 def test_cli_approval_workflow(tmp_path: Path, capsys) -> None:
@@ -362,3 +382,40 @@ spec:
     output = capsys.readouterr().out
     assert "kind: Approval" in output
     assert "approvedBy: cli" in output
+
+
+def test_cli_serve_invokes_uvicorn(tmp_path: Path, monkeypatch) -> None:
+    calls = {}
+
+    def fake_run(app: str, host: str, port: int, reload: bool) -> None:
+        calls["app"] = app
+        calls["host"] = host
+        calls["port"] = port
+        calls["reload"] = reload
+
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+
+    assert (
+        main(
+            [
+                "--db",
+                f"sqlite:///{tmp_path / 'platform.db'}",
+                "--root",
+                str(tmp_path / "platform"),
+                "serve",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "9001",
+            ]
+        )
+        == 0
+    )
+    assert calls == {
+        "app": "ai_platform.api:app",
+        "host": "0.0.0.0",
+        "port": 9001,
+        "reload": False,
+    }

@@ -5,7 +5,16 @@ from pathlib import Path
 
 import pytest
 
-from ai_platform.controllers import ControlPlane
+from ai_platform.controllers import (
+    AgentController,
+    AgentRunController,
+    ContextController,
+    ControlPlane,
+    FleetController,
+    KnowledgeIndexController,
+    LocalAgentRunWorker,
+    MissionController,
+)
 from ai_platform.observability import build_timeline, build_trace, describe_resource, format_timeline, format_trace
 from ai_platform.resources import ResourceKind, parse_resource_documents
 from ai_platform.storage import ResourceStore
@@ -176,10 +185,19 @@ def test_reconcile_creates_fleet_agent_artifact_and_events(tmp_path: Path) -> No
 
     results = asyncio.run(ControlPlane(store).reconcile_once())
 
-    assert [result.changed for result in results] == [1, 1, 1]
+    assert {result.controller for result in results} >= {
+        "mission",
+        "fleet",
+        "agent",
+        "knowledge-index",
+        "context",
+        "agent-run",
+        "worker",
+    }
     mission = store.get(ResourceKind.MISSION, "build-auth", "demo")
     fleet = store.get(ResourceKind.FLEET, "build-auth-fleet", "demo")
     agent = store.get(ResourceKind.AGENT, "build-auth-fleet-agent-1", "demo")
+    agent_run = store.get(ResourceKind.AGENT_RUN, "build-auth-fleet-agent-1-run-1", "demo")
 
     assert mission is not None
     assert mission["status"]["phase"] == "Completed"
@@ -188,6 +206,8 @@ def test_reconcile_creates_fleet_agent_artifact_and_events(tmp_path: Path) -> No
     assert fleet["status"]["phase"] == "Succeeded"
     assert agent is not None
     assert agent["status"]["phase"] == "Succeeded"
+    assert agent_run is not None
+    assert agent_run["status"]["phase"] == "Succeeded"
 
     artifact_path = Path(agent["status"]["data"]["artifactPath"])
     assert artifact_path.exists()
@@ -203,15 +223,55 @@ def test_reconcile_creates_fleet_agent_artifact_and_events(tmp_path: Path) -> No
         "MissionCreated",
         "FleetCreated",
         "AgentCreated",
-        "AgentStarted",
+        "AgentRunCreated",
+        "AgentRunScheduled",
+        "AgentRunStarted",
         "KnowledgeIndexed",
         "RetrievalCompleted",
         "ContextBuilt",
         "ContextConsumed",
         "ModelInvoked",
         "ArtifactCreated",
+        "ArtifactReady",
+        "AgentRunCompleted",
         "MissionCompleted",
     }.issubset(event_types)
+
+    asyncio.run(ControlPlane(store).reconcile_once())
+    assert len(store.list_artifacts("demo", "build-auth")) == 1
+
+
+def test_agent_controller_creates_agent_run_without_executing_runtime(tmp_path: Path) -> None:
+    store, _workspace_root = make_store_with_mission(tmp_path)
+
+    asyncio.run(MissionController(store).reconcile_once())
+    asyncio.run(FleetController(store).reconcile_once())
+    asyncio.run(AgentController(store).reconcile_once())
+
+    agent_run = store.get(ResourceKind.AGENT_RUN, "build-auth-fleet-agent-1-run-1", "demo")
+    assert agent_run is not None
+    assert agent_run["status"]["phase"] == "Pending"
+    assert store.list_artifacts("demo", "build-auth") == []
+
+
+def test_scheduler_and_worker_execute_agent_run_as_separate_boundary(tmp_path: Path) -> None:
+    store, _workspace_root = make_store_with_mission(tmp_path)
+    asyncio.run(MissionController(store).reconcile_once())
+    asyncio.run(FleetController(store).reconcile_once())
+    asyncio.run(AgentController(store).reconcile_once())
+    asyncio.run(KnowledgeIndexController(store).reconcile_once())
+    asyncio.run(ContextController(store).reconcile_once())
+
+    asyncio.run(AgentRunController(store).reconcile_once())
+    scheduled = store.get(ResourceKind.AGENT_RUN, "build-auth-fleet-agent-1-run-1", "demo")
+    assert scheduled is not None
+    assert scheduled["status"]["phase"] == "Scheduled"
+
+    asyncio.run(LocalAgentRunWorker(store).reconcile_once())
+    completed = store.get(ResourceKind.AGENT_RUN, "build-auth-fleet-agent-1-run-1", "demo")
+    assert completed is not None
+    assert completed["status"]["phase"] == "Succeeded"
+    assert len(store.list_artifacts("demo", "build-auth")) == 1
 
 
 def test_reconciliation_events_share_correlation_id_and_structured_fields(tmp_path: Path) -> None:
@@ -294,6 +354,8 @@ def test_trace_generation_reconstructs_execution_graph(tmp_path: Path) -> None:
     assert [agent["role"] for agent in trace["fleets"][0]["agents"]] == ["planner", "coder", "reviewer"]
     assert trace["fleets"][0]["agents"][0]["capabilities"] == ["plan"]
     assert trace["fleets"][0]["agents"][0]["model"] == "stub-model"
+    assert trace["fleets"][0]["agents"][0]["agentRuns"][0]["status"] == "Succeeded"
+    assert trace["fleets"][0]["agents"][0]["agentRuns"][0]["context"] == "build-auth-context"
     assert trace["fleets"][0]["agents"][1]["tools"] == ["git", "filesystem"]
     assert len(trace["artifacts"]) == 3
 
@@ -302,6 +364,8 @@ def test_trace_generation_reconstructs_execution_graph(tmp_path: Path) -> None:
     assert "Status: Completed" in formatted
     assert "Planner Agent" in formatted
     assert "Model stub-model" in formatted
+    assert "AgentRun build-auth-fleet-planner-run-1" in formatted
+    assert "Context build-auth-context" in formatted
     assert "Tool filesystem" in formatted
     assert "Knowledge" in formatted
     assert "Index: default" in formatted
@@ -368,7 +432,7 @@ def test_reapplying_completed_mission_refreshes_children_and_reruns_agent(tmp_pa
 
     results = asyncio.run(ControlPlane(store).reconcile_once())
 
-    assert [result.changed for result in results] == [1, 1, 1]
+    assert sum(result.changed for result in results) >= 3
     mission = store.get(ResourceKind.MISSION, "build-auth", "demo")
     fleet = store.get(ResourceKind.FLEET, "build-auth-fleet", "demo")
     agent = store.get(ResourceKind.AGENT, "build-auth-fleet-agent-1", "demo")
@@ -383,6 +447,9 @@ def test_reapplying_completed_mission_refreshes_children_and_reruns_agent(tmp_pa
     assert agent is not None
     assert agent["metadata"]["generation"] == 2
     assert agent["status"]["observedGeneration"] == 2
+    agent_run = store.get(ResourceKind.AGENT_RUN, "build-auth-fleet-agent-1-run-2", "demo")
+    assert agent_run is not None
+    assert agent_run["status"]["phase"] == "Succeeded"
     artifacts = store.list_artifacts("demo", "build-auth")
     assert len(artifacts) == 2
     artifact_text = Path(agent["status"]["data"]["artifactPath"]).read_text(encoding="utf-8")
@@ -447,6 +514,8 @@ def test_delete_mission_cascades_resources_and_artifact_records_only(tmp_path: P
     assert store.get(ResourceKind.MISSION, "build-auth", "demo") is None
     assert store.get(ResourceKind.FLEET, "build-auth-fleet", "demo") is None
     assert store.get(ResourceKind.AGENT, "build-auth-fleet-agent-1", "demo") is None
+    assert store.get(ResourceKind.AGENT_RUN, "build-auth-fleet-agent-1-run-1", "demo") is None
+    assert store.list(ResourceKind.ARTIFACT, "demo") == []
     assert store.list_artifacts("demo", "build-auth") == []
     assert artifact_path.exists()
 
@@ -468,7 +537,7 @@ def test_template_mission_creates_fleet_agents_artifacts_and_uses_inputs(tmp_pat
 
     results = asyncio.run(ControlPlane(store).reconcile_once())
 
-    assert [result.changed for result in results] == [1, 3, 3]
+    assert sum(result.changed for result in results) >= 10
     mission = store.get(ResourceKind.MISSION, "build-auth", "demo")
     fleet = store.get(ResourceKind.FLEET, "build-auth-fleet", "demo")
     assert mission is not None
@@ -484,9 +553,13 @@ def test_template_mission_creates_fleet_agents_artifacts_and_uses_inputs(tmp_pat
         assert agent["spec"]["pilot"]["modelRef"] == "stub-model"
         assert "model" not in agent["spec"]
         assert agent["status"]["phase"] == "Succeeded"
+        run = store.get(ResourceKind.AGENT_RUN, f"build-auth-fleet-{name}-run-1", "demo")
+        assert run is not None
+        assert run["status"]["phase"] == "Succeeded"
 
     artifacts = store.list_artifacts("demo", "build-auth")
     assert len(artifacts) == 3
+    assert len(store.list(ResourceKind.ARTIFACT, "demo")) == 3
     artifact_text = Path(artifacts[0]["path"]).read_text(encoding="utf-8")
     assert "Template: software-feature" in artifact_text
     assert "Context:" in artifact_text

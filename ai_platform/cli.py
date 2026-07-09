@@ -11,6 +11,7 @@ import yaml
 
 from .controllers import ControlPlane
 from .observability import build_timeline, build_trace, describe_resource, format_timeline, format_trace
+from .policy import ApprovalService
 from .resources import ResourceKind, parse_resource_documents
 from .storage import DEFAULT_DB_URL, ResourceStore
 
@@ -23,6 +24,10 @@ RESOURCE_ALIASES = {
     "fleets": ResourceKind.FLEET.value,
     "agent": ResourceKind.AGENT.value,
     "agents": ResourceKind.AGENT.value,
+    "policy": ResourceKind.POLICY.value,
+    "policies": ResourceKind.POLICY.value,
+    "approval": ResourceKind.APPROVAL.value,
+    "approvals": ResourceKind.APPROVAL.value,
     "model": ResourceKind.MODEL.value,
     "models": ResourceKind.MODEL.value,
     "tool": ResourceKind.TOOL.value,
@@ -104,6 +109,19 @@ def build_parser() -> argparse.ArgumentParser:
     timeline_mission_parser.add_argument("-o", "--output", choices=["text", "yaml", "json"], default="text")
 
     subparsers.add_parser("events", help="List recent events")
+
+    approvals_parser = subparsers.add_parser("approvals", help="List approval requests")
+    approvals_parser.add_argument("-o", "--output", choices=["yaml", "json"], default="yaml")
+
+    approve_parser = subparsers.add_parser("approve", help="Approve a pending Approval")
+    approve_parser.add_argument("name")
+    approve_parser.add_argument("--by", default="manual")
+    approve_parser.add_argument("--reason")
+
+    reject_parser = subparsers.add_parser("reject", help="Reject a pending Approval")
+    reject_parser.add_argument("name")
+    reject_parser.add_argument("--by", default="manual")
+    reject_parser.add_argument("--reason")
 
     serve_parser = subparsers.add_parser("serve", help="Run the FastAPI server with uvicorn")
     serve_parser.add_argument("--host", default="127.0.0.1")
@@ -199,6 +217,30 @@ async def run_async(args: argparse.Namespace) -> int:
 
     if args.command == "events":
         print_data({"items": store.list_events()})
+        return 0
+
+    if args.command == "approvals":
+        print_data({"items": store.list(ResourceKind.APPROVAL)}, args.output)
+        return 0
+
+    if args.command == "approve":
+        try:
+            approval = ApprovalService(store).approve(args.name, actor=args.by, reason=args.reason)
+        except (KeyError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        results = await ControlPlane(store).reconcile_once()
+        print_data({"approval": approval, "controllers": [result.__dict__ for result in results]})
+        return 0
+
+    if args.command == "reject":
+        try:
+            approval = ApprovalService(store).reject(args.name, actor=args.by, reason=args.reason)
+        except (KeyError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        results = await ControlPlane(store).reconcile_once()
+        print_data({"approval": approval, "controllers": [result.__dict__ for result in results]})
         return 0
 
     if args.command == "serve":

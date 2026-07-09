@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from ai_platform.cli import main
+from ai_platform.resources import ResourceKind
+from ai_platform.storage import ResourceStore
 
 
 def test_cli_apply_and_get(tmp_path: Path, capsys) -> None:
@@ -187,3 +189,112 @@ spec:
     assert "Executor Agent" in output
     assert "Mission created" in output
     assert "Mission completed" in output
+
+
+def test_cli_approval_workflow(tmp_path: Path, capsys) -> None:
+    manifest = tmp_path / "resources.yaml"
+    workspace_root = tmp_path / "workspace"
+    knowledge_dir = workspace_root / "knowledge"
+    knowledge_dir.mkdir(parents=True)
+    (knowledge_dir / "prd.md").write_text("Ship authentication.", encoding="utf-8")
+    manifest.write_text(
+        f"""
+apiVersion: ai.platform/v1
+kind: Workspace
+metadata:
+  name: demo
+spec:
+  rootPath: {workspace_root}
+---
+apiVersion: ai.platform/v1
+kind: Model
+metadata:
+  name: stub-model
+spec:
+  config:
+    provider: stub
+    model: stub-model
+---
+apiVersion: ai.platform/v1
+kind: Tool
+metadata:
+  name: git
+spec: {{}}
+---
+apiVersion: ai.platform/v1
+kind: Capability
+metadata:
+  name: implement
+spec:
+  requires:
+    tools:
+      - git
+  compatibleModels:
+    - stub-model
+---
+apiVersion: ai.platform/v1
+kind: FleetTemplate
+metadata:
+  name: protected-feature
+spec:
+  agents:
+    - name: coder
+      role: coder
+      capabilities:
+        - implement
+---
+apiVersion: ai.platform/v1
+kind: Policy
+metadata:
+  name: default
+spec:
+  rules:
+    - match:
+        tool: git
+        operation: use
+      requiresApproval: true
+    - match:
+        tool: knowledge
+      allow: true
+    - match:
+        tool: model
+      allow: true
+    - match:
+        tool: filesystem
+      allow: true
+---
+apiVersion: ai.platform/v1
+kind: Mission
+metadata:
+  name: build-auth
+  namespace: demo
+spec:
+  template: protected-feature
+  inputs:
+    prd:
+      ref: knowledge://prd.md
+""",
+        encoding="utf-8",
+    )
+    db = f"sqlite:///{tmp_path / 'platform.db'}"
+    root = str(tmp_path / "platform")
+
+    assert main(["--db", db, "--root", root, "apply", str(manifest)]) == 0
+    assert main(["--db", db, "--root", root, "reconcile"]) == 0
+    assert main(["--db", db, "--root", root, "approvals"]) == 0
+    store = ResourceStore(db, root)
+    approvals = store.list(ResourceKind.APPROVAL)
+    assert len(approvals) == 1
+    approval_name = approvals[0]["metadata"]["name"]
+    assert main(["--db", db, "--root", root, "describe", "approval", approval_name]) == 0
+    assert main(["--db", db, "--root", root, "approve", approval_name, "--by", "cli"]) == 0
+
+    mission = store.get(ResourceKind.MISSION, "build-auth", "demo")
+    approval = store.get(ResourceKind.APPROVAL, approval_name)
+    assert mission is not None
+    assert mission["status"]["phase"] == "Completed"
+    assert approval is not None
+    assert approval["status"]["phase"] == "Approved"
+    output = capsys.readouterr().out
+    assert "kind: Approval" in output
+    assert "approvedBy: cli" in output

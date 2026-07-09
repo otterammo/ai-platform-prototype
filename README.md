@@ -9,6 +9,8 @@ The prototype treats AI work as resources:
 - `FleetTemplate` declares the Agent topology for a class of work.
 - `Fleet` is instantiated from a Mission and FleetTemplate.
 - `Capability`, `Tool`, and `Model` describe what Agents need and how the platform can satisfy it.
+- `Policy` declares admission rules for runtime actions.
+- `Approval` records a pending, approved, or rejected action decision.
 - `Agent` is created by the Fleet controller and executes through an embedded `Pilot`.
 - `Knowledge` records describe workspace knowledge nodes separately from manifests.
 
@@ -35,6 +37,12 @@ The registry-driven reconciliation flow is:
 
 ```text
 Mission -> FleetTemplate -> Fleet -> Agents -> Capabilities -> Tools/Pilot/Model
+```
+
+Runtime actions pass through the policy engine before side effects occur:
+
+```text
+Agent -> Policy Engine -> Approval Service (optional) -> Runtime
 ```
 
 ## Install
@@ -92,6 +100,7 @@ platform --db sqlite:///./platform.db --root .platform get fleettemplates
 platform --db sqlite:///./platform.db --root .platform get capabilities
 platform --db sqlite:///./platform.db --root .platform get models
 platform --db sqlite:///./platform.db --root .platform get tools
+platform --db sqlite:///./platform.db --root .platform get policies
 platform --db sqlite:///./platform.db --root .platform get knowledge -n demo
 platform --db sqlite:///./platform.db --root .platform describe mission implement-auth -n demo
 platform --db sqlite:///./platform.db --root .platform events
@@ -111,6 +120,10 @@ Useful endpoints:
 - `DELETE /resources/{kind}/{name}?namespace=demo`
 - `POST /reconcile`
 - `GET /events`
+- `GET /approvals`
+- `GET /approvals/{id}`
+- `POST /approvals/{id}/approve`
+- `POST /approvals/{id}/reject`
 - `GET /artifacts`
 
 Deleting a Mission or Workspace removes the corresponding resource and artifact records from SQLite, but it does not delete artifact files from disk.
@@ -136,3 +149,51 @@ spec:
 The runtime sends chat-completions-compatible requests to `{baseUrl}/chat/completions`.
 
 Legacy Missions with `spec.objective` and `spec.brief` still work; they reconcile through the original single-agent path.
+
+## Policy And Approvals
+
+If no `Policy` resources exist, runtime actions are allowed for backward compatibility. Once a `Policy` exists, unmatched actions are denied.
+
+Rules are evaluated in policy-name order, then rule order. The first match wins:
+
+```yaml
+apiVersion: ai.platform/v1
+kind: Policy
+metadata:
+  name: default
+spec:
+  rules:
+    - match:
+        tool: shell
+        operation: use
+      requiresApproval: true
+    - match:
+        tool: git
+        operation: push
+      requiresApproval: true
+    - match:
+        tool: filesystem
+        operation: delete
+      requiresApproval: true
+    - match:
+        tool: knowledge
+      allow: true
+    - match:
+        tool: model
+      allow: true
+    - match:
+        tool: filesystem
+      allow: true
+    - match:
+        tool: git
+      allow: true
+```
+
+Agents pause in `Waiting` with a `WaitingForApproval` condition when approval is required:
+
+```bash
+platform --db sqlite:///./platform.db --root .platform approvals
+platform --db sqlite:///./platform.db --root .platform describe approval approval-abc123
+platform --db sqlite:///./platform.db --root .platform approve approval-abc123 --by alice
+platform --db sqlite:///./platform.db --root .platform reject approval-abc123 --by alice --reason "too risky"
+```

@@ -6,11 +6,18 @@ from typing import Any
 
 import yaml
 from fastapi import FastAPI, HTTPException, Query, Request, Response
+from pydantic import BaseModel
 
 from .controllers import ControlPlane
 from .observability import build_timeline, build_trace
+from .policy import ApprovalService
 from .resources import ResourceKind, parse_resource_documents
 from .storage import DEFAULT_DB_URL, ResourceStore
+
+
+class ApprovalDecisionRequest(BaseModel):
+    actor: str = "manual"
+    reason: str | None = None
 
 
 def create_app(
@@ -89,6 +96,47 @@ def create_app(
         limit: int = Query(default=100, ge=1, le=1000),
     ) -> dict[str, list[dict[str, Any]]]:
         return {"items": store.list_events(namespace, resourceKind, resourceName, limit, correlationId)}
+
+    @app.get("/approvals")
+    async def list_approvals() -> dict[str, list[dict[str, Any]]]:
+        return {"items": store.list(ResourceKind.APPROVAL)}
+
+    @app.get("/approvals/{approval_id}")
+    async def get_approval(approval_id: str) -> dict[str, Any]:
+        approval = store.get(ResourceKind.APPROVAL, approval_id)
+        if approval is None:
+            raise HTTPException(status_code=404, detail="approval not found")
+        return approval
+
+    @app.post("/approvals/{approval_id}/approve")
+    async def approve_approval(
+        approval_id: str,
+        request: ApprovalDecisionRequest | None = None,
+    ) -> dict[str, Any]:
+        decision = request or ApprovalDecisionRequest()
+        try:
+            approval = ApprovalService(store).approve(approval_id, actor=decision.actor, reason=decision.reason)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        results = await control_plane.reconcile_once()
+        return {"approval": approval, "controllers": [result.__dict__ for result in results]}
+
+    @app.post("/approvals/{approval_id}/reject")
+    async def reject_approval(
+        approval_id: str,
+        request: ApprovalDecisionRequest | None = None,
+    ) -> dict[str, Any]:
+        decision = request or ApprovalDecisionRequest()
+        try:
+            approval = ApprovalService(store).reject(approval_id, actor=decision.actor, reason=decision.reason)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        results = await control_plane.reconcile_once()
+        return {"approval": approval, "controllers": [result.__dict__ for result in results]}
 
     @app.get("/trace/{mission}")
     async def trace_mission(mission: str, namespace: str) -> dict[str, Any]:

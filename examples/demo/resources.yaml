@@ -17,6 +17,13 @@ spec:
 apiVersion: ai.platform/v1
 kind: Tool
 metadata:
+  name: shell
+spec:
+  description: Execute shell commands
+---
+apiVersion: ai.platform/v1
+kind: Tool
+metadata:
   name: filesystem
 spec:
   description: Read and write workspace files
@@ -89,6 +96,37 @@ metadata:
 spec:
   type: PRD
   ref: knowledge://prd.md
+---
+apiVersion: ai.platform/v1
+kind: Policy
+metadata:
+  name: default
+spec:
+  rules:
+    - match:
+        tool: shell
+        operation: use
+      requiresApproval: true
+    - match:
+        tool: git
+        operation: push
+      requiresApproval: true
+    - match:
+        tool: filesystem
+        operation: delete
+      requiresApproval: true
+    - match:
+        tool: knowledge
+      allow: true
+    - match:
+        tool: model
+      allow: true
+    - match:
+        tool: filesystem
+      allow: true
+    - match:
+        tool: git
+      allow: true
 ---
 apiVersion: ai.platform/v1
 kind: Mission

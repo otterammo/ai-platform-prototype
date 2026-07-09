@@ -5,7 +5,10 @@ from dataclasses import dataclass
 
 from .resources import (
     AgentResource,
+    CapabilityResource,
     FleetResource,
+    FleetTemplateAgentSpec,
+    FleetTemplateResource,
     MissionResource,
     ResourceKind,
     WorkspaceResource,
@@ -17,6 +20,11 @@ from .storage import ResourceStore
 
 MISSION_GENERATION_ANNOTATION = "ai.platform/mission-generation"
 FLEET_GENERATION_ANNOTATION = "ai.platform/fleet-generation"
+FLEET_TEMPLATE_GENERATION_ANNOTATION = "ai.platform/fleet-template-generation"
+
+
+class ReconcileError(Exception):
+    pass
 
 
 @dataclass
@@ -48,7 +56,21 @@ class MissionController:
             if isinstance(fleet, FleetResource) and self._fleet_matches_mission(fleet, mission):
                 continue
 
-            self.store.apply(self._fleet_manifest(mission, fleet))
+            try:
+                desired_fleet = self._fleet_manifest(mission, fleet)
+            except ReconcileError as exc:
+                self.store.update_status(
+                    ResourceKind.MISSION,
+                    mission.metadata.name,
+                    namespace,
+                    "Failed",
+                    str(exc),
+                    event_type="MissionFailed",
+                )
+                changed += 1
+                continue
+
+            self.store.apply(desired_fleet)
             if fleet_manifest is None:
                 self.store.emit_event(
                     "FleetCreated",
@@ -76,6 +98,32 @@ class MissionController:
         labels["mission"] = mission.metadata.name
         annotations = dict(fleet.metadata.annotations if fleet else {})
         annotations[MISSION_GENERATION_ANNOTATION] = str(mission.metadata.generation)
+        strategy = "single-agent"
+        agent_count = 1
+        template_name = None
+        agents: list[dict] = []
+        if mission.spec.template:
+            template_manifest = self.store.get(ResourceKind.FLEET_TEMPLATE, mission.spec.template)
+            if template_manifest is None:
+                raise ReconcileError(f"FleetTemplate {mission.spec.template} not found")
+            template = parse_resource(template_manifest)
+            if not isinstance(template, FleetTemplateResource):
+                raise ReconcileError(f"FleetTemplate {mission.spec.template} could not be loaded")
+            strategy = "template"
+            agent_count = len(template.spec.agents)
+            template_name = template.metadata.name
+            agents = [agent.model_dump(mode="json") for agent in template.spec.agents]
+            annotations[FLEET_TEMPLATE_GENERATION_ANNOTATION] = str(template.metadata.generation)
+
+        spec = {
+            "workspace": namespace,
+            "mission": mission.metadata.name,
+            "strategy": strategy,
+            "agentCount": agent_count,
+        }
+        if template_name:
+            spec["template"] = template_name
+            spec["agents"] = agents
         return {
             "apiVersion": "ai.platform/v1",
             "kind": "Fleet",
@@ -85,15 +133,26 @@ class MissionController:
                 "labels": labels,
                 "annotations": annotations,
             },
-            "spec": {
-                "workspace": namespace,
-                "mission": mission.metadata.name,
-                "strategy": "single-agent",
-                "agentCount": 1,
-            },
+            "spec": spec,
         }
 
     def _fleet_matches_mission(self, fleet: FleetResource, mission: MissionResource) -> bool:
+        if mission.spec.template:
+            template_manifest = self.store.get(ResourceKind.FLEET_TEMPLATE, mission.spec.template)
+            if template_manifest is None:
+                return False
+            template = parse_resource(template_manifest)
+            if not isinstance(template, FleetTemplateResource):
+                return False
+            return (
+                fleet.spec.workspace == mission.metadata.namespace
+                and fleet.spec.mission == mission.metadata.name
+                and fleet.spec.strategy == "template"
+                and fleet.spec.template == mission.spec.template
+                and fleet.metadata.annotations.get(MISSION_GENERATION_ANNOTATION) == str(mission.metadata.generation)
+                and fleet.metadata.annotations.get(FLEET_TEMPLATE_GENERATION_ANNOTATION)
+                == str(template.metadata.generation)
+            )
         return (
             fleet.spec.workspace == mission.metadata.namespace
             and fleet.spec.mission == mission.metadata.name
@@ -116,14 +175,39 @@ class FleetController:
             if fleet.status.phase in {"Succeeded", "Failed"} and is_current(fleet):
                 continue
             fleet_changed = 0
-            for index in range(fleet.spec.agentCount):
-                agent_name = f"{fleet.metadata.name}-agent-{index + 1}"
+            try:
+                desired_agents = self._desired_agents(fleet)
+            except ReconcileError as exc:
+                self._fail_fleet(fleet, str(exc))
+                changed += 1
+                continue
+            try:
+                resolved_agents = [
+                    (desired_agent, *self._resolve_capabilities(desired_agent.capabilities))
+                    for desired_agent in desired_agents
+                ]
+            except ReconcileError as exc:
+                self._fail_fleet(fleet, str(exc))
+                changed += 1
+                continue
+            for desired_agent, tools, model_ref in resolved_agents:
+                agent_name = f"{fleet.metadata.name}-{desired_agent.name}"
                 agent_manifest = self.store.get(ResourceKind.AGENT, agent_name, fleet.metadata.namespace)
                 agent = parse_resource(agent_manifest) if agent_manifest else None
-                if isinstance(agent, AgentResource) and self._agent_matches_fleet(agent, fleet):
+                if isinstance(agent, AgentResource) and self._agent_matches_fleet(agent, fleet, desired_agent, tools, model_ref):
                     continue
-                model_config = self._model_for_fleet(fleet)
-                self.store.apply(self._agent_manifest(fleet, agent_name, model_config, agent))
+                model_config = None if model_ref else self._model_for_fleet(fleet)
+                self.store.apply(
+                    self._agent_manifest(
+                        fleet,
+                        agent_name,
+                        desired_agent,
+                        tools,
+                        model_ref,
+                        model_config,
+                        agent,
+                    )
+                )
                 if agent_manifest is None:
                     self.store.emit_event(
                         "AgentCreated",
@@ -157,11 +241,53 @@ class FleetController:
             return workspace.spec.model.model_dump(mode="json", exclude_none=True)
         return {}
 
+    def _desired_agents(self, fleet: FleetResource) -> list[FleetTemplateAgentSpec]:
+        if fleet.spec.agents:
+            return fleet.spec.agents
+        return [
+            FleetTemplateAgentSpec(
+                name=f"agent-{index + 1}",
+                role="executor",
+                capabilities=[],
+            )
+            for index in range(fleet.spec.agentCount)
+        ]
+
+    def _resolve_capabilities(self, capabilities: list[str]) -> tuple[list[str], str | None]:
+        if not capabilities:
+            return [], None
+        tool_names: list[str] = []
+        compatible_sets: list[list[str]] = []
+        for capability_name in capabilities:
+            capability_manifest = self.store.get(ResourceKind.CAPABILITY, capability_name)
+            if capability_manifest is None:
+                raise ReconcileError(f"Capability {capability_name} not found")
+            capability = parse_resource(capability_manifest)
+            if not isinstance(capability, CapabilityResource):
+                raise ReconcileError(f"Capability {capability_name} could not be loaded")
+            for tool_name in capability.spec.requires.tools:
+                if self.store.get(ResourceKind.TOOL, tool_name) is None:
+                    raise ReconcileError(f"Tool {tool_name} required by Capability {capability_name} not found")
+                if tool_name not in tool_names:
+                    tool_names.append(tool_name)
+            if capability.spec.compatibleModels:
+                compatible_sets.append(capability.spec.compatibleModels)
+        if not compatible_sets:
+            raise ReconcileError(f"Capabilities {', '.join(capabilities)} do not declare compatibleModels")
+        for model_name in compatible_sets[0]:
+            if all(model_name in compatible_models for compatible_models in compatible_sets):
+                if self.store.get(ResourceKind.MODEL, model_name):
+                    return tool_names, model_name
+        raise ReconcileError(f"No available Model is compatible with capabilities: {', '.join(capabilities)}")
+
     def _agent_manifest(
         self,
         fleet: FleetResource,
         agent_name: str,
-        model_config: dict,
+        desired_agent: FleetTemplateAgentSpec,
+        tools: list[str],
+        model_ref: str | None,
+        model_config: dict | None,
         agent: AgentResource | None,
     ) -> dict:
         labels = dict(agent.metadata.labels if agent else {})
@@ -182,17 +308,53 @@ class FleetController:
                 "workspace": fleet.spec.workspace,
                 "mission": fleet.spec.mission,
                 "fleet": fleet.metadata.name,
-                "role": "executor",
-                "model": model_config,
+                "role": desired_agent.role,
+                "capabilities": desired_agent.capabilities,
+                "tools": tools,
+                **({"pilot": {"strategy": "direct", "modelRef": model_ref}} if model_ref else {}),
+                **({"model": model_config} if model_config else {}),
             },
         }
 
-    def _agent_matches_fleet(self, agent: AgentResource, fleet: FleetResource) -> bool:
+    def _agent_matches_fleet(
+        self,
+        agent: AgentResource,
+        fleet: FleetResource,
+        desired_agent: FleetTemplateAgentSpec,
+        tools: list[str],
+        model_ref: str | None,
+    ) -> bool:
         return (
             agent.spec.workspace == fleet.spec.workspace
             and agent.spec.mission == fleet.spec.mission
             and agent.spec.fleet == fleet.metadata.name
+            and agent.spec.role == desired_agent.role
+            and agent.spec.capabilities == desired_agent.capabilities
+            and agent.spec.tools == tools
+            and ((agent.spec.pilot.modelRef if agent.spec.pilot else None) == model_ref)
             and agent.metadata.annotations.get(FLEET_GENERATION_ANNOTATION) == str(fleet.metadata.generation)
+        )
+
+    def _fail_fleet(self, fleet: FleetResource, error: str) -> None:
+        namespace = fleet.metadata.namespace
+        message = f"Fleet {fleet.metadata.name} failed: {error}"
+        self.store.update_status(
+            ResourceKind.FLEET,
+            fleet.metadata.name,
+            namespace,
+            "Failed",
+            message,
+            {"error": error},
+            event_type="FleetFailed",
+        )
+        self.store.update_status(
+            ResourceKind.MISSION,
+            fleet.spec.mission,
+            namespace,
+            "Failed",
+            message,
+            {"fleet": fleet.metadata.name, "error": error},
+            event_type="MissionFailed",
         )
 
 

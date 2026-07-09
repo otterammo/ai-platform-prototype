@@ -4,3 +4,5 @@ __pycache__/
 .venv/
 .platform/
 platform.db
+*.egg-info/
+examples/**/artifacts/

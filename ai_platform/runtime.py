@@ -5,7 +5,9 @@ from pathlib import Path
 from .models import Message, build_model_client
 from .resources import (
     AgentResource,
+    KnowledgeRef,
     MissionResource,
+    ModelResource,
     ResourceKind,
     WorkspaceResource,
     parse_resource,
@@ -35,8 +37,9 @@ class AgentRuntime:
         )
 
         brief_text = self._load_brief(workspace, mission)
-        model_config = agent.spec.model or mission.spec.model or workspace.spec.model
-        messages = self._build_messages(mission, brief_text)
+        input_texts = self._load_inputs(workspace, mission)
+        model_config = self._model_for_agent(agent, mission, workspace)
+        messages = self._build_messages(mission, brief_text, input_texts)
         client = build_model_client(model_config, store=self.store)
 
         self.store.emit_event(
@@ -83,26 +86,61 @@ class AgentRuntime:
         if mission.spec.brief is None:
             return ""
 
+        return self._load_knowledge_ref(workspace, mission.spec.brief)
+
+    def _load_inputs(self, workspace: WorkspaceResource, mission: MissionResource) -> dict[str, str]:
+        return {
+            name: self._load_knowledge_ref(workspace, knowledge_ref)
+            for name, knowledge_ref in mission.spec.inputs.items()
+        }
+
+    def _load_knowledge_ref(self, workspace: WorkspaceResource, knowledge_ref: KnowledgeRef) -> str:
         workspace_root = workspace.spec.resolved_root(self.store.platform_root, workspace.metadata.name)
         knowledge_root = (workspace_root / "knowledge").resolve(strict=False)
-        candidate = knowledge_root / Path(mission.spec.brief.path)
+        candidate = knowledge_root / Path(knowledge_ref.path)
         resolved_candidate = candidate.resolve(strict=False)
         try:
             resolved_candidate.relative_to(knowledge_root)
         except ValueError as exc:
             raise PermissionError(
-                f"knowledge reference {mission.spec.brief.ref} resolves outside workspace knowledge"
+                f"knowledge reference {knowledge_ref.ref} resolves outside workspace knowledge"
             ) from exc
         if not resolved_candidate.is_file():
             raise FileNotFoundError(
-                f"knowledge reference {mission.spec.brief.ref} not found at {candidate}"
+                f"knowledge reference {knowledge_ref.ref} not found at {candidate}"
             )
         return resolved_candidate.read_text(encoding="utf-8")
 
-    def _build_messages(self, mission: MissionResource, brief_text: str) -> list[Message]:
-        user_parts = [f"Objective: {mission.spec.objective}"]
+    def _model_for_agent(
+        self,
+        agent: AgentResource,
+        mission: MissionResource,
+        workspace: WorkspaceResource,
+    ):
+        if agent.spec.pilot and agent.spec.pilot.modelRef:
+            model = self._load_resource(ResourceKind.MODEL, agent.spec.pilot.modelRef, None, ModelResource)
+            return model.spec.config
+        return agent.spec.model or mission.spec.model or workspace.spec.model
+
+    def _build_messages(
+        self,
+        mission: MissionResource,
+        brief_text: str,
+        input_texts: dict[str, str],
+    ) -> list[Message]:
+        user_parts = []
+        if mission.spec.objective:
+            user_parts.append(f"Objective: {mission.spec.objective}")
+        if mission.spec.template:
+            user_parts.append(f"Template: {mission.spec.template}")
         if brief_text:
             user_parts.append(f"Brief:\n{brief_text}")
+        for name, text in input_texts.items():
+            user_parts.append(f"Input {name}:\n{text}")
+        if mission.spec.outputs:
+            outputs = ", ".join(name for name, enabled in mission.spec.outputs.items() if enabled)
+            if outputs:
+                user_parts.append(f"Requested outputs: {outputs}")
         return [
             {
                 "role": "system",

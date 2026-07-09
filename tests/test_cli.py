@@ -67,3 +67,80 @@ metadata:
 
     output = capsys.readouterr().out
     assert "kind: Workspace" in output
+
+
+def test_cli_lists_v1_registry_resources(tmp_path: Path, capsys) -> None:
+    manifest = tmp_path / "v1.yaml"
+    manifest.write_text(
+        """
+apiVersion: ai.platform/v1
+kind: Workspace
+metadata:
+  name: demo
+---
+apiVersion: ai.platform/v1
+kind: Model
+metadata:
+  name: stub-model
+spec:
+  config:
+    provider: stub
+    model: stub-model
+---
+apiVersion: ai.platform/v1
+kind: Tool
+metadata:
+  name: git
+spec: {}
+---
+apiVersion: ai.platform/v1
+kind: Capability
+metadata:
+  name: code-review
+spec:
+  requires:
+    tools:
+      - git
+  compatibleModels:
+    - stub-model
+---
+apiVersion: ai.platform/v1
+kind: FleetTemplate
+metadata:
+  name: software-feature
+spec:
+  agents:
+    - name: reviewer
+      role: reviewer
+      capabilities:
+        - code-review
+---
+apiVersion: ai.platform/v1
+kind: Knowledge
+metadata:
+  name: prd
+  namespace: demo
+spec:
+  type: PRD
+  ref: knowledge://prd.md
+""",
+        encoding="utf-8",
+    )
+    db = f"sqlite:///{tmp_path / 'platform.db'}"
+    root = str(tmp_path / "platform")
+
+    assert main(["--db", db, "--root", root, "apply", str(manifest)]) == 0
+    assert main(["--db", db, "--root", root, "get", "models"]) == 0
+    assert main(["--db", db, "--root", root, "get", "tools"]) == 0
+    assert main(["--db", db, "--root", root, "get", "capabilities"]) == 0
+    assert main(["--db", db, "--root", root, "get", "fleettemplates"]) == 0
+    assert main(["--db", db, "--root", root, "get", "knowledge", "-n", "demo"]) == 0
+    assert main(["--db", db, "--root", root, "describe", "capability", "code-review"]) == 0
+
+    output = capsys.readouterr().out
+    assert "kind: Model" in output
+    assert "kind: Tool" in output
+    assert "kind: Capability" in output
+    assert "kind: FleetTemplate" in output
+    assert "kind: Knowledge" in output
+    assert "resource:" in output

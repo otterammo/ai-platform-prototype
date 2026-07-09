@@ -16,6 +16,20 @@ class ResourceKind(StrEnum):
     MISSION = "Mission"
     FLEET = "Fleet"
     AGENT = "Agent"
+    MODEL = "Model"
+    TOOL = "Tool"
+    CAPABILITY = "Capability"
+    FLEET_TEMPLATE = "FleetTemplate"
+    KNOWLEDGE = "Knowledge"
+
+
+CLUSTER_SCOPED_KINDS = {
+    ResourceKind.WORKSPACE.value,
+    ResourceKind.MODEL.value,
+    ResourceKind.TOOL.value,
+    ResourceKind.CAPABILITY.value,
+    ResourceKind.FLEET_TEMPLATE.value,
+}
 
 
 class Condition(BaseModel):
@@ -89,6 +103,11 @@ class ModelConfig(BaseModel):
     timeoutSeconds: float = 60.0
 
 
+class PilotConfig(BaseModel):
+    strategy: str = "direct"
+    modelRef: str | None = None
+
+
 class WorkspaceSpec(BaseModel):
     rootPath: str | None = None
     model: ModelConfig = Field(default_factory=ModelConfig)
@@ -101,16 +120,48 @@ class WorkspaceSpec(BaseModel):
 
 
 class MissionSpec(BaseModel):
-    objective: str
+    objective: str | None = None
     brief: KnowledgeRef | None = None
     model: ModelConfig | None = None
+    template: str | None = None
+    inputs: dict[str, KnowledgeRef] = Field(default_factory=dict)
+    outputs: dict[str, bool] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def require_legacy_objective_or_template(self) -> MissionSpec:
+        if not self.objective and not self.template:
+            raise ValueError("Mission spec requires objective or template")
+        return self
+
+
+class FleetTemplateAgentSpec(BaseModel):
+    name: str
+    role: str = "executor"
+    capabilities: list[str] = Field(default_factory=list)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return Metadata.validate_dnsish_name(value) or value
+
+
+class FleetTemplateSpec(BaseModel):
+    agents: list[FleetTemplateAgentSpec] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def require_agents(self) -> FleetTemplateSpec:
+        if not self.agents:
+            raise ValueError("FleetTemplate spec.agents must not be empty")
+        return self
 
 
 class FleetSpec(BaseModel):
     workspace: str
     mission: str
-    strategy: Literal["single-agent"] = "single-agent"
+    strategy: Literal["single-agent", "template"] = "single-agent"
     agentCount: int = Field(default=1, ge=1, le=16)
+    template: str | None = None
+    agents: list[FleetTemplateAgentSpec] = Field(default_factory=list)
 
 
 class AgentSpec(BaseModel):
@@ -118,7 +169,42 @@ class AgentSpec(BaseModel):
     mission: str
     fleet: str
     role: str = "executor"
-    model: ModelConfig = Field(default_factory=ModelConfig)
+    model: ModelConfig | None = None
+    capabilities: list[str] = Field(default_factory=list)
+    tools: list[str] = Field(default_factory=list)
+    pilot: PilotConfig | None = None
+
+
+class ModelSpec(BaseModel):
+    config: ModelConfig = Field(default_factory=ModelConfig)
+
+
+class ToolSpec(BaseModel):
+    description: str | None = None
+    type: str = "builtin"
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class CapabilityRequires(BaseModel):
+    tools: list[str] = Field(default_factory=list)
+
+
+class CapabilitySpec(BaseModel):
+    requires: CapabilityRequires = Field(default_factory=CapabilityRequires)
+    compatibleModels: list[str] = Field(default_factory=list)
+
+
+class KnowledgeSpec(BaseModel):
+    type: str
+    ref: KnowledgeRef
+    relatesTo: list[str] = Field(default_factory=list)
+
+    @field_validator("ref", mode="before")
+    @classmethod
+    def coerce_ref(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return {"ref": value}
+        return value
 
 
 class BaseResource(BaseModel):
@@ -137,6 +223,46 @@ class WorkspaceResource(BaseResource):
 
     @model_validator(mode="after")
     def clear_namespace(self) -> WorkspaceResource:
+        self.metadata.namespace = None
+        return self
+
+
+class ModelResource(BaseResource):
+    kind: Literal[ResourceKind.MODEL] = ResourceKind.MODEL
+    spec: ModelSpec = Field(default_factory=ModelSpec)
+
+    @model_validator(mode="after")
+    def clear_namespace(self) -> ModelResource:
+        self.metadata.namespace = None
+        return self
+
+
+class ToolResource(BaseResource):
+    kind: Literal[ResourceKind.TOOL] = ResourceKind.TOOL
+    spec: ToolSpec = Field(default_factory=ToolSpec)
+
+    @model_validator(mode="after")
+    def clear_namespace(self) -> ToolResource:
+        self.metadata.namespace = None
+        return self
+
+
+class CapabilityResource(BaseResource):
+    kind: Literal[ResourceKind.CAPABILITY] = ResourceKind.CAPABILITY
+    spec: CapabilitySpec = Field(default_factory=CapabilitySpec)
+
+    @model_validator(mode="after")
+    def clear_namespace(self) -> CapabilityResource:
+        self.metadata.namespace = None
+        return self
+
+
+class FleetTemplateResource(BaseResource):
+    kind: Literal[ResourceKind.FLEET_TEMPLATE] = ResourceKind.FLEET_TEMPLATE
+    spec: FleetTemplateSpec
+
+    @model_validator(mode="after")
+    def clear_namespace(self) -> FleetTemplateResource:
         self.metadata.namespace = None
         return self
 
@@ -178,20 +304,59 @@ class AgentResource(BaseResource):
         return self
 
 
+class KnowledgeResource(BaseResource):
+    kind: Literal[ResourceKind.KNOWLEDGE] = ResourceKind.KNOWLEDGE
+    spec: KnowledgeSpec
+
+    @model_validator(mode="after")
+    def require_namespace(self) -> KnowledgeResource:
+        if not self.metadata.namespace:
+            raise ValueError("Knowledge metadata.namespace must name a Workspace")
+        return self
+
+
 Resource = Annotated[
-    Union[WorkspaceResource, MissionResource, FleetResource, AgentResource],
+    Union[
+        WorkspaceResource,
+        MissionResource,
+        FleetResource,
+        AgentResource,
+        ModelResource,
+        ToolResource,
+        CapabilityResource,
+        FleetTemplateResource,
+        KnowledgeResource,
+    ],
     Field(discriminator="kind"),
 ]
 
-RESOURCE_BY_KIND: dict[str, type[WorkspaceResource | MissionResource | FleetResource | AgentResource]] = {
+AnyResource = (
+    WorkspaceResource
+    | MissionResource
+    | FleetResource
+    | AgentResource
+    | ModelResource
+    | ToolResource
+    | CapabilityResource
+    | FleetTemplateResource
+    | KnowledgeResource
+)
+
+
+RESOURCE_BY_KIND: dict[str, type[AnyResource]] = {
     ResourceKind.WORKSPACE.value: WorkspaceResource,
     ResourceKind.MISSION.value: MissionResource,
     ResourceKind.FLEET.value: FleetResource,
     ResourceKind.AGENT.value: AgentResource,
+    ResourceKind.MODEL.value: ModelResource,
+    ResourceKind.TOOL.value: ToolResource,
+    ResourceKind.CAPABILITY.value: CapabilityResource,
+    ResourceKind.FLEET_TEMPLATE.value: FleetTemplateResource,
+    ResourceKind.KNOWLEDGE.value: KnowledgeResource,
 }
 
 
-def parse_resource(raw: dict[str, Any]) -> WorkspaceResource | MissionResource | FleetResource | AgentResource:
+def parse_resource(raw: dict[str, Any]) -> AnyResource:
     kind = raw.get("kind")
     resource_type = RESOURCE_BY_KIND.get(str(kind))
     if resource_type is None:
@@ -200,17 +365,17 @@ def parse_resource(raw: dict[str, Any]) -> WorkspaceResource | MissionResource |
     return resource_type.model_validate(raw)
 
 
-def parse_resource_documents(raw_text: str) -> list[WorkspaceResource | MissionResource | FleetResource | AgentResource]:
+def parse_resource_documents(raw_text: str) -> list[AnyResource]:
     docs = [doc for doc in yaml.safe_load_all(raw_text) if doc]
     return [parse_resource(doc) for doc in docs]
 
 
 def resource_key(kind: str | ResourceKind, name: str, namespace: str | None = None) -> tuple[str, str, str]:
     normalized_kind = ResourceKind(kind).value
-    if normalized_kind == ResourceKind.WORKSPACE.value:
+    if normalized_kind in CLUSTER_SCOPED_KINDS:
         namespace = ""
     return normalized_kind, namespace or "", name
 
 
-def dump_resource(resource: WorkspaceResource | MissionResource | FleetResource | AgentResource) -> dict[str, Any]:
+def dump_resource(resource: AnyResource) -> dict[str, Any]:
     return resource.model_dump(mode="json", exclude_none=True)

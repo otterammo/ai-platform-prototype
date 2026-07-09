@@ -6,8 +6,11 @@ The prototype treats AI work as resources:
 
 - `Workspace` defines a project boundary and storage root.
 - `Mission` declares a desired outcome.
-- `Fleet` is created by the Mission controller.
-- `Agent` is created by the Fleet controller and executes the Mission through a model abstraction.
+- `FleetTemplate` declares the Agent topology for a class of work.
+- `Fleet` is instantiated from a Mission and FleetTemplate.
+- `Capability`, `Tool`, and `Model` describe what Agents need and how the platform can satisfy it.
+- `Agent` is created by the Fleet controller and executes through an embedded `Pilot`.
+- `Knowledge` records describe workspace knowledge nodes separately from manifests.
 
 Resources use the shape:
 
@@ -18,11 +21,20 @@ metadata:
   name: implement-auth
   namespace: demo
 spec:
-  objective: Implement authentication
-  brief:
-    ref: knowledge://prd.md
+  template: software-feature
+  inputs:
+    prd:
+      ref: knowledge://prd.md
+  outputs:
+    code: true
 status:
   phase: Pending
+```
+
+The registry-driven reconciliation flow is:
+
+```text
+Mission -> FleetTemplate -> Fleet -> Agents -> Capabilities -> Tools/Pilot/Model
 ```
 
 ## Install
@@ -51,6 +63,11 @@ Inspect resources and events:
 
 ```bash
 platform --db sqlite:///./platform.db --root .platform get missions
+platform --db sqlite:///./platform.db --root .platform get fleettemplates
+platform --db sqlite:///./platform.db --root .platform get capabilities
+platform --db sqlite:///./platform.db --root .platform get models
+platform --db sqlite:///./platform.db --root .platform get tools
+platform --db sqlite:///./platform.db --root .platform get knowledge -n demo
 platform --db sqlite:///./platform.db --root .platform describe mission implement-auth -n demo
 platform --db sqlite:///./platform.db --root .platform events
 ```
@@ -77,14 +94,20 @@ Deleting a Mission or Workspace removes the corresponding resource and artifact 
 
 The default provider is `stub`, which produces deterministic markdown artifacts without network access.
 
-To use an OpenAI-compatible endpoint, set a model config on the Workspace or Mission:
+To use an OpenAI-compatible endpoint in the registry-driven path, create a `Model` resource and reference it through a Capability-compatible Pilot:
 
 ```yaml
-model:
-  provider: openai-compatible
-  model: gpt-4.1-mini
-  baseUrl: https://api.openai.com/v1
-  apiKeyEnv: OPENAI_API_KEY
+kind: Model
+metadata:
+  name: gpt-coder
+spec:
+  config:
+    provider: openai-compatible
+    model: gpt-4.1-mini
+    baseUrl: https://api.openai.com/v1
+    apiKeyEnv: OPENAI_API_KEY
 ```
 
 The runtime sends chat-completions-compatible requests to `{baseUrl}/chat/completions`.
+
+Legacy Missions with `spec.objective` and `spec.brief` still work; they reconcile through the original single-agent path.

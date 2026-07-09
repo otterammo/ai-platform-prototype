@@ -23,6 +23,17 @@ RESOURCE_ALIASES = {
     "fleets": ResourceKind.FLEET.value,
     "agent": ResourceKind.AGENT.value,
     "agents": ResourceKind.AGENT.value,
+    "model": ResourceKind.MODEL.value,
+    "models": ResourceKind.MODEL.value,
+    "tool": ResourceKind.TOOL.value,
+    "tools": ResourceKind.TOOL.value,
+    "capability": ResourceKind.CAPABILITY.value,
+    "capabilities": ResourceKind.CAPABILITY.value,
+    "fleettemplate": ResourceKind.FLEET_TEMPLATE.value,
+    "fleettemplates": ResourceKind.FLEET_TEMPLATE.value,
+    "fleet-template": ResourceKind.FLEET_TEMPLATE.value,
+    "fleet-templates": ResourceKind.FLEET_TEMPLATE.value,
+    "knowledge": ResourceKind.KNOWLEDGE.value,
 }
 
 

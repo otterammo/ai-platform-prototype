@@ -89,7 +89,10 @@ def create_app(
         return {"items": store.list_events(namespace, resourceKind, resourceName, limit)}
 
     @app.get("/artifacts")
-    async def list_artifacts(namespace: str | None = None, mission: str | None = None) -> dict[str, list[dict[str, Any]]]:
+    async def list_artifacts(
+        namespace: str | None = None,
+        mission: str | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
         return {"items": store.list_artifacts(namespace, mission)}
 
     @app.get("/openapi.yaml", include_in_schema=False)

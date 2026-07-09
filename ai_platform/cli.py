@@ -13,7 +13,6 @@ from .controllers import ControlPlane
 from .resources import ResourceKind, parse_resource_documents
 from .storage import DEFAULT_DB_URL, ResourceStore
 
-
 RESOURCE_ALIASES = {
     "workspace": ResourceKind.WORKSPACE.value,
     "workspaces": ResourceKind.WORKSPACE.value,
@@ -51,7 +50,11 @@ def normalize_kind(value: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="platform", description="Declarative AI platform prototype CLI")
-    parser.add_argument("--db", default=os.environ.get("AI_PLATFORM_DB", DEFAULT_DB_URL), help="SQLAlchemy database URL")
+    parser.add_argument(
+        "--db",
+        default=os.environ.get("AI_PLATFORM_DB", DEFAULT_DB_URL),
+        help="SQLAlchemy database URL",
+    )
     parser.add_argument("--root", default=os.environ.get("AI_PLATFORM_ROOT", ".platform"), help="Platform data root")
     subparsers = parser.add_subparsers(dest="command", required=True)
 

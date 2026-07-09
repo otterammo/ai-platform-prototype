@@ -6,11 +6,9 @@ import os
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
-from typing import Any
 
 from .resources import ModelConfig
 from .storage import ResourceStore
-
 
 Message = dict[str, str]
 
@@ -41,10 +39,12 @@ class StubModelClient(ModelClient):
 
 class OpenAICompatibleClient(ModelClient):
     def __init__(self, config: ModelConfig, store: ResourceStore | None = None) -> None:
-        if not config.baseUrl:
+        base_url = config.baseUrl
+        if not base_url:
             raise ValueError("openai-compatible model requires baseUrl")
         self.config = config
         self.store = store
+        self.base_url = base_url.rstrip("/")
 
     async def generate(self, messages: list[Message]) -> str:
         return await asyncio.to_thread(self._generate_sync, messages)
@@ -54,8 +54,7 @@ class OpenAICompatibleClient(ModelClient):
         if not api_key:
             raise RuntimeError(f"missing API key environment variable: {self.config.apiKeyEnv}")
 
-        base_url = self.config.baseUrl.rstrip("/")
-        url = f"{base_url}/chat/completions"
+        url = f"{self.base_url}/chat/completions"
         payload = {
             "model": self.config.model,
             "messages": messages,

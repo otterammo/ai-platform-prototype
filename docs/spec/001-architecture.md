@@ -55,7 +55,7 @@ Artifact represents durable output produced by an AgentRun.
 
 ToolInvocation represents one structured, governed request to execute a Tool
 operation during an AgentRun. Observation represents the structured result of
-that invocation returned to the Pilot.
+that invocation for status, API projections, and trace reconstruction.
 
 ## Ownership
 

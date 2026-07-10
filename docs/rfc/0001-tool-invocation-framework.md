@@ -235,10 +235,18 @@ provider.
 - ToolInvocation resources may grow large unless Observation payload and output
   reference rules are clear.
 
-## Open Questions
+## Accepted Decisions
 
-- Which ToolInvocation phases should be required in the stable resource schema?
-- What storage compaction rules are allowed for Observations without weakening
-  the resource API, ordering, or trace reconstruction contract?
-- How much of Tool Runtime identity should be persisted for audit without
-  leaking provider internals?
+- ToolInvocation lifecycle should include requested, validated, authorized,
+  waiting for approval, running, succeeded, failed, denied, timed out, and
+  cancelled states. Compatible implementations may use additional phases, but
+  must preserve equivalent terminal conditions for succeeded, failed, denied,
+  timed out, and cancelled outcomes.
+- Observation compaction may move unbounded output into scoped or admitted output
+  references, but must preserve enough resource or API-projected data for trace
+  reconstruction, ordering, redaction disclosure, terminal result inspection, and
+  policy audit.
+- Tool Runtime identity must be persisted as a stable runtime or provider actor
+  identifier in status, events, or trace projections when available. The
+  identifier must be sufficient for audit without exposing provider internals,
+  credentials, or policy-redacted details.

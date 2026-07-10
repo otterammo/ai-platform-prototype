@@ -88,7 +88,7 @@ responsible controller.
 ## Observation
 
 A Workspace-scoped resource containing the structured result of a ToolInvocation
-returned to the Pilot and preserved for trace reconstruction.
+for status, API projections, and trace reconstruction.
 
 ## OwnerReference
 

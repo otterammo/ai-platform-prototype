@@ -1,0 +1,106 @@
+apiVersion: ai.platform/v1
+kind: Model
+metadata:
+  name: stub-model
+spec:
+  config:
+    provider: stub
+    model: stub-model
+---
+apiVersion: ai.platform/v1
+kind: Tool
+metadata:
+  name: git
+spec:
+  description: Inspect and prepare source changes
+---
+apiVersion: ai.platform/v1
+kind: Tool
+metadata:
+  name: filesystem
+spec:
+  description: Read and write workspace files
+---
+apiVersion: ai.platform/v1
+kind: Capability
+metadata:
+  name: implement-login-page
+spec:
+  requires:
+    tools:
+      - git
+      - filesystem
+  compatibleModels:
+    - stub-model
+---
+apiVersion: ai.platform/v1
+kind: FleetTemplate
+metadata:
+  name: login-page
+spec:
+  agents:
+    - name: implementer
+      role: implementer
+      capabilities:
+        - implement-login-page
+---
+apiVersion: ai.platform/v1
+kind: Policy
+metadata:
+  name: default
+spec:
+  rules:
+    - match:
+        tool: git
+        operation: use
+      requiresApproval: true
+    - match:
+        tool: knowledge
+      allow: true
+    - match:
+        tool: model
+      allow: true
+    - match:
+        tool: filesystem
+      allow: true
+    - match:
+        tool: git
+      allow: true
+---
+apiVersion: ai.platform/v1
+kind: Knowledge
+metadata:
+  name: login-prd
+  namespace: day0
+spec:
+  type: PRD
+  ref: knowledge://prd.md
+---
+apiVersion: ai.platform/v1
+kind: Knowledge
+metadata:
+  name: login-architecture
+  namespace: day0
+spec:
+  type: Architecture
+  ref: knowledge://architecture.md
+---
+apiVersion: ai.platform/v1
+kind: Knowledge
+metadata:
+  name: login-research
+  namespace: day0
+spec:
+  type: Research
+  ref: knowledge://research.md
+---
+apiVersion: ai.platform/v1
+kind: KnowledgeIndex
+metadata:
+  name: default
+  namespace: day0
+spec:
+  sources:
+    - knowledge://prd.md
+    - knowledge://architecture.md
+    - knowledge://research.md

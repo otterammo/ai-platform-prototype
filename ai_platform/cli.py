@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
+import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from . import __version__
 from .controllers import ControlPlane
 from .knowledge import DEFAULT_INDEX_NAME, KeywordRetriever, KnowledgeIndexer
 from .observability import build_timeline, build_trace, describe_resource, format_timeline, format_trace
@@ -77,6 +81,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", default=os.environ.get("AI_PLATFORM_ROOT", ".platform"), help="Platform data root")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    version_parser = subparsers.add_parser("version", help="Show platform CLI version")
+    version_parser.add_argument("-o", "--output", choices=["yaml", "json"], default="yaml")
+
+    health_parser = subparsers.add_parser("health", help="Check local store or API health")
+    health_parser.add_argument("--api-url", help="Base API URL or /health endpoint to check")
+    health_parser.add_argument("-o", "--output", choices=["yaml", "json"], default="yaml")
+
     apply_parser = subparsers.add_parser("apply", help="Apply one or more YAML resource manifests")
     apply_parser.add_argument("path", nargs="?", type=Path)
     apply_parser.add_argument("-f", "--file", type=Path)
@@ -107,6 +118,21 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_parser.add_argument("--watch", action="store_true", help="Run continuously")
     reconcile_parser.add_argument("--interval", type=float, default=2.0)
 
+    wait_parser = subparsers.add_parser("wait", help="Wait for a resource condition")
+    wait_parser.add_argument("kind", type=normalize_kind)
+    wait_parser.add_argument("name")
+    wait_parser.add_argument("-n", "--namespace")
+    wait_parser.add_argument(
+        "--for",
+        dest="wait_for",
+        required=True,
+        help="Condition to wait for, e.g. phase=Completed",
+    )
+    wait_parser.add_argument("--timeout", type=float, default=60.0)
+    wait_parser.add_argument("--interval", type=float, default=1.0)
+    wait_parser.add_argument("--reconcile", action="store_true", help="Run reconciliation while waiting")
+    wait_parser.add_argument("-o", "--output", choices=["yaml", "json"], default="yaml")
+
     trace_parser = subparsers.add_parser("trace", help="Show an execution trace")
     trace_subparsers = trace_parser.add_subparsers(dest="trace_kind", required=True)
     trace_mission_parser = trace_subparsers.add_parser("mission", help="Trace a Mission execution")
@@ -134,7 +160,13 @@ def build_parser() -> argparse.ArgumentParser:
     knowledge_search_parser.add_argument("--limit", type=int, default=10)
     knowledge_search_parser.add_argument("-o", "--output", choices=["yaml", "json"], default="yaml")
 
-    subparsers.add_parser("events", help="List recent events")
+    events_parser = subparsers.add_parser("events", help="List recent events")
+    events_parser.add_argument("-n", "--namespace")
+    events_parser.add_argument("--kind", type=normalize_kind)
+    events_parser.add_argument("--name")
+    events_parser.add_argument("--correlation-id")
+    events_parser.add_argument("--limit", type=int, default=100)
+    events_parser.add_argument("-o", "--output", choices=["yaml", "json"], default="yaml")
 
     approvals_parser = subparsers.add_parser("approvals", help="List approval requests")
     approvals_parser.add_argument("-o", "--output", choices=["yaml", "json"], default="yaml")
@@ -161,15 +193,30 @@ def make_store(args: argparse.Namespace) -> ResourceStore:
 
 def print_data(data: Any, output: str = "yaml") -> None:
     if output == "json":
-        import json
-
         print(json.dumps(data, indent=2))
         return
     print(yaml.safe_dump(data, sort_keys=False))
 
 
 async def run_async(args: argparse.Namespace) -> int:
+    if args.command == "version":
+        print_data({"version": __version__}, args.output)
+        return 0
+
+    if args.command == "health" and args.api_url:
+        try:
+            print_data(_api_health(args.api_url), args.output)
+            return 0
+        except Exception as exc:
+            print_data({"status": "unhealthy", "error": str(exc), "apiUrl": _health_url(args.api_url)}, args.output)
+            return 1
+
     store = make_store(args)
+    if args.command == "health":
+        health = _local_health(store)
+        print_data(health, args.output)
+        return 0 if health["status"] == "ok" else 1
+
     if args.command == "apply":
         path = args.file or args.path
         if path is None:
@@ -219,6 +266,26 @@ async def run_async(args: argparse.Namespace) -> int:
         print_data({"controllers": [result.__dict__ for result in results]})
         return 0
 
+    if args.command == "wait":
+        try:
+            field, expected = _parse_wait_for(args.wait_for)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        ok, result = await _wait_for_resource(
+            store,
+            args.kind,
+            args.name,
+            args.namespace,
+            field,
+            expected,
+            timeout_seconds=args.timeout,
+            interval_seconds=args.interval,
+            reconcile=args.reconcile,
+        )
+        print_data(result, args.output)
+        return 0 if ok else 1
+
     if args.command == "trace":
         trace = build_trace(store, args.name, args.namespace)
         if trace is None:
@@ -253,7 +320,18 @@ async def run_async(args: argparse.Namespace) -> int:
             return 0
 
     if args.command == "events":
-        print_data({"items": store.list_events()})
+        print_data(
+            {
+                "items": store.list_events(
+                    namespace=args.namespace,
+                    resource_kind=args.kind,
+                    resource_name=args.name,
+                    limit=args.limit,
+                    correlation_id=args.correlation_id,
+                )
+            },
+            args.output,
+        )
         return 0
 
     if args.command == "approvals":
@@ -280,20 +358,125 @@ async def run_async(args: argparse.Namespace) -> int:
         print_data({"approval": approval, "controllers": [result.__dict__ for result in results]})
         return 0
 
-    if args.command == "serve":
-        os.environ["AI_PLATFORM_DB"] = args.db
-        os.environ["AI_PLATFORM_ROOT"] = args.root
-        import uvicorn
-
-        uvicorn.run("ai_platform.api:app", host=args.host, port=args.port, reload=False)
-        return 0
-
     raise AssertionError(f"unhandled command {args.command}")
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "serve":
+        return _serve(args)
     return asyncio.run(run_async(args))
+
+
+def _serve(args: argparse.Namespace) -> int:
+    os.environ["AI_PLATFORM_DB"] = args.db
+    os.environ["AI_PLATFORM_ROOT"] = args.root
+    import uvicorn
+
+    uvicorn.run("ai_platform.api:app", host=args.host, port=args.port, reload=False)
+    return 0
+
+
+def _local_health(store: ResourceStore) -> dict[str, Any]:
+    platform = store.get(ResourceKind.PLATFORM, "local")
+    phase = (platform.get("status") or {}).get("phase") if platform else None
+    return {
+        "status": "ok" if phase == "Ready" else "unhealthy",
+        "version": __version__,
+        "database": store.database_url,
+        "root": str(store.platform_root),
+        "platform": {
+            "name": "local",
+            "phase": phase,
+        },
+    }
+
+
+def _health_url(api_url: str) -> str:
+    base = api_url.rstrip("/")
+    if base.endswith("/health"):
+        return base
+    return f"{base}/health"
+
+
+def _api_health(api_url: str) -> dict[str, Any]:
+    url = _health_url(api_url)
+    request = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(request, timeout=5) as response:
+        raw_body = response.read().decode("utf-8")
+    body = json.loads(raw_body) if raw_body.strip() else {}
+    if not isinstance(body, dict):
+        raise ValueError("health endpoint did not return an object")
+    return {
+        "status": body.get("status", "unknown"),
+        "version": __version__,
+        "apiUrl": url,
+        "api": body,
+    }
+
+
+def _parse_wait_for(value: str) -> tuple[str, str]:
+    field, separator, expected = value.partition("=")
+    if not separator or not field or not expected:
+        raise ValueError("wait requires --for phase=<Phase>")
+    if field != "phase":
+        raise ValueError("wait currently supports only --for phase=<Phase>")
+    return field, expected
+
+
+async def _wait_for_resource(
+    store: ResourceStore,
+    kind: str,
+    name: str,
+    namespace: str | None,
+    field: str,
+    expected: str,
+    *,
+    timeout_seconds: float,
+    interval_seconds: float,
+    reconcile: bool,
+) -> tuple[bool, dict[str, Any]]:
+    deadline = time.monotonic() + timeout_seconds
+    control_plane = ControlPlane(store) if reconcile else None
+    last_value: str | None = None
+    last_resource: dict[str, Any] | None = None
+
+    while True:
+        if control_plane:
+            await control_plane.reconcile_once()
+        resource = store.get(kind, name, namespace)
+        if resource is not None:
+            last_resource = resource
+            last_value = _resource_wait_value(resource, field)
+            if last_value == expected:
+                return True, {
+                    "status": "met",
+                    "kind": kind,
+                    "name": name,
+                    "namespace": namespace,
+                    "condition": {"field": field, "value": expected},
+                    "resource": resource,
+                }
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, {
+                "status": "timeout",
+                "kind": kind,
+                "name": name,
+                "namespace": namespace,
+                "condition": {"field": field, "value": expected},
+                "observed": last_value,
+                "resource": last_resource,
+            }
+        await asyncio.sleep(min(interval_seconds, remaining))
+
+
+def _resource_wait_value(resource: dict[str, Any], field: str) -> str | None:
+    if field == "phase":
+        value = (resource.get("status") or {}).get("phase")
+        return value if isinstance(value, str) else None
+    raise ValueError(f"unsupported wait field {field}")
 
 
 def _search_result(chunk: dict[str, Any]) -> dict[str, Any]:

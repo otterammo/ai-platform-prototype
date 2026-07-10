@@ -1,0 +1,6 @@
+apiVersion: ai.platform/v1
+kind: Workspace
+metadata:
+  name: day0
+spec:
+  rootPath: ../day0

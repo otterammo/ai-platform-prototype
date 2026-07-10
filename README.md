@@ -2,6 +2,53 @@
 
 A functional prototype of a declarative AI orchestration platform inspired by Kubernetes.
 
+## Start Here
+
+New users should start with the Day 0 tutorial. It runs fully offline with the
+stub model and takes you from clone to completed Mission artifact.
+
+### Install
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e ".[dev]"
+platform version
+platform health
+```
+
+### First Mission
+
+```bash
+mkdir -p day0
+cp -R docs/tutorials/assets/day0/. day0/
+export AI_PLATFORM_DB=sqlite:///./platform.db
+export AI_PLATFORM_ROOT=.platform
+platform apply day0/workspace.yaml
+platform apply day0/knowledge.yaml
+platform knowledge index -n day0
+platform apply day0/mission.yaml
+platform wait mission implement-login-page -n day0 --for phase=Waiting --reconcile --timeout 30
+platform approvals
+```
+
+Approve the pending approval, then wait for completion:
+
+```bash
+platform approve <approval-name> --by day0-user --reason "Day 0 tutorial"
+platform wait mission implement-login-page -n day0 --for phase=Completed --reconcile --timeout 30
+platform get artifacts -n day0
+platform trace mission implement-login-page -n day0
+```
+
+### Learn More
+
+Follow the full [Day 0 tutorial](docs/tutorials/README.md) for Workspace,
+Knowledge, Mission, reconciliation, approvals, trace, artifacts, and cleanup.
+The engineering specification and governance docs live in [docs](docs/README.md).
+
+## Resource Model
+
 The prototype treats AI work as resources:
 
 - `Workspace` defines a project boundary and storage root.
@@ -55,7 +102,7 @@ Knowledge now flows through an indexed retrieval path before model invocation:
 Knowledge Storage -> KnowledgeIndexController -> ContextController -> Context -> AgentRun Worker
 ```
 
-## Install
+## Development Install
 
 ```bash
 python3 -m venv .venv
@@ -94,7 +141,10 @@ live in [docs](docs/README.md).
 
 Use `/hooks` in Codex to review and trust project-local hooks after changes.
 
-## Run The Prototype
+## Run The Prototype Reference
+
+For first-time use, prefer the [Day 0 tutorial](docs/tutorials/README.md). The
+commands below are a compact reference for the older demo manifest.
 
 Apply the demo resources:
 

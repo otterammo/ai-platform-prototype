@@ -1,10 +1,32 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from ai_platform.cli import main
 from ai_platform.resources import ResourceKind
 from ai_platform.storage import ResourceStore
+
+
+def test_cli_version_does_not_create_store(tmp_path: Path, capsys) -> None:
+    db_path = tmp_path / "platform.db"
+
+    assert main(["--db", f"sqlite:///{db_path}", "--root", str(tmp_path / "platform"), "version", "-o", "json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["version"] == "0.1.0"
+    assert not db_path.exists()
+
+
+def test_cli_health_checks_local_store(tmp_path: Path, capsys) -> None:
+    db_path = tmp_path / "platform.db"
+
+    assert main(["--db", f"sqlite:///{db_path}", "--root", str(tmp_path / "platform"), "health", "-o", "json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "ok"
+    assert output["platform"]["phase"] == "Ready"
+    assert db_path.exists()
 
 
 def test_cli_apply_and_get(tmp_path: Path, capsys) -> None:
@@ -48,6 +70,86 @@ spec:
     assert "name: demo" in output
     assert "kind: Mission" in output
     assert "resource:" in output
+
+
+def test_cli_wait_with_reconcile_and_filtered_events(tmp_path: Path, capsys) -> None:
+    manifest = tmp_path / "resources.yaml"
+    manifest.write_text(
+        f"""
+apiVersion: ai.platform/v1
+kind: Workspace
+metadata:
+  name: demo
+spec:
+  rootPath: {tmp_path / "workspace"}
+---
+apiVersion: ai.platform/v1
+kind: Mission
+metadata:
+  name: build-login
+  namespace: demo
+spec:
+  objective: Build login page
+""",
+        encoding="utf-8",
+    )
+    db = f"sqlite:///{tmp_path / 'platform.db'}"
+    root = str(tmp_path / "platform")
+
+    assert main(["--db", db, "--root", root, "apply", str(manifest)]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "--db",
+                db,
+                "--root",
+                root,
+                "wait",
+                "mission",
+                "build-login",
+                "-n",
+                "demo",
+                "--for",
+                "phase=Completed",
+                "--reconcile",
+                "--timeout",
+                "5",
+                "--interval",
+                "0.01",
+                "-o",
+                "json",
+            ]
+        )
+        == 0
+    )
+    waited = json.loads(capsys.readouterr().out)
+    assert waited["status"] == "met"
+    assert waited["resource"]["status"]["phase"] == "Completed"
+
+    assert (
+        main(
+            [
+                "--db",
+                db,
+                "--root",
+                root,
+                "events",
+                "-n",
+                "demo",
+                "--kind",
+                "Mission",
+                "--name",
+                "build-login",
+                "--limit",
+                "20",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "MissionCreated" in output
+    assert "AgentRunCreated" not in output
 
 
 def test_cli_apply_still_accepts_file_flag(tmp_path: Path, capsys) -> None:
@@ -385,6 +487,10 @@ spec:
 
 
 def test_cli_serve_invokes_uvicorn(tmp_path: Path, monkeypatch) -> None:
+    import uvicorn
+
+    import ai_platform.cli as cli
+
     calls = {}
 
     def fake_run(app: str, host: str, port: int, reload: bool) -> None:
@@ -393,8 +499,10 @@ def test_cli_serve_invokes_uvicorn(tmp_path: Path, monkeypatch) -> None:
         calls["port"] = port
         calls["reload"] = reload
 
-    import uvicorn
+    def fail_asyncio_run(coro: object) -> int:
+        raise AssertionError(f"serve must not run inside asyncio.run: {coro!r}")
 
+    monkeypatch.setattr(cli.asyncio, "run", fail_asyncio_run)
     monkeypatch.setattr(uvicorn, "run", fake_run)
 
     assert (

@@ -16,6 +16,8 @@ Future significant work should update governance artifacts in this order:
 
 ## Directory Guide
 
+- [tutorials](tutorials/README.md) contains the Day 0 onboarding flow and
+  acceptance-test-backed getting started experience.
 - [spec](spec/README.md) contains the normative Platform Specification.
 - [rfc](rfc/README.md) contains design proposals for significant changes.
 - [adr](adr/README.md) contains permanent architecture decisions.

@@ -10,7 +10,7 @@ TBD.
 
 ## Status
 
-Draft.
+Accepted.
 
 ## Motivation
 

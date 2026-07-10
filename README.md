@@ -79,6 +79,12 @@ Install the local Git hooks with:
 pre-commit install
 ```
 
+## Engineering Governance
+
+The Platform Specification is the contract for future platform evolution.
+Governance docs, RFCs, ADRs, the milestone roadmap, and contributor workflow
+live in [docs](docs/README.md).
+
 ## Codex Repo Tools
 
 - `AGENTS.md` defines persistent repository instructions for Codex agents.

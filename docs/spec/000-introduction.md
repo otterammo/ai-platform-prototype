@@ -1,11 +1,11 @@
-# Platform Specification v1
+# Platform Specification v1.0.0
 
 ## Purpose
 
-This specification defines the v1 architecture and behavioral contracts for the AI
-Platform. It is the normative source of truth for resources, controllers,
-runtimes, APIs, command-line tools, and extensions that claim compatibility with
-`ai.platform/v1`.
+This specification defines the v1.0.0 architecture and behavioral contracts for
+the AI Platform. It is the normative source of truth for resources,
+controllers, runtimes, APIs, command-line tools, and extensions that claim
+compatibility with `ai.platform/v1`.
 
 The platform is a declarative control plane for AI work. Users declare desired
 outcomes as resources. The control plane admits, persists, reconciles, schedules,
@@ -38,6 +38,10 @@ context consumption rules, and artifact reporting rules defined here.
 The specification is intentionally architecture-first. Existing systems SHOULD
 evolve toward this specification. This specification MUST NOT be reduced to match
 the incidental limits of any single system.
+
+The specification index is maintained in [README.md](README.md). Versioning
+rules for the Platform Specification and resource APIs are defined in
+[Versioning](020-versioning.md).
 
 ## Platform Goals
 

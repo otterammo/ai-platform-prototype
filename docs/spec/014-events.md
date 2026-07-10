@@ -72,9 +72,10 @@ reconciliation completed, admission rejected, template selected, capability
 resolved, model selected, context built, AgentRun scheduled, AgentRun started,
 policy evaluated, approval requested, approval granted, approval rejected, model
 invoked, ToolInvocation requested, ToolInvocation validated, ToolInvocation
-authorized, ToolInvocation denied, ToolInvocation started, ToolInvocation
-completed, ToolInvocation failed, Observation recorded, Pilot continued, Pilot
-completed, artifact ready, completed, waiting, and failed.
+authorized, ToolInvocation denied, ToolInvocation waiting for approval,
+ToolInvocation started, ToolInvocation completed, ToolInvocation failed,
+ToolInvocation timed out, ToolInvocation cancelled, Observation recorded,
+artifact ready, completed, waiting, and failed.
 
 ToolInvocation events MUST include correlation identifier, Workspace, AgentRun,
 ToolInvocation, Tool, operation, and runtime or provider actor. Sensitive
@@ -85,7 +86,7 @@ arguments and output MUST be redacted according to Policy.
 Trace projections MUST be able to reconstruct the execution path for a Mission
 or AgentRun from resources and events. For tool-executing AgentRuns, trace MUST
 show each ToolInvocation, policy decision, execution phase, result, Observation,
-related Artifacts, and Pilot continuation or completion.
+and related Artifacts.
 
 Trace output MUST distinguish missing data from redacted data. Redaction MUST be
 driven by Policy and MUST NOT remove the fact that a ToolInvocation occurred.

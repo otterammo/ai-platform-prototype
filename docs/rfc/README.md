@@ -8,7 +8,11 @@ Use [template.md](template.md) for new RFCs.
 
 ## RFCs
 
-- [RFC-0001: Structured Tool Invocation And Execution Loop](0001-structured-tool-invocation.md)
+- [RFC-0001: Tool Invocation Framework](0001-tool-invocation-framework.md)
+- [RFC-0002: Pilot Execution Loop](0002-pilot-execution-loop.md)
+- [RFC-0003: Built-In Tool Runtime](0003-built-in-tool-runtime.md)
+- [RFC-0004: Structured Model Protocol](0004-structured-model-protocol.md)
+- [RFC-0005: Multi-Turn Agent Runtime](0005-multi-turn-agent-runtime.md)
 
 ## Statuses
 

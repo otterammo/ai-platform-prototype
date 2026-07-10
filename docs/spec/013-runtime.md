@@ -18,7 +18,7 @@ Runtime MAY perform the following actions for a scheduled AgentRun:
 - Invoke the effective Pilot.
 - Invoke permitted Models through the Pilot.
 - Record, validate, authorize, and execute ToolInvocations.
-- Record Observations and return them to the Pilot.
+- Record Observations.
 - Produce Artifacts.
 - Update AgentRun status through approved status paths.
 - Emit execution events.
@@ -58,26 +58,14 @@ Such transformation MUST preserve provenance and MUST honor Model limits.
 Runtime MUST use the ToolInvocation contract for tool actions. Runtime MUST
 validate structured arguments, authorize the ToolInvocation through Policy, pause
 for Approval when required, invoke the Tool Runtime only after authorization,
-record the Observation, and return the Observation to the Pilot.
+and record the Observation.
 
-Runtime MUST NOT interpret natural-language model output as a tool request.
 Runtime MUST NOT execute denied ToolInvocations, and MUST NOT change Tool,
 operation, provider, or request shape to bypass denial.
 
 Tool invocation events SHOULD include tool identity, operation, AgentRun
 identity, ToolInvocation identity, policy decision, Observation identity, and
 correlation data. Sensitive details SHOULD be redacted according to policy.
-
-## Execution Loop
-
-Runtime MUST continue the Pilot execution loop until the Pilot returns a final
-response, the AgentRun is cancelled, approval is required, or a termination
-limit is reached.
-
-Runtime MUST enforce maximum iteration count, maximum ToolInvocation count,
-effective token budget, Tool timeouts, and cancellation. When a limit terminates
-execution, runtime MUST record failure or cancellation in AgentRun status and
-events.
 
 ## Artifact Production
 

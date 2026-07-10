@@ -3,15 +3,16 @@
 ## Purpose
 
 ToolInvocation represents one structured request to execute a Tool operation for
-an AgentRun. It is the runtime-side effect boundary where model-directed intent
-becomes a governed platform action.
+an AgentRun. It is the runtime-side effect boundary where model-directed or
+platform-directed intent becomes a governed platform action.
 
-Observation represents the structured result of a ToolInvocation that is
-returned to the Pilot and preserved for trace reconstruction.
+Observation represents the structured result of a ToolInvocation and preserves
+the execution outcome for status, API clients, trace reconstruction, and future
+Pilot continuation semantics.
 
-Runtime MUST NOT execute tools from natural-language instructions. Tool
-operations MUST be represented as structured ToolInvocation requests before any
-side effect occurs.
+Runtime MUST execute tools only through ToolInvocation resources. Runtime MUST
+NOT treat process-local logs, provider-native tool-call objects, or
+natural-language text as substitutes for ToolInvocation state.
 
 ## Scope And Ownership
 
@@ -74,7 +75,7 @@ An Observation MUST contain:
 
 - ToolInvocation reference.
 - AgentRun reference.
-- Summary suitable for Pilot continuation.
+- Summary.
 - Structured payload matching the Tool operation output schema when execution
   succeeds.
 - Error reason and message when execution fails, is denied, times out, or is
@@ -82,13 +83,12 @@ An Observation MUST contain:
 - Redaction metadata when arguments or outputs were withheld by policy.
 
 An Observation SHOULD include output references for large data rather than
-embedding unbounded payloads. Shell Observations SHOULD preserve exit code,
-stdout reference or excerpt, stderr reference or excerpt, and timeout state when
-allowed by policy.
+embedding unbounded payloads. Output references MUST remain scoped or admitted
+for the owning Workspace.
 
-Runtime MUST make Observations available to the Pilot in execution order.
 Runtime MUST preserve enough Observation data in resources or API projections for
-trace reconstruction.
+trace reconstruction. Future Pilot continuation semantics are defined outside
+this framework chapter.
 
 ## Tool Contract
 
@@ -109,42 +109,36 @@ Runtime MUST validate ToolInvocation arguments against the operation input schem
 before policy authorization and execution. Runtime MUST reject or fail invalid
 ToolInvocations without invoking the Tool Runtime.
 
-## Execution Loop
+## Runtime Interface
 
-Pilot decisions MUST use a structured contract. A Pilot decision MUST be either
-a final response or a ToolInvocation request.
+Runtime MUST execute one admitted ToolInvocation through this framework by:
 
-For each ToolInvocation request, runtime MUST:
+1. Loading the AgentRun and ToolInvocation.
+2. Validating arguments against the Tool contract.
+3. Evaluating Policy.
+4. Pausing for Approval when Policy requires approval.
+5. Executing the authorized Tool operation through the selected Tool Runtime.
+6. Recording the Observation.
+7. Updating ToolInvocation and AgentRun status.
+8. Emitting events.
 
-1. Record or derive a ToolInvocation identity.
-2. Validate arguments against the Tool contract.
-3. Evaluate Policy.
-4. Pause for Approval when Policy requires approval.
-5. Execute the authorized Tool operation through the selected Tool Runtime.
-6. Record the Observation.
-7. Return the Observation to the Pilot.
-8. Continue the AgentRun loop until a final response or termination condition.
+Runtime MUST NOT perform Mission, Fleet, or Agent planning while executing a
+ToolInvocation.
 
-Runtime MUST NOT perform Mission, Fleet, or Agent planning while running this
-loop.
+The structured protocol that converts Model decisions into ToolInvocation
+requests is defined separately from this framework.
 
-## Built-In Tool Runtimes
+## Tool Runtime Interface
 
-Compatible implementations MAY provide built-in Tool Runtimes. When provided,
-the following operation contracts apply.
+Tool Runtimes execute authorized ToolInvocation operations. A Tool Runtime MUST
+accept validated structured arguments and return output that conforms to the Tool
+operation output schema or a structured error.
 
-Filesystem runtime operations are `read`, `write`, `append`, `list`, and
-`mkdir`. Filesystem operations MUST be restricted to the Workspace root and MUST
-reject path traversal outside that root.
+Tool Runtimes MUST report enough metadata for runtime to record status, events,
+Observations, output references, timeout state, and redaction metadata.
 
-Git runtime operations are `status`, `diff`, `add`, `commit`, and `branch`. Git
-runtime MUST NOT push to remote repositories unless a later specification
-explicitly adds a push contract.
-
-Shell runtime operation is approved command execution. Shell execution MUST
-capture stdout, stderr, exit code, and timeout state. Shell execution MUST remain
-sandboxed and MUST use the effective timeout from Tool, Policy, Pilot, or
-AgentRun configuration.
+Concrete built-in Tool Runtime contracts are intentionally out of scope for this
+chapter.
 
 ## Policy
 
@@ -155,21 +149,20 @@ Denied ToolInvocations MUST NOT execute. Approval-required ToolInvocations MUST
 pause the AgentRun before the guarded side effect occurs. Runtime MUST NOT retry,
 rename, reshape, or route a denied ToolInvocation to bypass Policy.
 
-## Safety And Termination
+## Safety
 
 Runtime MUST enforce:
 
 - Workspace isolation.
-- Path traversal protection for filesystem-backed operations.
-- Command timeout for shell-backed operations.
-- Maximum Pilot iteration count.
-- Maximum ToolInvocation count per AgentRun.
-- Maximum effective token budget.
-- Cancellation support.
+- Tool operation validation.
+- Per-invocation timeout.
+- Cancellation.
+- Redaction.
+- Idempotency metadata for side-effecting operations when one can be derived.
+- Policy authorization before side effects.
 
-If a termination limit is reached, runtime MUST stop the execution loop, record
-AgentRun failure or cancellation status, and emit events that identify the
-triggering limit.
+Tool-specific sandbox requirements are defined by Tool contracts and concrete
+Tool Runtime specifications.
 
 ## Events And Trace
 
@@ -183,4 +176,4 @@ arguments and output MUST be redacted according to Policy.
 
 Trace views MUST be able to reconstruct each tool step, including arguments or
 redacted argument metadata, policy decision, execution result, Observation
-summary, related Artifacts, and continuation or completion of the Pilot loop.
+summary, and related Artifacts.

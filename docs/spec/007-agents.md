@@ -57,7 +57,7 @@ Agent MUST remain independent of any specific model provider. If Agent reference
 a Model, the reference MUST be expressed through Pilot or a Pilot-compatible
 routing contract.
 
-## Execution Loop
+## AgentRun Creation
 
 Agent controllers create AgentRuns. Each AgentRun is an execution attempt for
 the Agent. The Agent controller SHOULD create a new AgentRun when Agent desired

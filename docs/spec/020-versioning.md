@@ -61,9 +61,8 @@ target, and compatibility notes in the relevant RFC.
 
 ## Version History
 
-- `v1.1.0`: Adds structured ToolInvocation and Observation contracts, Pilot
-  execution loop semantics, Tool Runtime requirements, and tool execution trace
-  taxonomy.
+- `v1.1.0`: Adds structured ToolInvocation and Observation contracts, Tool
+  contracts, Tool Runtime interfaces, and tool execution trace taxonomy.
 - `v1.0.0`: Establishes the initial declarative resource model, AgentRun
   execution boundary, Context runtime boundary, Policy, Events, API, CLI, and
   governance contracts.

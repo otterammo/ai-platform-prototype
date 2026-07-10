@@ -40,11 +40,13 @@ events to reason about platform behavior.
 ## Tool Providers
 
 Tool providers expose tool operations to runtime. Tool providers MUST identify
-operations, inputs, outputs, side effects, idempotency behavior, and policy
-attributes.
+operations, input schemas, output schemas, side effects, risk level, timeouts,
+retry policy, sandbox requirements, idempotency behavior, redaction behavior,
+and policy attributes.
 
 Runtime MUST authorize tool operations before invoking providers. Tool providers
-SHOULD emit or return enough metadata for runtime events and Artifacts.
+SHOULD emit or return enough metadata for runtime events, Observations, and
+Artifacts.
 
 ## Model Providers
 

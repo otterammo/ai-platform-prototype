@@ -49,6 +49,16 @@ status or events.
 Workers MUST be able to recover from duplicate delivery. Runtime side effects
 SHOULD be idempotent or guarded by policy and action identity.
 
+## Tool Invocation Ownership
+
+ToolInvocations created during execution MUST be owned by the AgentRun that
+requested them. Observations produced by those ToolInvocations MUST also be
+owned by the same AgentRun.
+
+AgentRun status SHOULD reference active, waiting, failed, denied, and completed
+ToolInvocations when they materially affect execution. Runtime MUST NOT hide
+tool execution state in process-local logs when it affects AgentRun outcome.
+
 ## Retry And Idempotency
 
 Retry MUST create a distinguishable execution attempt or update a retry counter
@@ -64,6 +74,10 @@ If policy requires approval during execution, the AgentRun MUST enter a waiting
 state and reference the pending Approval. Runtime MUST stop the guarded action
 until approval is granted. If approval is rejected, the AgentRun MUST fail or
 remain waiting according to policy.
+
+Approval required for a ToolInvocation MUST pause the AgentRun before the tool
+operation begins. Resuming an AgentRun after approval MUST continue from the same
+ToolInvocation identity or record why a replacement ToolInvocation was created.
 
 ## Artifacts
 

@@ -45,6 +45,9 @@ authorized by policy before side effects occur.
 Agent MUST NOT assume a tool provider is available merely because a tool name is
 present. Tool availability is a control-plane and provider contract.
 
+Resolved tools MUST provide operation schemas, risk metadata, sandbox
+requirements, and output contracts before runtime can execute ToolInvocations.
+
 ## Pilot Ownership
 
 Agent owns Pilot configuration. Pilot configuration defines reasoning strategy,

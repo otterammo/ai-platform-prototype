@@ -16,6 +16,8 @@ Platform
                     |-- Context
                     |-- Pilot
                     |   `-- Model
+                    |-- ToolInvocation
+                    |   `-- Observation
                     `-- Artifact
 ```
 
@@ -51,6 +53,10 @@ replaceable execution backend selected or routed by Pilot.
 
 Artifact represents durable output produced by an AgentRun.
 
+ToolInvocation represents one structured, governed request to execute a Tool
+operation during an AgentRun. Observation represents the structured result of
+that invocation returned to the Pilot.
+
 ## Ownership
 
 Every namespaced workload resource MUST have a clear owner chain rooted at a
@@ -77,7 +83,8 @@ resource.
 
 The control plane owns admission, persistence, reconciliation, scheduling,
 policy evaluation, status propagation, and events. Runtime owns AgentRun
-execution, Pilot invocation, tool invocation, and artifact production.
+execution, Pilot invocation, model invocation, structured tool invocation,
+Observation recording, and artifact production.
 
 Runtime MUST NOT schedule work, reconcile resources, perform admission, build
 Context, or make orchestration decisions. Controllers MUST NOT perform runtime

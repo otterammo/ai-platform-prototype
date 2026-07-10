@@ -45,6 +45,19 @@ approval MUST pause before the guarded side effect occurs.
 Runtime MUST NOT bypass policy by changing Model, Tool, provider, operation
 name, or request shape after denial.
 
+## ToolInvocation Authorization
+
+Every ToolInvocation MUST receive a Policy decision before execution. The
+decision MUST be allow, deny, or require approval.
+
+Allowed ToolInvocations MAY proceed to execution. Denied ToolInvocations MUST
+NOT execute. ToolInvocations that require approval MUST create or reference an
+Approval and pause the AgentRun before the guarded side effect occurs.
+
+Policy evaluation for ToolInvocations SHOULD include Tool identity, operation,
+arguments or redacted argument metadata, risk level, sandbox requirements,
+Workspace, Mission, Fleet, Agent, AgentRun, actor, and correlation data.
+
 ## Waiting And Resume
 
 When approval is required, the relevant AgentRun MUST enter a waiting state and

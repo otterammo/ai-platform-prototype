@@ -43,6 +43,26 @@ steps, validation behavior, and output review requirements. These settings MUST
 be provider-neutral unless explicitly placed inside a provider-specific Model
 configuration.
 
+## Decision Contract
+
+Pilot decisions during AgentRun execution MUST be structured. A Pilot decision
+MUST be either a final response or a ToolInvocation request. Runtime MUST NOT
+interpret natural-language model output as an executable tool request.
+
+A ToolInvocation request MUST identify the Tool, operation, and structured
+arguments required by the Tool contract. A final response MUST provide the data
+needed for runtime to produce required Artifacts or complete the AgentRun.
+
+## Execution Loop
+
+Runtime returns Observations from completed, failed, denied, timed out, or
+cancelled ToolInvocations to the Pilot as execution context. Pilot MAY continue
+with another ToolInvocation request or return a final response.
+
+Pilot configuration MUST define or inherit termination limits for maximum
+iterations, maximum ToolInvocations, maximum effective token budget, and
+cancellation behavior. A Pilot MUST NOT depend on an unbounded execution loop.
+
 ## Model Routing
 
 Pilot MAY route requests by task type, cost, latency, capability, policy,

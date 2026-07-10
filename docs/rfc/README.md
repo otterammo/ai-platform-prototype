@@ -6,6 +6,10 @@ runtime behavior, policy, traceability, or compatibility.
 
 Use [template.md](template.md) for new RFCs.
 
+## RFCs
+
+- [RFC-0001: Structured Tool Invocation And Execution Loop](0001-structured-tool-invocation.md)
+
 ## Statuses
 
 - `Draft`: The idea is being shaped.

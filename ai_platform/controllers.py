@@ -1092,17 +1092,21 @@ class ToolInvocationController:
                 continue
             if self._pending_approval(invocation):
                 continue
-            if self._reconcile_invocation(invocation):
+            if await self._reconcile_invocation(invocation):
                 changed += 1
         return ReconcileResult("tool-invocation", changed)
 
-    def _reconcile_invocation(self, invocation: ToolInvocationResource) -> bool:
+    async def _reconcile_invocation(self, invocation: ToolInvocationResource) -> bool:
         try:
             run = self._agent_run(invocation)
             agent = self._agent(run)
-            self._validate_tool_contract(invocation)
+            tool, operation = self._validate_tool_contract(invocation)
             action = self._runtime_action(invocation, run, agent)
-            decision = self.policy_engine.authorize(action)
+            decision = self.policy_engine.authorize(
+                action,
+                pause_agent_run=False,
+                approval_agent_run=False,
+            )
         except ApprovalRequired as exc:
             self._mark_waiting_for_approval(invocation, exc.approval_id)
             return True
@@ -1173,7 +1177,23 @@ class ToolInvocationController:
             {"runtime": runtime_id},
         )
         try:
-            observation = runtime.execute(invocation)
+            observation = await self._execute_runtime(runtime, invocation, tool, operation)
+        except TimeoutError:
+            timeout_seconds = self._effective_timeout(invocation, tool, operation)
+            timeout_display = f"{timeout_seconds:g}" if timeout_seconds is not None else "unknown"
+            message = f"ToolInvocation timed out after {timeout_display} seconds"
+            observation = self._error_observation("ToolInvocationTimedOut", message)
+            self._set_status(
+                invocation,
+                run,
+                "TimedOut",
+                message,
+                "ToolInvocationTimedOut",
+                {"runtime": runtime_id, "error": message, "timeoutSeconds": timeout_seconds},
+                observation=observation,
+            )
+            self._record_observation(invocation, run, observation)
+            return True
         except ToolRuntimeError as exc:
             observation = self._error_observation("ToolRuntimeError", str(exc))
             self._set_status(
@@ -1235,7 +1255,7 @@ class ToolInvocationController:
             {"approval": approval_id, "approvalId": approval_id, "policyDecision": "RequireApproval"},
         )
 
-    def _validate_tool_contract(self, invocation: ToolInvocationResource) -> None:
+    def _validate_tool_contract(self, invocation: ToolInvocationResource) -> tuple[ToolResource, ToolOperationSpec]:
         manifest = self.store.get(ResourceKind.TOOL, invocation.spec.tool)
         if manifest is None:
             raise ReconcileError(f"Tool {invocation.spec.tool} not found")
@@ -1252,6 +1272,7 @@ class ToolInvocationController:
         if operation is None:
             raise ReconcileError(f"Tool {tool.metadata.name} does not support operation {invocation.spec.operation}")
         self._validate_arguments(invocation, operation)
+        return tool, operation
 
     def _validate_arguments(
         self,
@@ -1297,6 +1318,16 @@ class ToolInvocationController:
                 if not isinstance(property_schema, dict):
                     raise ReconcileError(f"{path}.{field_name} schema must be an object")
                 self._validate_schema_value(value[field_name], property_schema, f"{path}.{field_name}")
+        if schema.get("type") == "array" or isinstance(value, list):
+            if not isinstance(value, list):
+                raise ReconcileError(f"{path} must be array")
+            items_schema = schema.get("items")
+            if items_schema is None:
+                return
+            if not isinstance(items_schema, dict):
+                raise ReconcileError(f"{path} schema items must be an object")
+            for index, item in enumerate(value):
+                self._validate_schema_value(item, items_schema, f"{path}[{index}]")
 
     @staticmethod
     def _schema_type_matches(value: Any, expected_type: Any) -> bool:
@@ -1317,6 +1348,30 @@ class ToolInvocationController:
         if expected_type == "null":
             return value is None
         return True
+
+    async def _execute_runtime(
+        self,
+        runtime: Any,
+        invocation: ToolInvocationResource,
+        tool: ToolResource,
+        operation: ToolOperationSpec,
+    ) -> Observation:
+        execute = asyncio.to_thread(runtime.execute, invocation)
+        timeout_seconds = self._effective_timeout(invocation, tool, operation)
+        if timeout_seconds is None:
+            return await execute
+        try:
+            return await asyncio.wait_for(execute, timeout=timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError from exc
+
+    @staticmethod
+    def _effective_timeout(
+        invocation: ToolInvocationResource,
+        tool: ToolResource,
+        operation: ToolOperationSpec,
+    ) -> float | None:
+        return invocation.spec.timeoutSeconds or operation.timeoutSeconds or tool.spec.timeoutSeconds
 
     def _fail_running_replay(self, invocation: ToolInvocationResource) -> None:
         run = self._agent_run(invocation)

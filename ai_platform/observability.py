@@ -45,6 +45,7 @@ DECISION_EVENT_TYPES = {
     "ToolInvocationStarted",
     "ToolInvocationCompleted",
     "ToolInvocationFailed",
+    "ToolInvocationTimedOut",
     "ObservationRecorded",
 }
 
@@ -482,6 +483,7 @@ def _timeline_message(event: JsonDict) -> str:
         "ToolInvocationStarted": f"ToolInvocation {resource_name} started",
         "ToolInvocationCompleted": f"ToolInvocation {resource_name} completed",
         "ToolInvocationFailed": f"ToolInvocation {resource_name} failed",
+        "ToolInvocationTimedOut": f"ToolInvocation {resource_name} timed out",
         "ObservationRecorded": f"Observation recorded for {resource_name}",
     }
     fallback = event.get("message") or event_type

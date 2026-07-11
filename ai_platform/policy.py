@@ -118,7 +118,13 @@ class PolicyEngine:
                 return PolicyDecision(PolicyEffect.DENY, "MatchedRule", policy.metadata.name, index)
         return PolicyDecision(PolicyEffect.DENY, "NoMatchingPolicyRule")
 
-    def authorize(self, action: RuntimeAction) -> PolicyDecision:
+    def authorize(
+        self,
+        action: RuntimeAction,
+        *,
+        pause_agent_run: bool = True,
+        approval_agent_run: bool = True,
+    ) -> PolicyDecision:
         decision = self.evaluate(action)
         self._emit_policy_event("PolicyEvaluated", action, decision, f"Evaluated {action.tool}/{action.operation}")
 
@@ -153,7 +159,12 @@ class PolicyEngine:
                 )
                 raise PolicyDenied(action, "ApprovalRejected")
 
-            approval, created = self._get_or_create_pending_approval(action, decision, existing_approval)
+            approval, created = self._get_or_create_pending_approval(
+                action,
+                decision,
+                existing_approval,
+                approval_agent_run=approval_agent_run,
+            )
             if created:
                 self._emit_policy_event(
                     "ApprovalRequested",
@@ -162,7 +173,8 @@ class PolicyEngine:
                     f"Approval {approval.metadata.name} requested",
                     approval_id=approval.metadata.name,
                 )
-            self._pause_agent_run(action, decision, approval.metadata.name)
+            if pause_agent_run:
+                self._pause_agent_run(action, decision, approval.metadata.name)
             raise ApprovalRequired(approval.metadata.name, action)
 
         self._emit_policy_event("PolicyDenied", action, decision, f"Denied {action.tool}/{action.operation}")
@@ -203,6 +215,8 @@ class PolicyEngine:
         action: RuntimeAction,
         decision: PolicyDecision,
         existing_approval: ApprovalResource | None,
+        *,
+        approval_agent_run: bool,
     ) -> tuple[ApprovalResource, bool]:
         if existing_approval and existing_approval.status.phase == "Pending":
             return existing_approval, False
@@ -216,7 +230,7 @@ class PolicyEngine:
                 "workspace": action.workspace or "",
                 "mission": action.mission or "",
                 "agent": action.agent or "",
-                "agentRun": action.agentRun,
+                "agentRun": action.agentRun if approval_agent_run else None,
                 "action": action.to_payload(),
                 "actionHash": action.action_hash,
                 "policy": decision.policy_name,

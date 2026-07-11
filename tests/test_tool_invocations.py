@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -13,9 +14,17 @@ from ai_platform.cli import main
 from ai_platform.controllers import ToolInvocationController
 from ai_platform.observability import build_trace, format_trace
 from ai_platform.policy import ApprovalService
-from ai_platform.resources import ResourceKind, parse_resource_documents
+from ai_platform.resources import Observation, ResourceKind, parse_resource_documents
 from ai_platform.runtime import ToolRuntimeRegistry
 from ai_platform.storage import ResourceStore
+
+
+class SlowRuntime:
+    runtime_id = "test.slow"
+
+    def execute(self, _invocation: Any) -> Observation:
+        time.sleep(0.05)
+        return Observation(summary="Too late")
 
 
 def base_manifests(policy_rules: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
@@ -305,6 +314,54 @@ def test_invalid_tool_invocation_arguments_fail_before_policy_and_runtime(tmp_pa
     ]
 
 
+def test_array_item_schema_is_validated_before_policy_and_runtime(tmp_path: Path) -> None:
+    store = ResourceStore(f"sqlite:///{tmp_path / 'platform.db'}", tmp_path / "platform")
+    for manifest in base_manifests()[:-1]:
+        if manifest["kind"] != "Tool":
+            store.apply(manifest)
+    store.apply(
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Tool",
+            "metadata": {"name": "array-tool"},
+            "spec": {
+                "operations": [
+                    {
+                        "name": "echo",
+                        "inputSchema": {
+                            "type": "object",
+                            "required": ["messages"],
+                            "properties": {
+                                "messages": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                }
+                            },
+                        },
+                    }
+                ]
+            },
+        }
+    )
+    invocation = tool_invocation_manifest("invoke-array-invalid")
+    invocation["spec"]["tool"] = "array-tool"
+    invocation["spec"]["arguments"] = {"messages": ["ok", 1]}
+    store.apply(invocation)
+
+    asyncio.run(ToolInvocationController(store).reconcile_once())
+
+    failed = store.get(ResourceKind.TOOL_INVOCATION, "invoke-array-invalid", "demo")
+    assert failed is not None
+    assert failed["status"]["phase"] == "Failed"
+    assert "arguments.messages[1] must be string" in failed["status"]["message"]
+    assert not [
+        event
+        for event in store.list_events(namespace="demo", limit=100)
+        if event["type"] == "PolicyEvaluated"
+        and event["payload"]["runtimeAction"]["details"].get("toolInvocation") == "invoke-array-invalid"
+    ]
+
+
 def test_tool_invocation_spec_is_immutable_on_reapply(tmp_path: Path) -> None:
     store = make_store(tmp_path, [{"match": {"tool": "fake", "operation": "echo"}, "allow": True}])
     asyncio.run(ToolInvocationController(store).reconcile_once())
@@ -340,29 +397,68 @@ def test_tool_invocation_policy_deny_does_not_execute_runtime(tmp_path: Path) ->
 def test_tool_invocation_requires_approval_and_resumes_after_approval(tmp_path: Path) -> None:
     store = make_store(tmp_path, [{"match": {"tool": "fake", "operation": "echo"}, "requiresApproval": True}])
     controller = ToolInvocationController(store)
+    store.update_status(
+        ResourceKind.AGENT_RUN,
+        "run-1",
+        "demo",
+        "Succeeded",
+        "Existing AgentRun already completed",
+    )
 
     asyncio.run(controller.reconcile_once())
     asyncio.run(controller.reconcile_once())
 
     invocation = store.get(ResourceKind.TOOL_INVOCATION, "invoke-0001", "demo")
+    run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
     approvals = store.list(ResourceKind.APPROVAL)
     assert invocation is not None
     assert invocation["status"]["phase"] == "WaitingForApproval"
     assert "observation" not in invocation["status"]
+    assert run is not None
+    assert run["status"]["phase"] == "Succeeded"
     assert len(approvals) == 1
+    assert "agentRun" not in approvals[0]["spec"]
     approval_name = approvals[0]["metadata"]["name"]
     assert invocation["status"]["data"]["approvalId"] == approval_name
     event_types = {event["type"] for event in store.list_events(namespace="demo", limit=50)}
     assert "ToolInvocationWaitingForApproval" in event_types
+    assert "AgentRunWaiting" not in event_types
     assert "ToolInvocationStarted" not in event_types
 
     ApprovalService(store).approve(approval_name, actor="test")
+    approved_run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    assert approved_run is not None
+    assert approved_run["status"]["phase"] == "Succeeded"
+    event_types = {event["type"] for event in store.list_events(namespace="demo", limit=50)}
+    assert "AgentRunResumed" not in event_types
     asyncio.run(controller.reconcile_once())
 
     invocation = store.get(ResourceKind.TOOL_INVOCATION, "invoke-0001", "demo")
     assert invocation is not None
     assert invocation["status"]["phase"] == "Succeeded"
     assert invocation["status"]["observation"]["payload"] == {"message": "hello"}
+
+
+def test_tool_invocation_runtime_timeout_marks_timed_out(tmp_path: Path) -> None:
+    store = make_store(tmp_path, [{"match": {"tool": "fake", "operation": "echo"}, "allow": True}])
+    timed = tool_invocation_manifest("invoke-timeout")
+    timed["spec"]["timeoutSeconds"] = 0.01
+    store.apply(timed)
+
+    registry = ToolRuntimeRegistry({"fake": SlowRuntime()})
+    asyncio.run(ToolInvocationController(store, runtime_registry=registry).reconcile_once())
+
+    invocation = store.get(ResourceKind.TOOL_INVOCATION, "invoke-timeout", "demo")
+    assert invocation is not None
+    assert invocation["status"]["phase"] == "TimedOut"
+    assert invocation["status"]["observation"]["error"]["reason"] == "ToolInvocationTimedOut"
+    event_types = {
+        event["type"]
+        for event in store.list_events(namespace="demo", resource_kind=ResourceKind.TOOL_INVOCATION, limit=100)
+        if event["resourceName"] == "invoke-timeout"
+    }
+    assert "ToolInvocationTimedOut" in event_types
+    assert "ToolInvocationCompleted" not in event_types
 
 
 def test_tool_invocation_cli_lists_describes_and_projects_observations(tmp_path: Path, capsys) -> None:

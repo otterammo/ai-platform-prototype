@@ -27,6 +27,7 @@ from .resources import (
     ObservationError,
     ResourceKind,
     ToolInvocationResource,
+    ToolOperationSpec,
     ToolResource,
     WorkspaceResource,
     parse_resource,
@@ -1242,11 +1243,80 @@ class ToolInvocationController:
         tool = parse_resource(manifest)
         if not isinstance(tool, ToolResource):
             raise ReconcileError(f"Tool {invocation.spec.tool} could not be loaded")
-        operations = [operation.name for operation in tool.spec.operations]
-        if not operations:
+        if not tool.spec.operations:
             raise ReconcileError(f"Tool {tool.metadata.name} does not define supported operations")
-        if invocation.spec.operation not in operations:
+        operation = next(
+            (candidate for candidate in tool.spec.operations if candidate.name == invocation.spec.operation),
+            None,
+        )
+        if operation is None:
             raise ReconcileError(f"Tool {tool.metadata.name} does not support operation {invocation.spec.operation}")
+        self._validate_arguments(invocation, operation)
+
+    def _validate_arguments(
+        self,
+        invocation: ToolInvocationResource,
+        operation: ToolOperationSpec,
+    ) -> None:
+        schema = operation.inputSchema
+        if not schema:
+            return
+        self._validate_schema_value(
+            invocation.spec.arguments,
+            schema,
+            f"ToolInvocation {invocation.metadata.name} arguments",
+        )
+
+    def _validate_schema_value(self, value: Any, schema: dict[str, Any], path: str) -> None:
+        expected_type = schema.get("type")
+        if expected_type is not None and not self._schema_type_matches(value, expected_type):
+            expected = ", ".join(expected_type) if isinstance(expected_type, list) else str(expected_type)
+            raise ReconcileError(f"{path} must be {expected}")
+
+        enum = schema.get("enum")
+        if isinstance(enum, list) and value not in enum:
+            raise ReconcileError(f"{path} must be one of: {', '.join(str(item) for item in enum)}")
+
+        if schema.get("type") == "object" or isinstance(value, dict):
+            if not isinstance(value, dict):
+                raise ReconcileError(f"{path} must be object")
+            required = schema.get("required") or []
+            if not isinstance(required, list):
+                raise ReconcileError(f"{path} schema required must be a list")
+            for field_name in required:
+                if not isinstance(field_name, str):
+                    raise ReconcileError(f"{path} schema required entries must be strings")
+                if field_name not in value:
+                    raise ReconcileError(f"{path}.{field_name} is required")
+            properties = schema.get("properties") or {}
+            if not isinstance(properties, dict):
+                raise ReconcileError(f"{path} schema properties must be an object")
+            for field_name, property_schema in properties.items():
+                if field_name not in value:
+                    continue
+                if not isinstance(property_schema, dict):
+                    raise ReconcileError(f"{path}.{field_name} schema must be an object")
+                self._validate_schema_value(value[field_name], property_schema, f"{path}.{field_name}")
+
+    @staticmethod
+    def _schema_type_matches(value: Any, expected_type: Any) -> bool:
+        if isinstance(expected_type, list):
+            return any(ToolInvocationController._schema_type_matches(value, item) for item in expected_type)
+        if expected_type == "object":
+            return isinstance(value, dict)
+        if expected_type == "array":
+            return isinstance(value, list)
+        if expected_type == "string":
+            return isinstance(value, str)
+        if expected_type == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if expected_type == "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if expected_type == "boolean":
+            return isinstance(value, bool)
+        if expected_type == "null":
+            return value is None
+        return True
 
     def _fail_running_replay(self, invocation: ToolInvocationResource) -> None:
         run = self._agent_run(invocation)

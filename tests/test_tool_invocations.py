@@ -69,13 +69,21 @@ def base_manifests(policy_rules: list[dict[str, Any]] | None = None) -> list[dic
                         "name": "echo",
                         "timeoutSeconds": 5,
                         "riskLevel": "low",
-                        "inputSchema": {"type": "object"},
+                        "inputSchema": {
+                            "type": "object",
+                            "required": ["message"],
+                            "properties": {"message": {"type": "string"}},
+                        },
                         "outputSchema": {"type": "object"},
                     }
                 ],
                 "timeoutSeconds": 5,
                 "riskLevel": "low",
-                "inputSchema": {"type": "object"},
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["message"],
+                    "properties": {"message": {"type": "string"}},
+                },
                 "outputSchema": {"type": "object"},
             },
         },
@@ -129,6 +137,11 @@ spec:
   riskLevel: low
   inputSchema:
     type: object
+    required:
+      - message
+    properties:
+      message:
+        type: string
   outputSchema:
     type: object
 ---
@@ -258,6 +271,54 @@ def test_running_tool_invocation_is_not_replayed(tmp_path: Path) -> None:
     event_types = {event["type"] for event in store.list_events(namespace="demo", limit=50)}
     assert "ToolInvocationFailed" in event_types
     assert "ToolInvocationCompleted" not in event_types
+
+
+def test_invalid_tool_invocation_arguments_fail_before_policy_and_runtime(tmp_path: Path) -> None:
+    store = make_store(tmp_path, [{"match": {"tool": "fake", "operation": "echo"}, "allow": True}])
+    invalid = tool_invocation_manifest()
+    invalid["metadata"]["name"] = "invoke-invalid"
+    invalid["spec"]["arguments"] = {"message": 123}
+    store.apply(invalid)
+
+    asyncio.run(ToolInvocationController(store).reconcile_once())
+
+    invocation = store.get(ResourceKind.TOOL_INVOCATION, "invoke-invalid", "demo")
+    assert invocation is not None
+    assert invocation["status"]["phase"] == "Failed"
+    assert "arguments.message must be string" in invocation["status"]["message"]
+    assert invocation["status"]["observation"]["error"]["reason"] == "ToolInvocationFailed"
+    invalid_events = [
+        event
+        for event in store.list_events(namespace="demo", resource_kind=ResourceKind.TOOL_INVOCATION, limit=100)
+        if event["resourceName"] == "invoke-invalid"
+    ]
+    event_types = {event["type"] for event in invalid_events}
+    assert "ToolInvocationFailed" in event_types
+    assert "ToolInvocationAuthorized" not in event_types
+    assert "ToolInvocationStarted" not in event_types
+    assert "ToolInvocationCompleted" not in event_types
+    assert not [
+        event
+        for event in store.list_events(namespace="demo", limit=100)
+        if event["type"] == "PolicyEvaluated"
+        and event["payload"]["runtimeAction"]["details"].get("toolInvocation") == "invoke-invalid"
+    ]
+
+
+def test_tool_invocation_spec_is_immutable_on_reapply(tmp_path: Path) -> None:
+    store = make_store(tmp_path, [{"match": {"tool": "fake", "operation": "echo"}, "allow": True}])
+    asyncio.run(ToolInvocationController(store).reconcile_once())
+
+    changed = tool_invocation_manifest()
+    changed["spec"]["arguments"] = {"message": "changed"}
+    with pytest.raises(ValueError, match="ToolInvocation demo/invoke-0001 spec is immutable"):
+        store.apply(changed)
+
+    invocation = store.get(ResourceKind.TOOL_INVOCATION, "invoke-0001", "demo")
+    assert invocation is not None
+    assert invocation["spec"]["arguments"] == {"message": "hello"}
+    assert invocation["status"]["phase"] == "Succeeded"
+    assert invocation["status"]["observation"]["payload"] == {"message": "hello"}
 
 
 def test_tool_invocation_policy_deny_does_not_execute_runtime(tmp_path: Path) -> None:

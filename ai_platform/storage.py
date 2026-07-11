@@ -216,6 +216,8 @@ class ResourceStore:
             previous_manifest: JsonDict | None = None
             if record:
                 previous_manifest = dict(record.manifest)
+                if isinstance(resource, ToolInvocationResource):
+                    self._ensure_tool_invocation_spec_immutable(previous_manifest, dump_resource(resource))
                 resource.metadata.generation = record.generation + 1
                 resource.status = parse_resource(record.manifest).status
                 if correlation_id:
@@ -1009,6 +1011,15 @@ class ResourceStore:
     @staticmethod
     def display_name(namespace: str | None, name: str) -> str:
         return f"{namespace}/{name}" if namespace else name
+
+    @staticmethod
+    def _ensure_tool_invocation_spec_immutable(previous_manifest: JsonDict, next_manifest: JsonDict) -> None:
+        if (previous_manifest.get("spec") or {}) != (next_manifest.get("spec") or {}):
+            metadata = previous_manifest.get("metadata") or {}
+            name = metadata.get("name") or "<unknown>"
+            namespace = metadata.get("namespace")
+            display_name = ResourceStore.display_name(namespace, str(name))
+            raise ValueError(f"ToolInvocation {display_name} spec is immutable")
 
     def _agent_run_correlation_id(self, agent_run_name: str, namespace: str | None) -> str | None:
         manifest = self.get(ResourceKind.AGENT_RUN, agent_run_name, namespace)

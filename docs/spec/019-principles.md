@@ -40,6 +40,12 @@ contract. Runtime consumes Context rather than reaching into Knowledge directly.
 Model providers sit behind Model and Pilot contracts. Platform behavior should
 not depend on a single vendor, API surface, or model family.
 
+## Models Propose
+
+Models produce Decisions. Decisions represent intent, not platform authority.
+The Execution Engine validates and interprets Decisions before platform actions
+or side effects occur.
+
 ## Agents Are Persistent
 
 Agents represent durable roles in a Fleet. Execution attempts are AgentRuns, not
@@ -54,8 +60,8 @@ trace data for users to understand what happened and why.
 ## Tools Are Structured
 
 Runtime executes tools only through structured ToolInvocation resources, Policy
-decisions, Tool Runtime contracts, and Observations. Natural-language tool
-requests are not an execution contract.
+decisions, Tool Runtime contracts, and embedded Observations.
+Natural-language tool requests are not an execution contract.
 
 ## Resources Own Their Children
 
@@ -66,4 +72,4 @@ policy says so.
 ## Traceability Is Mandatory
 
 Important platform actions should be explainable through resources, events,
-conditions, correlation identifiers, artifacts, and ADR/RFC history.
+Decisions, conditions, correlation identifiers, artifacts, and ADR/RFC history.

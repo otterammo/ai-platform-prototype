@@ -42,6 +42,12 @@ side effects.
 Controllers MUST NOT execute AgentRuns. They MAY create, schedule, and aggregate
 AgentRuns.
 
+Local single-process implementations MAY invoke runtime workers or
+ToolInvocation execution components from the same outer service loop used for
+reconciliation. Those components are runtime actors for specification purposes:
+they MUST preserve AgentRun execution boundaries, ToolInvocation side-effect
+boundaries, policy checks, status ownership, and event traceability.
+
 ## Scheduler
 
 The scheduler selects executable AgentRuns for workers. Scheduling MUST happen
@@ -73,12 +79,14 @@ The control plane SHOULD reconcile from higher-level intent toward lower-level
 execution: Mission, Fleet, Agent, KnowledgeIndex, Context, AgentRun scheduling,
 runtime completion, then aggregation back upward.
 
-Specific implementations MAY use different controller order or concurrency, but
-the externally visible semantics MUST preserve ownership, readiness, status
-propagation, and AgentRun-only execution.
+Specific implementations MAY use different controller order, runtime worker
+placement, or concurrency, but the externally visible semantics MUST preserve
+ownership, readiness, status propagation, policy enforcement, and AgentRun-only
+execution.
 
 ## Exclusions
 
-The control plane MUST NOT invoke Pilots, invoke Models, call Tools, write
-Artifacts as execution output, or build runtime-local prompts. Those actions
-belong to runtime after an AgentRun has been scheduled and authorized.
+Control-plane controllers MUST NOT invoke Pilots, invoke Models, call Tools,
+write Artifacts as execution output, or build runtime-local prompts. Those
+actions belong to runtime actors after an AgentRun or ToolInvocation has been
+scheduled, admitted, and authorized.

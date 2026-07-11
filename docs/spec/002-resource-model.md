@@ -22,6 +22,8 @@ case-sensitive.
 `metadata` MUST contain identity and ownership information. `spec` MUST contain
 desired state. `status` MUST contain observed state.
 
+Decision is not a Resource and MUST NOT use the resource envelope.
+
 ## Metadata
 
 `metadata.name` is required. Names MUST be stable identifiers within the
@@ -79,8 +81,10 @@ single uninterrupted process to complete reconciliation.
 
 Platform, Workspace, Policy, Approval, Model, Tool, Capability, and
 FleetTemplate are cluster-scoped unless an extension explicitly defines a
-different scope. Mission, Fleet, Agent, AgentRun, ToolInvocation, Observation,
-Artifact, Knowledge, KnowledgeIndex, and Context are Workspace-scoped.
+different scope. Mission, Fleet, Agent, AgentRun, ToolInvocation, Artifact,
+Knowledge, KnowledgeIndex, and Context are Workspace-scoped. Observation data is
+embedded in ToolInvocation status for v1.1 and is not a standalone resource
+kind. Decision is a protocol message, not a scoped resource kind.
 
 Namespaced resources MUST NOT reference resources in another Workspace except
 through an explicitly defined cross-scope contract.

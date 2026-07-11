@@ -40,10 +40,22 @@ prepared for an AgentRun. Runtime consumes Context instead of querying Knowledge
 The platform subsystem responsible for admission, persistence, reconciliation,
 scheduling, policy evaluation, status propagation, and events.
 
+## Decision
+
+A structured, versioned instruction returned by a Model through Pilot and
+interpreted by the Execution Engine. Decision represents intent, is not a
+Resource, and is the canonical protocol between intelligence and execution.
+
 ## Event
 
 An immutable record of material platform activity associated with resources,
 actors, actions, reasons, and correlation data.
+
+## Execution Engine
+
+The runtime component that owns AgentRun control flow, validates and interprets
+Decisions, creates ToolInvocations, integrates Policy, handles Observations,
+applies retries, manages iteration, and records terminal state.
 
 ## Fleet
 
@@ -80,6 +92,11 @@ is intent, not execution.
 A cluster-scoped resource describing a replaceable model backend, including
 provider, capabilities, limits, and configuration.
 
+## Model Protocol
+
+The provider-neutral Decision protocol exchanged from Model through Pilot to the
+Execution Engine.
+
 ## ObservedGeneration
 
 A status value recording the latest metadata.generation observed by the
@@ -87,8 +104,9 @@ responsible controller.
 
 ## Observation
 
-A Workspace-scoped resource containing the structured result of a ToolInvocation
-for status, API projections, and trace reconstruction.
+Structured result data for a ToolInvocation. In Platform Specification v1.1,
+Observation data is embedded in `ToolInvocation.status.observation` and exposed
+through status, API projections, events, and trace reconstruction.
 
 ## OwnerReference
 
@@ -97,8 +115,8 @@ OwnerReferences define lifecycle and status aggregation relationships.
 
 ## Pilot
 
-The provider-independent reasoning, prompt, routing, fallback, and model
-orchestration configuration owned by an Agent.
+The provider-independent reasoning, prompt, routing, fallback, response parsing,
+and Decision production configuration owned by an Agent.
 
 ## Platform
 
@@ -141,9 +159,10 @@ to execute a Tool operation for an AgentRun.
 
 The runtime component or provider adapter that executes authorized
 ToolInvocation operations and returns structured output for Observation
-recording.
+recording in ToolInvocation status.
 
 ## Workspace
 
 The primary isolation and namespace boundary for Missions, Knowledge, Context,
-Fleets, Agents, AgentRuns, ToolInvocations, Observations, and Artifacts.
+Fleets, Agents, AgentRuns, ToolInvocations, embedded Observations, and
+Artifacts.

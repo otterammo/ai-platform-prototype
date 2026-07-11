@@ -7,7 +7,7 @@ plugins, tool providers, model providers, knowledge providers, schedulers, and
 workers. Extensions MUST preserve core platform contracts.
 
 Extension mechanisms MUST NOT weaken resource ownership, policy, Context
-boundaries, event traceability, or AgentRun-only execution.
+boundaries, Decision validation, event traceability, or AgentRun-only execution.
 
 ## Custom Resources
 
@@ -45,8 +45,8 @@ retry policy, sandbox requirements, idempotency behavior, redaction behavior,
 and policy attributes.
 
 Runtime MUST authorize tool operations before invoking providers. Tool providers
-SHOULD emit or return enough metadata for runtime events, Observations, and
-Artifacts.
+SHOULD emit or return enough metadata for runtime events, embedded
+Observations, and Artifacts.
 
 ## Model Providers
 
@@ -54,7 +54,9 @@ Model providers expose model backends to Pilots. They MUST declare supported
 capabilities, limits, configuration fields, credential requirements, and error
 semantics.
 
-Model providers MUST remain replaceable behind Model and Pilot contracts.
+Model providers MUST remain replaceable behind Model, Pilot, and Decision
+contracts. Provider-native structured output or tool-calling formats MUST be
+adapted to the platform Decision protocol before the Execution Engine acts.
 
 ## Knowledge Providers
 
@@ -68,7 +70,8 @@ Custom schedulers MAY select worker classes, priorities, placement, and queues
 for AgentRuns. They MUST schedule only AgentRuns.
 
 Custom workers execute scheduled AgentRuns. They MUST report status, honor
-policy, consume Context, produce Artifact resources, and emit events.
+policy, consume Context, validate and interpret Decisions, produce Artifact
+resources, and emit events.
 
 ## Compatibility
 

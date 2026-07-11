@@ -24,9 +24,10 @@ contracts are defined independently.
 RFC-0005 depends on:
 
 - RFC-0001 Tool Invocation Framework.
-- RFC-0002 Pilot Execution Loop.
+- RFC-0002 AgentRun Execution Engine Loop.
 - RFC-0003 Built-In Tool Runtime.
 - RFC-0004 Structured Model Protocol.
+- Platform Specification [Decisions](../spec/022-decisions.md).
 
 Each dependency must be accepted and incorporated into the Platform
 Specification before RFC-0005 implementation begins.
@@ -34,20 +35,24 @@ Specification before RFC-0005 implementation begins.
 Only after those contracts exist should the platform connect:
 
 ```text
-Pilot
+Execution Engine
+-> Pilot
 -> Model
+-> Decision
+-> Execution Engine
 -> ToolInvocation
 -> Tool
--> Observation
--> Model
+-> Embedded Observation
+-> Execution Engine
 -> ...
--> FinalResponse
+-> Artifact
 ```
 
 ## Goals
 
-- Compose the Pilot loop, structured Model protocol, ToolInvocation framework,
-  and built-in Tool Runtimes into one AgentRun execution flow.
+- Compose the Execution Engine loop, structured Model protocol,
+  ToolInvocation framework, and built-in Tool Runtimes into one AgentRun
+  execution flow.
 - Produce Artifacts after multiple tool invocations.
 - Persist modified files as Workspace changes.
 - Reconstruct the entire execution through Trace.
@@ -61,11 +66,11 @@ arbitrary plugin loading.
 
 ## Proposed Design
 
-Runtime executes a scheduled AgentRun by loading Ready Context, invoking the
-effective Pilot, requesting structured Model decisions, mapping tool decisions
-to ToolInvocation resources, executing authorized tools, recording
-Observations, continuing the loop, and producing Artifacts when the Model
-returns a final response.
+Runtime executes a scheduled AgentRun through the Execution Engine. The
+Execution Engine loads Ready Context, invokes the effective Pilot, receives
+structured Decisions, maps `invoke_tool` Decisions to ToolInvocation resources,
+executes authorized tools, records embedded Observations, continues the loop,
+and produces Artifacts when it receives a `complete` Decision.
 
 Runtime must remain inside the AgentRun boundary. It must not schedule work,
 reconcile resources, perform admission, build Context from Knowledge, or mutate
@@ -80,13 +85,13 @@ The platform should successfully execute a Mission such as:
 Expected behavior:
 
 1. Retrieve Context.
-2. Ask the Model for the next structured decision.
-3. Receive a structured ToolInvocation request.
+2. Ask the Pilot for the next structured Decision.
+3. Receive a structured `invoke_tool` Decision.
 4. Authorize the invocation through Policy.
 5. Execute the Tool.
-6. Record an Observation.
+6. Record an embedded Observation.
 7. Continue the execution loop.
-8. Repeat until the Model returns a final response.
+8. Repeat until the Execution Engine receives a `complete` Decision.
 9. Persist modified files as Workspace changes.
 10. Produce Artifact resources summarizing completed work.
 11. Reconstruct the entire execution through Trace.
@@ -95,7 +100,7 @@ Expected behavior:
 
 The implementation should include coverage for:
 
-- structured tool requests
+- structured `invoke_tool` Decisions
 - filesystem read/write
 - git operations
 - shell execution

@@ -14,11 +14,20 @@ Platform
             `-- Agent
                 `-- AgentRun
                     |-- Context
-                    |-- Pilot
-                    |   `-- Model
                     |-- ToolInvocation
-                    |   `-- Observation
                     `-- Artifact
+```
+
+Execution uses protocol boundaries that are not all resources:
+
+```text
+AgentRun
+-> Execution Engine
+-> Pilot
+-> Model
+-> Decision
+-> Execution Engine
+-> Platform Resources
 ```
 
 ## Resource Responsibilities
@@ -45,17 +54,27 @@ remain independent of any specific model provider.
 AgentRun represents one execution attempt for an Agent. AgentRun is the only
 executable resource in the platform.
 
+Execution Engine represents the runtime control-flow component for an AgentRun.
+It owns Decision validation, Decision interpretation, iteration, retry,
+timeout, cancellation, ToolInvocation creation, Observation handling, and
+terminal state.
+
 Context represents assembled, provenance-bearing information prepared for an
 AgentRun. Runtime MUST consume Context and MUST NOT query Knowledge directly.
 
-Pilot represents the agent reasoning and model orchestration policy. Model is a
-replaceable execution backend selected or routed by Pilot.
+Pilot represents the stateless agent reasoning and model orchestration policy.
+Pilot owns prompt construction, model selection, provider adaptation, response
+parsing, and Decision production. Model is a replaceable execution backend
+selected or routed by Pilot.
+
+Decision represents provider-neutral Model intent returned through Pilot and
+interpreted by the Execution Engine. Decision is not a Resource.
 
 Artifact represents durable output produced by an AgentRun.
 
 ToolInvocation represents one structured, governed request to execute a Tool
-operation during an AgentRun. Observation represents the structured result of
-that invocation for status, API projections, and trace reconstruction.
+operation during an AgentRun. Observation data is embedded in ToolInvocation
+status for status, API projections, and trace reconstruction.
 
 ## Ownership
 
@@ -83,7 +102,8 @@ resource.
 
 The control plane owns admission, persistence, reconciliation, scheduling,
 policy evaluation, status propagation, and events. Runtime owns AgentRun
-execution, Pilot invocation, model invocation, structured tool invocation,
+execution through the Execution Engine, Pilot invocation, model invocation,
+Decision validation and interpretation, structured tool invocation, embedded
 Observation recording, and artifact production.
 
 Runtime MUST NOT schedule work, reconcile resources, perform admission, build

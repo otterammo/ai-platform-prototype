@@ -37,6 +37,9 @@ class.
 Capability matching SHOULD happen before AgentRun execution. A Pilot MUST NOT
 select a Model that fails required capability constraints.
 
+Models produce provider output that Pilot adapts into Decisions. A Model MUST
+NOT directly create platform Resources, ToolInvocations, Artifacts, or Events.
+
 ## Limits
 
 Model limits SHOULD describe context size, output size, rate limits, cost class,
@@ -65,5 +68,5 @@ reason, and correlation data.
 
 A Model can be replaced by changing routing, capability matching, or provider
 configuration without changing Mission intent. Replacing a Model MUST preserve
-resource ownership, policy evaluation, event traceability, and Artifact
-ownership.
+Decision compatibility, resource ownership, policy evaluation, event
+traceability, and Artifact ownership.

@@ -52,8 +52,9 @@ SHOULD be idempotent or guarded by policy and action identity.
 ## Tool Invocation Ownership
 
 ToolInvocations created during execution MUST be owned by the AgentRun that
-requested them. Observations produced by those ToolInvocations MUST also be
-owned by the same AgentRun.
+requested them. Observations produced by those ToolInvocations MUST be recorded
+on the owning ToolInvocation status or through a later explicitly specified
+Observation resource.
 
 AgentRun status SHOULD reference active, waiting, failed, denied, and completed
 ToolInvocations when they materially affect execution. Runtime MUST NOT hide
@@ -88,5 +89,5 @@ success before required Artifacts have been recorded.
 ## Events
 
 AgentRun events MUST be emitted for creation, scheduling, start, policy
-evaluation, approval waiting, model invocation, tool invocation, artifact
-creation, completion, retry, and failure.
+evaluation, approval waiting, model invocation, Decision handling, tool
+invocation, artifact creation, completion, retry, and failure.

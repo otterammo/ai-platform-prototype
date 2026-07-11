@@ -5,7 +5,7 @@ for the AI Platform. It defines resource semantics, controller behavior, runtime
 boundaries, APIs, CLI expectations, events, policy, extensibility, principles,
 and versioning.
 
-The current specification version is `v1.0.0`. The current stable resource API
+The current specification version is `v1.1.0`. The current stable resource API
 group is `ai.platform/v1`.
 
 ## Chapters
@@ -31,6 +31,7 @@ group is `ai.platform/v1`.
 19. [Glossary](018-glossary.md)
 20. [Architectural Principles](019-principles.md)
 21. [Versioning](020-versioning.md)
+22. [Tool Invocations](021-tool-invocations.md)
 
 ## Change Rules
 

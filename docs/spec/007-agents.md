@@ -45,6 +45,9 @@ authorized by policy before side effects occur.
 Agent MUST NOT assume a tool provider is available merely because a tool name is
 present. Tool availability is a control-plane and provider contract.
 
+Resolved tools MUST provide operation schemas, risk metadata, sandbox
+requirements, and output contracts before runtime can execute ToolInvocations.
+
 ## Pilot Ownership
 
 Agent owns Pilot configuration. Pilot configuration defines reasoning strategy,
@@ -54,7 +57,7 @@ Agent MUST remain independent of any specific model provider. If Agent reference
 a Model, the reference MUST be expressed through Pilot or a Pilot-compatible
 routing contract.
 
-## Execution Loop
+## AgentRun Creation
 
 Agent controllers create AgentRuns. Each AgentRun is an execution attempt for
 the Agent. The Agent controller SHOULD create a new AgentRun when Agent desired

@@ -2,9 +2,10 @@
 
 ## Purpose
 
-Runtime executes scheduled AgentRuns. Runtime is responsible for invoking Pilots,
-Models, and Tools, enforcing policy decisions at side-effect boundaries,
-producing Artifacts, and reporting execution status.
+Runtime executes scheduled AgentRuns. Runtime is responsible for invoking
+Pilots, Models, and Tools, enforcing policy decisions at side-effect boundaries,
+recording ToolInvocations and Observations, producing Artifacts, and reporting
+execution status.
 
 Runtime is not the control plane.
 
@@ -16,7 +17,8 @@ Runtime MAY perform the following actions for a scheduled AgentRun:
 - Consume Ready Context.
 - Invoke the effective Pilot.
 - Invoke permitted Models through the Pilot.
-- Invoke permitted Tools after policy authorization.
+- Record, validate, authorize, and execute ToolInvocations.
+- Record Observations.
 - Produce Artifacts.
 - Update AgentRun status through approved status paths.
 - Emit execution events.
@@ -53,10 +55,17 @@ Such transformation MUST preserve provenance and MUST honor Model limits.
 
 ## Tool Invocation
 
-Runtime MUST authorize tool actions before side effects occur. Tool invocation
-events SHOULD include tool identity, operation, AgentRun identity, policy
-decision, and correlation data. Sensitive details SHOULD be redacted according
-to policy.
+Runtime MUST use the ToolInvocation contract for tool actions. Runtime MUST
+validate structured arguments, authorize the ToolInvocation through Policy, pause
+for Approval when required, invoke the Tool Runtime only after authorization,
+and record the Observation.
+
+Runtime MUST NOT execute denied ToolInvocations, and MUST NOT change Tool,
+operation, provider, or request shape to bypass denial.
+
+Tool invocation events SHOULD include tool identity, operation, AgentRun
+identity, ToolInvocation identity, policy decision, Observation identity, and
+correlation data. Sensitive details SHOULD be redacted according to policy.
 
 ## Artifact Production
 

@@ -79,8 +79,8 @@ single uninterrupted process to complete reconciliation.
 
 Platform, Workspace, Policy, Approval, Model, Tool, Capability, and
 FleetTemplate are cluster-scoped unless an extension explicitly defines a
-different scope. Mission, Fleet, Agent, AgentRun, Artifact, Knowledge,
-KnowledgeIndex, and Context are Workspace-scoped.
+different scope. Mission, Fleet, Agent, AgentRun, ToolInvocation, Observation,
+Artifact, Knowledge, KnowledgeIndex, and Context are Workspace-scoped.
 
 Namespaced resources MUST NOT reference resources in another Workspace except
 through an explicitly defined cross-scope contract.

@@ -18,8 +18,8 @@ change resource semantics.
 ## Correlation
 
 Events SHOULD include correlation identifiers that connect Platform, Workspace,
-Mission, Fleet, Agent, AgentRun, Context, Approval, Model, Tool, and Artifact
-activity for the same unit of work.
+Mission, Fleet, Agent, AgentRun, Context, Approval, Model, Tool,
+ToolInvocation, Observation, and Artifact activity for the same unit of work.
 
 Correlation identifiers MUST be stable across controller, scheduler, runtime,
 and provider boundaries when propagated.
@@ -70,8 +70,26 @@ Snapshots MUST respect redaction and policy constraints.
 The event taxonomy SHOULD include resource applied, reconciliation started,
 reconciliation completed, admission rejected, template selected, capability
 resolved, model selected, context built, AgentRun scheduled, AgentRun started,
-policy evaluated, approval requested, approval granted, approval rejected, tool
-invoked, model invoked, artifact ready, completed, waiting, and failed.
+policy evaluated, approval requested, approval granted, approval rejected, model
+invoked, ToolInvocation requested, ToolInvocation validated, ToolInvocation
+authorized, ToolInvocation denied, ToolInvocation waiting for approval,
+ToolInvocation started, ToolInvocation completed, ToolInvocation failed,
+ToolInvocation timed out, ToolInvocation cancelled, Observation recorded,
+artifact ready, completed, waiting, and failed.
+
+ToolInvocation events MUST include correlation identifier, Workspace, AgentRun,
+ToolInvocation, Tool, operation, and runtime or provider actor. Sensitive
+arguments and output MUST be redacted according to Policy.
+
+## Trace Semantics
+
+Trace projections MUST be able to reconstruct the execution path for a Mission
+or AgentRun from resources and events. For tool-executing AgentRuns, trace MUST
+show each ToolInvocation, policy decision, execution phase, result, Observation,
+and related Artifacts.
+
+Trace output MUST distinguish missing data from redacted data. Redaction MUST be
+driven by Policy and MUST NOT remove the fact that a ToolInvocation occurred.
 
 Extensions MAY add event types. Extension event types SHOULD use stable names
 and SHOULD include the same correlation fields as core events.

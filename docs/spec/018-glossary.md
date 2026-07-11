@@ -85,6 +85,11 @@ provider, capabilities, limits, and configuration.
 A status value recording the latest metadata.generation observed by the
 responsible controller.
 
+## Observation
+
+A Workspace-scoped resource containing the structured result of a ToolInvocation
+for status, API projections, and trace reconstruction.
+
 ## OwnerReference
 
 A metadata reference from a child resource to an owning parent resource.
@@ -127,7 +132,18 @@ The observed-state section of a resource. Status is controller-owned.
 A declared capability provider that runtime may invoke after policy
 authorization.
 
+## ToolInvocation
+
+A Workspace-scoped resource representing one structured, policy-governed request
+to execute a Tool operation for an AgentRun.
+
+## Tool Runtime
+
+The runtime component or provider adapter that executes authorized
+ToolInvocation operations and returns structured output for Observation
+recording.
+
 ## Workspace
 
 The primary isolation and namespace boundary for Missions, Knowledge, Context,
-Fleets, Agents, AgentRuns, and Artifacts.
+Fleets, Agents, AgentRuns, ToolInvocations, Observations, and Artifacts.

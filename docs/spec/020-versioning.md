@@ -13,7 +13,7 @@ The Platform Specification uses semantic versioning:
 - `PATCH` changes clarify language, fix examples, or correct non-contractual
   errors without changing behavior.
 
-The current Platform Specification version is `v1.0.0`.
+The current Platform Specification version is `v1.1.0`.
 
 Specification versions are independent from the Python package version in
 `pyproject.toml`. An implementation package may release multiple versions while
@@ -58,3 +58,11 @@ Compatible implementations MUST preserve:
 Breaking changes require a new major Platform Specification version or a new
 resource API version. Deprecations SHOULD include migration guidance, a removal
 target, and compatibility notes in the relevant RFC.
+
+## Version History
+
+- `v1.1.0`: Adds structured ToolInvocation and Observation contracts, Tool
+  contracts, Tool Runtime interfaces, and tool execution trace taxonomy.
+- `v1.0.0`: Establishes the initial declarative resource model, AgentRun
+  execution boundary, Context runtime boundary, Policy, Events, API, CLI, and
+  governance contracts.

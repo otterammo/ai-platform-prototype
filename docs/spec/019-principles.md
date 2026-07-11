@@ -51,6 +51,12 @@ stable across attempts.
 Controllers and runtime must emit events, update status, and preserve enough
 trace data for users to understand what happened and why.
 
+## Tools Are Structured
+
+Runtime executes tools only through structured ToolInvocation resources, Policy
+decisions, Tool Runtime contracts, and Observations. Natural-language tool
+requests are not an execution contract.
+
 ## Resources Own Their Children
 
 Lifecycle, garbage collection, and status aggregation follow explicit ownership

@@ -17,6 +17,7 @@ class ResourceKind(StrEnum):
     FLEET = "Fleet"
     AGENT = "Agent"
     AGENT_RUN = "AgentRun"
+    TOOL_INVOCATION = "ToolInvocation"
     ARTIFACT = "Artifact"
     POLICY = "Policy"
     APPROVAL = "Approval"
@@ -59,10 +60,24 @@ class Condition(BaseModel):
     message: str | None = None
 
 
+class ObservationError(BaseModel):
+    reason: str
+    message: str
+
+
+class Observation(BaseModel):
+    summary: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    error: ObservationError | None = None
+    redactions: dict[str, Any] = Field(default_factory=dict)
+    outputReferences: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class Status(BaseModel):
     phase: str = "Pending"
     observedGeneration: int = 0
     message: str | None = None
+    observation: Observation | None = None
     conditions: list[Condition] = Field(default_factory=list)
     data: dict[str, Any] = Field(default_factory=dict)
 
@@ -247,6 +262,22 @@ class ArtifactSpec(BaseModel):
     producedBy: ProducedByRef
 
 
+class ToolInvocationSpec(BaseModel):
+    agentRunRef: ResourceRef
+    tool: str
+    operation: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    correlationId: str | None = None
+    idempotencyKey: str | None = None
+    timeoutSeconds: float | None = Field(default=None, gt=0)
+    riskLevel: Literal["low", "medium", "high"] | None = None
+
+    @field_validator("tool", "operation")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return Metadata.validate_dnsish_name(value) or value
+
+
 class PolicyMatch(BaseModel):
     tool: str | None = None
     operation: str | None = None
@@ -289,10 +320,47 @@ class ModelSpec(BaseModel):
     config: ModelConfig = Field(default_factory=ModelConfig)
 
 
+class ToolOperationSpec(BaseModel):
+    name: str
+    timeoutSeconds: float | None = Field(default=None, gt=0)
+    riskLevel: Literal["low", "medium", "high"] | None = None
+    inputSchema: dict[str, Any] = Field(default_factory=dict)
+    outputSchema: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return Metadata.validate_dnsish_name(value) or value
+
+
 class ToolSpec(BaseModel):
     description: str | None = None
     type: str = "builtin"
+    operations: list[ToolOperationSpec] = Field(default_factory=list)
+    timeoutSeconds: float = Field(default=30.0, gt=0)
+    riskLevel: Literal["low", "medium", "high"] = "medium"
+    inputSchema: dict[str, Any] = Field(default_factory=dict)
+    outputSchema: dict[str, Any] = Field(default_factory=dict)
     config: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_supported_operations_alias(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        if "supportedOperations" in data and "operations" not in data:
+            data["operations"] = data.pop("supportedOperations")
+        return data
+
+    @field_validator("operations", mode="before")
+    @classmethod
+    def coerce_operations(cls, value: Any) -> Any:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [{"name": item} if isinstance(item, str) else item for item in value]
+        return value
 
 
 class CapabilityRequires(BaseModel):
@@ -460,6 +528,32 @@ class AgentRunResource(BaseResource):
         return self
 
 
+class ToolInvocationResource(BaseResource):
+    kind: Literal[ResourceKind.TOOL_INVOCATION] = ResourceKind.TOOL_INVOCATION
+    spec: ToolInvocationSpec
+
+    @model_validator(mode="after")
+    def require_namespace_and_validate_phase(self) -> ToolInvocationResource:
+        if not self.metadata.namespace:
+            raise ValueError("ToolInvocation metadata.namespace must name a Workspace")
+        valid_phases = {
+            "Pending",
+            "Requested",
+            "Validated",
+            "Authorized",
+            "WaitingForApproval",
+            "Running",
+            "Succeeded",
+            "Failed",
+            "Denied",
+            "TimedOut",
+            "Cancelled",
+        }
+        if self.status.phase not in valid_phases:
+            raise ValueError(f"ToolInvocation status.phase must be one of: {', '.join(sorted(valid_phases))}")
+        return self
+
+
 class ArtifactResource(BaseResource):
     kind: Literal[ResourceKind.ARTIFACT] = ResourceKind.ARTIFACT
     spec: ArtifactSpec
@@ -535,6 +629,7 @@ Resource = Annotated[
         FleetResource,
         AgentResource,
         AgentRunResource,
+        ToolInvocationResource,
         ArtifactResource,
         PolicyResource,
         ApprovalResource,
@@ -556,6 +651,7 @@ AnyResource = (
     | FleetResource
     | AgentResource
     | AgentRunResource
+    | ToolInvocationResource
     | ArtifactResource
     | PolicyResource
     | ApprovalResource
@@ -576,6 +672,7 @@ RESOURCE_BY_KIND: dict[str, type[AnyResource]] = {
     ResourceKind.FLEET.value: FleetResource,
     ResourceKind.AGENT.value: AgentResource,
     ResourceKind.AGENT_RUN.value: AgentRunResource,
+    ResourceKind.TOOL_INVOCATION.value: ToolInvocationResource,
     ResourceKind.ARTIFACT.value: ArtifactResource,
     ResourceKind.POLICY.value: PolicyResource,
     ResourceKind.APPROVAL.value: ApprovalResource,

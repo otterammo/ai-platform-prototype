@@ -30,8 +30,10 @@ from .resources import (
     KnowledgeIndexResource,
     KnowledgeResource,
     MissionResource,
+    Observation,
     OwnerReference,
     ResourceKind,
+    ToolInvocationResource,
     dump_resource,
     parse_resource,
     resource_key,
@@ -46,6 +48,7 @@ LEGAL_OWNER_KINDS: dict[ResourceKind, set[ResourceKind]] = {
     ResourceKind.FLEET: {ResourceKind.MISSION},
     ResourceKind.AGENT: {ResourceKind.FLEET},
     ResourceKind.AGENT_RUN: {ResourceKind.AGENT},
+    ResourceKind.TOOL_INVOCATION: {ResourceKind.AGENT_RUN},
     ResourceKind.CONTEXT: {ResourceKind.AGENT_RUN},
     ResourceKind.ARTIFACT: {ResourceKind.AGENT_RUN},
     ResourceKind.KNOWLEDGE: {ResourceKind.WORKSPACE},
@@ -138,12 +141,14 @@ def _is_default_status(value: Any) -> bool:
         return True
     if not isinstance(value, dict):
         return False
-    allowed_keys = {"phase", "observedGeneration", "conditions", "data"}
+    allowed_keys = {"phase", "observedGeneration", "message", "observation", "conditions", "data"}
     if any(key not in allowed_keys for key in value):
         return False
     return (
         value.get("phase", "Pending") == "Pending"
         and value.get("observedGeneration", 0) == 0
+        and value.get("message") is None
+        and value.get("observation") is None
         and value.get("conditions", []) == []
         and value.get("data", {}) == {}
     )
@@ -186,11 +191,19 @@ class ResourceStore:
         correlation_id = event_context.correlation_id if event_context else None
         if kind == ResourceKind.MISSION.value:
             correlation_id = new_correlation_id()
+        elif isinstance(resource, ToolInvocationResource):
+            correlation_id = (
+                correlation_id
+                or resource.spec.correlationId
+                or self._agent_run_correlation_id(resource.spec.agentRunRef.name, namespace)
+                or new_correlation_id()
+            )
         elif correlation_id is None:
             correlation_id = correlation_id_from_manifest(manifest)
         if correlation_id:
             resource.metadata.annotations[CORRELATION_ID_ANNOTATION] = correlation_id
             resource.status.data[CORRELATION_ID_STATUS_KEY] = correlation_id
+        resource_event_payload = self._resource_event_payload(resource)
         with self.session() as session:
             record = session.scalar(
                 select(ResourceRecord).where(
@@ -203,6 +216,8 @@ class ResourceStore:
             previous_manifest: JsonDict | None = None
             if record:
                 previous_manifest = dict(record.manifest)
+                if isinstance(resource, ToolInvocationResource):
+                    self._ensure_tool_invocation_spec_immutable(previous_manifest, dump_resource(resource))
                 resource.metadata.generation = record.generation + 1
                 resource.status = parse_resource(record.manifest).status
                 if correlation_id:
@@ -233,6 +248,7 @@ class ResourceStore:
                 {
                     "generation": resource.metadata.generation,
                     "resourceSnapshot": dump_resource(resource),
+                    **resource_event_payload,
                     **({"previousResourceSnapshot": previous_manifest} if previous_manifest else {}),
                 },
                 event_context,
@@ -301,6 +317,8 @@ class ResourceStore:
             owner = OwnerReference(kind=ResourceKind.FLEET, name=resource.spec.fleet, controller=True)
         elif isinstance(resource, AgentRunResource):
             owner = OwnerReference(kind=ResourceKind.AGENT, name=resource.spec.agentRef.name, controller=True)
+        elif isinstance(resource, ToolInvocationResource):
+            owner = OwnerReference(kind=ResourceKind.AGENT_RUN, name=resource.spec.agentRunRef.name, controller=True)
         elif isinstance(resource, ArtifactResource):
             owner = OwnerReference(kind=ResourceKind.AGENT_RUN, name=resource.spec.producedBy.name, controller=True)
         if owner is not None:
@@ -330,6 +348,9 @@ class ResourceStore:
         elif isinstance(resource, AgentRunResource):
             self._require_exists(ResourceKind.AGENT, resource.spec.agentRef.name, namespace)
             self._require_exists(ResourceKind.MISSION, resource.spec.missionRef.name, namespace)
+        elif isinstance(resource, ToolInvocationResource):
+            self._require_exists(ResourceKind.AGENT_RUN, resource.spec.agentRunRef.name, namespace)
+            self._require_exists(ResourceKind.TOOL, resource.spec.tool, None)
         elif isinstance(resource, ArtifactResource):
             self._require_exists(ResourceKind.AGENT_RUN, resource.spec.producedBy.name, namespace)
             artifact_path = Path(resource.spec.path)
@@ -396,6 +417,9 @@ class ResourceStore:
             agent = self._load_resource(ResourceKind.AGENT, resource.spec.agentRef.name, namespace, AgentResource)
             if agent.spec.mission != resource.spec.missionRef.name:
                 raise ValueError("AgentRun spec.missionRef must match owning Agent mission")
+        elif isinstance(resource, ToolInvocationResource):
+            if owner.kind != ResourceKind.AGENT_RUN or owner.name != resource.spec.agentRunRef.name:
+                raise ValueError("ToolInvocation ownerReference must match spec.agentRunRef.name")
         elif isinstance(resource, ContextResource):
             if owner.kind != ResourceKind.AGENT_RUN:
                 raise ValueError("Context ownerReference must be AgentRun")
@@ -689,6 +713,7 @@ class ResourceStore:
         event_type: str | None = None,
         event_context: EventContext | None = None,
         clear_data_keys: Sequence[str] | None = None,
+        observation: Observation | dict[str, Any] | None = None,
     ) -> JsonDict:
         kind_value, namespace_value, name_value = resource_key(kind, name, namespace)
         with self.session() as session:
@@ -724,6 +749,15 @@ class ResourceStore:
                 if data:
                     merged.update(data)
                 status["data"] = merged
+            if observation is not None:
+                if isinstance(observation, Observation):
+                    status["observation"] = observation.model_dump(
+                        mode="json",
+                        exclude_none=True,
+                        exclude_defaults=True,
+                    )
+                else:
+                    status["observation"] = observation
             status["conditions"] = self._conditions_for_phase(
                 kind_value,
                 phase,
@@ -977,6 +1011,34 @@ class ResourceStore:
     @staticmethod
     def display_name(namespace: str | None, name: str) -> str:
         return f"{namespace}/{name}" if namespace else name
+
+    @staticmethod
+    def _ensure_tool_invocation_spec_immutable(previous_manifest: JsonDict, next_manifest: JsonDict) -> None:
+        if (previous_manifest.get("spec") or {}) != (next_manifest.get("spec") or {}):
+            metadata = previous_manifest.get("metadata") or {}
+            name = metadata.get("name") or "<unknown>"
+            namespace = metadata.get("namespace")
+            display_name = ResourceStore.display_name(namespace, str(name))
+            raise ValueError(f"ToolInvocation {display_name} spec is immutable")
+
+    def _agent_run_correlation_id(self, agent_run_name: str, namespace: str | None) -> str | None:
+        manifest = self.get(ResourceKind.AGENT_RUN, agent_run_name, namespace)
+        if manifest is None:
+            return None
+        return correlation_id_from_manifest(manifest)
+
+    @staticmethod
+    def _resource_event_payload(resource: AnyResource) -> dict[str, Any]:
+        if isinstance(resource, ToolInvocationResource):
+            workspace = resource.metadata.namespace
+            return {
+                "workspace": workspace,
+                "agentRun": resource.spec.agentRunRef.name,
+                "toolInvocation": resource.metadata.name,
+                "tool": resource.spec.tool,
+                "operation": resource.spec.operation,
+            }
+        return {}
 
     @staticmethod
     def _structured_payload(

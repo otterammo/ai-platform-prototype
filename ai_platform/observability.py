@@ -4,7 +4,15 @@ from datetime import datetime
 from typing import Any
 
 from .events import correlation_id_from_manifest
-from .resources import AgentResource, AgentRunResource, FleetResource, MissionResource, ResourceKind, parse_resource
+from .resources import (
+    AgentResource,
+    AgentRunResource,
+    FleetResource,
+    MissionResource,
+    ResourceKind,
+    ToolInvocationResource,
+    parse_resource,
+)
 from .storage import ResourceStore
 
 JsonDict = dict[str, Any]
@@ -31,6 +39,13 @@ DECISION_EVENT_TYPES = {
     "ContextConsumed",
     "ReconciliationStarted",
     "ReconciliationCompleted",
+    "ToolInvocationAuthorized",
+    "ToolInvocationDenied",
+    "ToolInvocationWaitingForApproval",
+    "ToolInvocationStarted",
+    "ToolInvocationCompleted",
+    "ToolInvocationFailed",
+    "ObservationRecorded",
 }
 
 
@@ -260,7 +275,7 @@ def _agent_trace(store: ResourceStore, agent: AgentResource, artifacts: JsonDict
         "model": agent.spec.pilot.modelRef if agent.spec.pilot and agent.spec.pilot.modelRef else _model_name(agent),
         "conditions": agent.status.model_dump(mode="json", exclude_none=True).get("conditions", []),
         "artifacts": [artifact for artifact in artifacts if artifact["agent"] == agent.metadata.name],
-        "agentRuns": [_agent_run_trace(run, artifacts, events) for run in runs],
+        "agentRuns": [_agent_run_trace(store, run, artifacts, events) for run in runs],
         "events": _agent_events(events, agent.metadata.name),
     }
 
@@ -274,13 +289,44 @@ def _agent_runs(store: ResourceStore, agent: AgentResource) -> list[AgentRunReso
     return sorted(runs, key=lambda item: item.metadata.name)
 
 
-def _agent_run_trace(run: AgentRunResource, artifacts: JsonDictList, events: JsonDictList) -> JsonDict:
+def _agent_run_trace(
+    store: ResourceStore,
+    run: AgentRunResource,
+    artifacts: JsonDictList,
+    events: JsonDictList,
+) -> JsonDict:
     return {
         "name": run.metadata.name,
         "status": run.status.phase,
         "context": run.spec.contextRef.name,
         "artifacts": [artifact for artifact in artifacts if artifact.get("agentRun") == run.metadata.name],
+        "toolInvocations": [_tool_invocation_trace(invocation, events) for invocation in _tool_invocations(store, run)],
         "events": _resource_events(events, ResourceKind.AGENT_RUN.value, run.metadata.name),
+    }
+
+
+def _tool_invocations(store: ResourceStore, run: AgentRunResource) -> list[ToolInvocationResource]:
+    invocations: list[ToolInvocationResource] = []
+    for manifest in store.list(ResourceKind.TOOL_INVOCATION, run.metadata.namespace):
+        candidate = parse_resource(manifest)
+        if isinstance(candidate, ToolInvocationResource) and candidate.spec.agentRunRef.name == run.metadata.name:
+            invocations.append(candidate)
+    return sorted(invocations, key=lambda item: item.metadata.name)
+
+
+def _tool_invocation_trace(invocation: ToolInvocationResource, events: JsonDictList) -> JsonDict:
+    return {
+        "name": invocation.metadata.name,
+        "status": invocation.status.phase,
+        "tool": invocation.spec.tool,
+        "operation": invocation.spec.operation,
+        "arguments": invocation.spec.arguments,
+        "observation": (
+            invocation.status.observation.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
+            if invocation.status.observation
+            else None
+        ),
+        "events": _resource_events(events, ResourceKind.TOOL_INVOCATION.value, invocation.metadata.name),
     }
 
 
@@ -328,6 +374,15 @@ def _agent_detail_lines(agent: JsonDict) -> list[str]:
         lines.append(f"Context {run['context']}")
         for artifact in run.get("artifacts") or []:
             lines.append(f"Artifact {artifact.get('name') or artifact.get('path')}")
+        for invocation in run.get("toolInvocations") or []:
+            lines.append(f"ToolInvocation {invocation['name']}")
+            lines.append(f"Tool {invocation['tool']}.{invocation['operation']}")
+            lines.append("Result")
+            lines.append(str(invocation["status"]))
+            observation = invocation.get("observation") or {}
+            if observation.get("summary"):
+                lines.append("Observation")
+                lines.append(str(observation["summary"]))
         lines.extend(_policy_detail_lines(run.get("events") or []))
         lines.append(_display_status(run["status"]))
     lines.append(_display_status(agent["status"]))
@@ -420,6 +475,14 @@ def _timeline_message(event: JsonDict) -> str:
         "AgentResumed": f"{_short_agent_name(resource_name)} resumed",
         "FleetWaiting": "Fleet waiting for approval",
         "MissionWaiting": "Mission waiting for approval",
+        "ToolInvocationCreated": f"ToolInvocation {resource_name} created",
+        "ToolInvocationAuthorized": f"ToolInvocation {resource_name} authorized",
+        "ToolInvocationDenied": f"ToolInvocation {resource_name} denied",
+        "ToolInvocationWaitingForApproval": f"ToolInvocation {resource_name} waiting for approval",
+        "ToolInvocationStarted": f"ToolInvocation {resource_name} started",
+        "ToolInvocationCompleted": f"ToolInvocation {resource_name} completed",
+        "ToolInvocationFailed": f"ToolInvocation {resource_name} failed",
+        "ObservationRecorded": f"Observation recorded for {resource_name}",
     }
     fallback = event.get("message") or event_type
     return labels.get(event_type, str(fallback))
@@ -503,6 +566,7 @@ def _children_for_resource(
         fleets = []
         agents = []
         agent_runs = []
+        tool_invocations = []
         contexts = []
         artifacts = []
         for fleet_manifest in store.list(ResourceKind.FLEET, namespace):
@@ -531,6 +595,18 @@ def _children_for_resource(
                         "phase": run.status.phase,
                     }
                 )
+        agent_run_names = {item["name"] for item in agent_runs}
+        for invocation_manifest in store.list(ResourceKind.TOOL_INVOCATION, namespace):
+            invocation = parse_resource(invocation_manifest)
+            if isinstance(invocation, ToolInvocationResource) and invocation.spec.agentRunRef.name in agent_run_names:
+                tool_invocations.append(
+                    {
+                        "kind": "ToolInvocation",
+                        "name": invocation.metadata.name,
+                        "agentRun": invocation.spec.agentRunRef.name,
+                        "phase": invocation.status.phase,
+                    }
+                )
         for context_manifest in store.list(ResourceKind.CONTEXT, namespace):
             spec = context_manifest.get("spec") or {}
             if spec.get("mission") == name:
@@ -547,6 +623,7 @@ def _children_for_resource(
             "fleets": fleets,
             "agents": agents,
             "agentRuns": agent_runs,
+            "toolInvocations": tool_invocations,
             "contexts": contexts,
             "artifacts": artifacts,
         }
@@ -564,6 +641,19 @@ def _children_for_resource(
             if isinstance(run, AgentRunResource) and run.spec.agentRef.name == name:
                 runs.append({"kind": "AgentRun", "name": run.metadata.name, "phase": run.status.phase})
         return {"agentRuns": runs}
+    if kind == ResourceKind.AGENT_RUN.value:
+        invocations = []
+        for invocation_manifest in store.list(ResourceKind.TOOL_INVOCATION, namespace):
+            invocation = parse_resource(invocation_manifest)
+            if isinstance(invocation, ToolInvocationResource) and invocation.spec.agentRunRef.name == name:
+                invocations.append(
+                    {
+                        "kind": "ToolInvocation",
+                        "name": invocation.metadata.name,
+                        "phase": invocation.status.phase,
+                    }
+                )
+        return {"toolInvocations": invocations}
     return {}
 
 
@@ -615,6 +705,13 @@ def _referenced_resources(resource: JsonDict, kind: str) -> JsonDictList:
                 {"kind": "Agent", "name": (spec.get("agentRef") or {}).get("name")},
                 {"kind": "Mission", "name": (spec.get("missionRef") or {}).get("name")},
                 {"kind": "Context", "name": (spec.get("contextRef") or {}).get("name")},
+            ]
+        )
+    elif kind == ResourceKind.TOOL_INVOCATION.value:
+        references.extend(
+            [
+                {"kind": "AgentRun", "name": (spec.get("agentRunRef") or {}).get("name")},
+                {"kind": "Tool", "name": spec.get("tool")},
             ]
         )
     elif kind == ResourceKind.ARTIFACT.value:

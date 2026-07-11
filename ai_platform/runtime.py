@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
 from .events import CORRELATION_ID_ANNOTATION, CORRELATION_ID_STATUS_KEY, EventContext
 from .models import Message, build_model_client
@@ -13,13 +13,56 @@ from .resources import (
     MissionResource,
     ModelConfig,
     ModelResource,
+    Observation,
     ResourceKind,
+    ToolInvocationResource,
     WorkspaceResource,
     parse_resource,
 )
 from .storage import CONTROLLER_FIELD_MANAGER, ResourceStore
 
 _ResourceT = TypeVar("_ResourceT")
+
+
+class ToolRuntimeError(Exception):
+    pass
+
+
+class ToolRuntime(Protocol):
+    runtime_id: str
+
+    def execute(self, invocation: ToolInvocationResource) -> Observation: ...
+
+
+class FakeToolRuntime:
+    runtime_id = "builtin.fake"
+
+    def execute(self, invocation: ToolInvocationResource) -> Observation:
+        if invocation.spec.tool != "fake" or invocation.spec.operation != "echo":
+            raise ToolRuntimeError(f"fake runtime cannot execute {invocation.spec.tool}.{invocation.spec.operation}")
+        return Observation(
+            summary="Echo completed",
+            payload={"message": invocation.spec.arguments.get("message")},
+        )
+
+
+class ToolRuntimeRegistry:
+    def __init__(self, runtimes: dict[str, ToolRuntime] | None = None) -> None:
+        self._runtimes: dict[str, ToolRuntime] = {"fake": FakeToolRuntime()}
+        if runtimes:
+            self._runtimes.update(runtimes)
+
+    def register(self, tool: str, runtime: ToolRuntime) -> None:
+        self._runtimes[tool] = runtime
+
+    def resolve(self, invocation: ToolInvocationResource) -> ToolRuntime:
+        runtime = self._runtimes.get(invocation.spec.tool)
+        if runtime is None:
+            raise ToolRuntimeError(f"No ToolRuntime registered for tool {invocation.spec.tool}")
+        return runtime
+
+    def execute(self, invocation: ToolInvocationResource) -> Observation:
+        return self.resolve(invocation).execute(invocation)
 
 
 def run_correlation_id(run: AgentRunResource) -> str | None:

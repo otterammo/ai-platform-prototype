@@ -33,6 +33,12 @@ RESOURCE_ALIASES = {
     "agentruns": ResourceKind.AGENT_RUN.value,
     "agent-run": ResourceKind.AGENT_RUN.value,
     "agent-runs": ResourceKind.AGENT_RUN.value,
+    "toolinvocation": ResourceKind.TOOL_INVOCATION.value,
+    "toolinvocations": ResourceKind.TOOL_INVOCATION.value,
+    "tool-invocation": ResourceKind.TOOL_INVOCATION.value,
+    "tool-invocations": ResourceKind.TOOL_INVOCATION.value,
+    "observation": "Observation",
+    "observations": "Observation",
     "artifact": ResourceKind.ARTIFACT.value,
     "artifacts": ResourceKind.ARTIFACT.value,
     "policy": ResourceKind.POLICY.value,
@@ -228,10 +234,30 @@ async def run_async(args: argparse.Namespace) -> int:
         return 0
 
     if args.command == "get":
+        if args.kind == "Observation":
+            observations = _embedded_observations(store, args.namespace)
+            if args.name is None:
+                print_data(
+                    {
+                        "message": (
+                            "Observations are embedded in ToolInvocation status for v1.1; "
+                            "Observation is not a standalone resource yet."
+                        ),
+                        "items": observations,
+                    },
+                    args.output,
+                )
+                return 0
+            for observation in observations:
+                if observation["toolInvocation"] == args.name:
+                    print_data(observation, args.output)
+                    return 0
+            print(f"Observation {args.name} not found", file=sys.stderr)
+            return 1
         if args.name is None:
             print_data({"items": store.list(args.kind, args.namespace)}, args.output)
             return 0
-        resource = store.get(args.kind, args.name, args.namespace)
+        resource = _get_resource(store, args.kind, args.name, args.namespace)
         if not resource:
             print(f"{args.kind} {args.name} not found", file=sys.stderr)
             return 1
@@ -239,11 +265,28 @@ async def run_async(args: argparse.Namespace) -> int:
         return 0
 
     if args.command == "list":
+        if args.kind == "Observation":
+            print_data(
+                {
+                    "message": (
+                        "Observations are embedded in ToolInvocation status for v1.1; "
+                        "Observation is not a standalone resource yet."
+                    ),
+                    "items": _embedded_observations(store, args.namespace),
+                },
+                args.output,
+            )
+            return 0
         print_data({"items": store.list(args.kind, args.namespace)}, args.output)
         return 0
 
     if args.command == "describe":
-        description = describe_resource(store, args.kind, args.name, args.namespace)
+        namespace = args.namespace
+        if args.kind == ResourceKind.TOOL_INVOCATION.value and namespace is None:
+            resource = _get_resource(store, args.kind, args.name, None)
+            if resource is not None:
+                namespace = (resource.get("metadata") or {}).get("namespace")
+        description = describe_resource(store, args.kind, args.name, namespace)
         if not description:
             print(f"{args.kind} {args.name} not found", file=sys.stderr)
             return 1
@@ -477,6 +520,41 @@ def _resource_wait_value(resource: dict[str, Any], field: str) -> str | None:
         value = (resource.get("status") or {}).get("phase")
         return value if isinstance(value, str) else None
     raise ValueError(f"unsupported wait field {field}")
+
+
+def _embedded_observations(store: ResourceStore, namespace: str | None = None) -> list[dict[str, Any]]:
+    observations: list[dict[str, Any]] = []
+    for manifest in store.list(ResourceKind.TOOL_INVOCATION, namespace):
+        status = manifest.get("status") or {}
+        observation = status.get("observation")
+        if not observation:
+            continue
+        metadata = manifest.get("metadata") or {}
+        spec = manifest.get("spec") or {}
+        observations.append(
+            {
+                "namespace": metadata.get("namespace"),
+                "toolInvocation": metadata.get("name"),
+                "agentRun": (spec.get("agentRunRef") or {}).get("name"),
+                "tool": spec.get("tool"),
+                "operation": spec.get("operation"),
+                "phase": status.get("phase"),
+                "observation": observation,
+            }
+        )
+    return observations
+
+
+def _get_resource(store: ResourceStore, kind: str, name: str, namespace: str | None = None) -> dict[str, Any] | None:
+    resource = store.get(kind, name, namespace)
+    if resource is not None or namespace is not None or kind != ResourceKind.TOOL_INVOCATION.value:
+        return resource
+    matches = [
+        item for item in store.list(ResourceKind.TOOL_INVOCATION) if (item.get("metadata") or {}).get("name") == name
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
 
 
 def _search_result(chunk: dict[str, Any]) -> dict[str, Any]:

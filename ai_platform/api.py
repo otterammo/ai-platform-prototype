@@ -142,6 +142,25 @@ def create_app(
     async def list_agent_runs(namespace: str | None = None) -> dict[str, list[dict[str, Any]]]:
         return {"items": store.list(ResourceKind.AGENT_RUN, namespace)}
 
+    @app.get("/toolinvocations")
+    async def list_tool_invocations(namespace: str | None = None) -> dict[str, list[dict[str, Any]]]:
+        return {"items": store.list(ResourceKind.TOOL_INVOCATION, namespace)}
+
+    @app.get("/toolinvocations/{name}")
+    async def get_tool_invocation(name: str, namespace: str | None = None) -> dict[str, Any]:
+        invocation = store.get(ResourceKind.TOOL_INVOCATION, name, namespace)
+        if invocation is None and namespace is None:
+            matches = [
+                item
+                for item in store.list(ResourceKind.TOOL_INVOCATION)
+                if (item.get("metadata") or {}).get("name") == name
+            ]
+            if len(matches) == 1:
+                invocation = matches[0]
+        if invocation is None:
+            raise HTTPException(status_code=404, detail="tool invocation not found")
+        return invocation
+
     @app.get("/approvals/{approval_id}")
     async def get_approval(approval_id: str) -> dict[str, Any]:
         approval = store.get(ResourceKind.APPROVAL, approval_id)

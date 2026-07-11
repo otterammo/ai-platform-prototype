@@ -12,7 +12,7 @@ from .knowledge import (
     mission_knowledge_refs,
     mission_query,
 )
-from .policy import ApprovalRequired
+from .policy import ApprovalRequired, PolicyDenied, PolicyEngine, RuntimeAction
 from .resources import (
     AgentResource,
     AgentRunResource,
@@ -23,11 +23,15 @@ from .resources import (
     FleetTemplateResource,
     KnowledgeIndexResource,
     MissionResource,
+    Observation,
+    ObservationError,
     ResourceKind,
+    ToolInvocationResource,
+    ToolResource,
     WorkspaceResource,
     parse_resource,
 )
-from .runtime import AgentRuntime
+from .runtime import AgentRuntime, ToolRuntimeError, ToolRuntimeRegistry
 from .storage import CONTROLLER_FIELD_MANAGER, ResourceStore
 
 MISSION_GENERATION_ANNOTATION = "ai.platform/mission-generation"
@@ -46,7 +50,9 @@ class ReconcileResult:
     changed: int = 0
 
 
-def resource_correlation_id(resource: MissionResource | FleetResource | AgentResource | AgentRunResource) -> str | None:
+def resource_correlation_id(
+    resource: MissionResource | FleetResource | AgentResource | AgentRunResource | ToolInvocationResource,
+) -> str | None:
     annotated = resource.metadata.annotations.get(CORRELATION_ID_ANNOTATION)
     if annotated:
         return annotated
@@ -54,7 +60,11 @@ def resource_correlation_id(resource: MissionResource | FleetResource | AgentRes
     return value if isinstance(value, str) else None
 
 
-def is_current(resource: MissionResource | FleetResource | AgentResource | AgentRunResource | ContextResource) -> bool:
+def is_current(
+    resource: (
+        MissionResource | FleetResource | AgentResource | AgentRunResource | ToolInvocationResource | ContextResource
+    ),
+) -> bool:
     return resource.status.observedGeneration == resource.metadata.generation
 
 
@@ -1058,6 +1068,319 @@ class LocalAgentRunWorker:
         return ReconcileResult("worker", changed)
 
 
+TOOL_INVOCATION_TERMINAL_PHASES = {"Succeeded", "Failed", "Denied", "TimedOut", "Cancelled"}
+
+
+class ToolInvocationController:
+    def __init__(self, store: ResourceStore, runtime_registry: ToolRuntimeRegistry | None = None) -> None:
+        self.store = store
+        self.policy_engine = PolicyEngine(store)
+        self.runtime_registry = runtime_registry or ToolRuntimeRegistry()
+
+    async def reconcile_once(self) -> ReconcileResult:
+        changed = 0
+        for manifest in self.store.list(ResourceKind.TOOL_INVOCATION):
+            invocation = parse_resource(manifest)
+            if not isinstance(invocation, ToolInvocationResource):
+                continue
+            if invocation.status.phase in TOOL_INVOCATION_TERMINAL_PHASES:
+                continue
+            if invocation.status.phase == "Running":
+                self._fail_running_replay(invocation)
+                changed += 1
+                continue
+            if self._pending_approval(invocation):
+                continue
+            if self._reconcile_invocation(invocation):
+                changed += 1
+        return ReconcileResult("tool-invocation", changed)
+
+    def _reconcile_invocation(self, invocation: ToolInvocationResource) -> bool:
+        try:
+            run = self._agent_run(invocation)
+            agent = self._agent(run)
+            self._validate_tool_contract(invocation)
+            action = self._runtime_action(invocation, run, agent)
+            decision = self.policy_engine.authorize(action)
+        except ApprovalRequired as exc:
+            self._mark_waiting_for_approval(invocation, exc.approval_id)
+            return True
+        except PolicyDenied as exc:
+            run = self._agent_run(invocation)
+            observation = self._error_observation("PolicyDenied", exc.reason)
+            self._set_status(
+                invocation,
+                run,
+                "Denied",
+                "ToolInvocation denied by Policy",
+                "ToolInvocationDenied",
+                {"policyDecision": "Deny", "reason": exc.reason},
+                observation=observation,
+            )
+            self._record_observation(invocation, run, observation)
+            return True
+        except Exception as exc:
+            run = self._agent_run(invocation)
+            observation = self._error_observation("ToolInvocationFailed", str(exc))
+            self._set_status(
+                invocation,
+                run,
+                "Failed",
+                str(exc),
+                "ToolInvocationFailed",
+                {"error": str(exc)},
+                observation=observation,
+            )
+            self._record_observation(invocation, run, observation)
+            return True
+
+        try:
+            runtime = self.runtime_registry.resolve(invocation)
+        except ToolRuntimeError as exc:
+            observation = self._error_observation("ToolRuntimeError", str(exc))
+            self._set_status(
+                invocation,
+                run,
+                "Failed",
+                str(exc),
+                "ToolInvocationFailed",
+                {"error": str(exc)},
+                observation=observation,
+            )
+            self._record_observation(invocation, run, observation)
+            return True
+        runtime_id = runtime.runtime_id
+        self._set_status(
+            invocation,
+            run,
+            "Authorized",
+            "ToolInvocation authorized by Policy",
+            "ToolInvocationAuthorized",
+            {
+                "runtime": runtime_id,
+                "policyDecision": decision.effect.value,
+                "policy": decision.policy_name,
+                "ruleIndex": decision.rule_index,
+            },
+        )
+        self._set_status(
+            invocation,
+            run,
+            "Running",
+            "ToolInvocation execution started",
+            "ToolInvocationStarted",
+            {"runtime": runtime_id},
+        )
+        try:
+            observation = runtime.execute(invocation)
+        except ToolRuntimeError as exc:
+            observation = self._error_observation("ToolRuntimeError", str(exc))
+            self._set_status(
+                invocation,
+                run,
+                "Failed",
+                str(exc),
+                "ToolInvocationFailed",
+                {"runtime": runtime_id, "error": str(exc)},
+                observation=observation,
+            )
+            self._record_observation(invocation, run, observation)
+            return True
+        except Exception as exc:
+            observation = self._error_observation("ToolRuntimeError", str(exc))
+            self._set_status(
+                invocation,
+                run,
+                "Failed",
+                str(exc),
+                "ToolInvocationFailed",
+                {"runtime": runtime_id, "error": str(exc)},
+                observation=observation,
+            )
+            self._record_observation(invocation, run, observation)
+            return True
+
+        self._set_status(
+            invocation,
+            run,
+            "Succeeded",
+            "ToolInvocation completed successfully",
+            "ToolInvocationCompleted",
+            {"runtime": runtime_id},
+            observation=observation,
+        )
+        self._record_observation(invocation, run, observation)
+        return True
+
+    def _pending_approval(self, invocation: ToolInvocationResource) -> bool:
+        if invocation.status.phase != "WaitingForApproval":
+            return False
+        approval_id = invocation.status.data.get("approvalId") or invocation.status.data.get("approval")
+        if not isinstance(approval_id, str):
+            return False
+        approval = self.store.get(ResourceKind.APPROVAL, approval_id)
+        return bool(approval and (approval.get("status") or {}).get("phase") == "Pending")
+
+    def _mark_waiting_for_approval(self, invocation: ToolInvocationResource, approval_id: str) -> None:
+        run = self._agent_run(invocation)
+        if invocation.status.phase == "WaitingForApproval":
+            return
+        self._set_status(
+            invocation,
+            run,
+            "WaitingForApproval",
+            f"ToolInvocation waiting for approval {approval_id}",
+            "ToolInvocationWaitingForApproval",
+            {"approval": approval_id, "approvalId": approval_id, "policyDecision": "RequireApproval"},
+        )
+
+    def _validate_tool_contract(self, invocation: ToolInvocationResource) -> None:
+        manifest = self.store.get(ResourceKind.TOOL, invocation.spec.tool)
+        if manifest is None:
+            raise ReconcileError(f"Tool {invocation.spec.tool} not found")
+
+        tool = parse_resource(manifest)
+        if not isinstance(tool, ToolResource):
+            raise ReconcileError(f"Tool {invocation.spec.tool} could not be loaded")
+        operations = [operation.name for operation in tool.spec.operations]
+        if not operations:
+            raise ReconcileError(f"Tool {tool.metadata.name} does not define supported operations")
+        if invocation.spec.operation not in operations:
+            raise ReconcileError(f"Tool {tool.metadata.name} does not support operation {invocation.spec.operation}")
+
+    def _fail_running_replay(self, invocation: ToolInvocationResource) -> None:
+        run = self._agent_run(invocation)
+        message = "ToolInvocation was already Running; refusing to replay execution"
+        observation = self._error_observation("ExecutionStateUnknown", message)
+        self._set_status(
+            invocation,
+            run,
+            "Failed",
+            message,
+            "ToolInvocationFailed",
+            {"error": message},
+            observation=observation,
+        )
+        self._record_observation(invocation, run, observation)
+
+    def _runtime_action(
+        self,
+        invocation: ToolInvocationResource,
+        run: AgentRunResource,
+        agent: AgentResource,
+    ) -> RuntimeAction:
+        return RuntimeAction(
+            tool=invocation.spec.tool,
+            operation=invocation.spec.operation,
+            details={
+                "toolInvocation": invocation.metadata.name,
+                "arguments": invocation.spec.arguments,
+            },
+            workspace=invocation.metadata.namespace,
+            mission=run.spec.missionRef.name,
+            agent=agent.metadata.name,
+            agentRun=run.metadata.name,
+            correlation_id=resource_correlation_id(invocation) or resource_correlation_id(run),
+        )
+
+    def _set_status(
+        self,
+        invocation: ToolInvocationResource,
+        run: AgentRunResource,
+        phase: str,
+        message: str,
+        event_type: str,
+        data: dict[str, Any],
+        *,
+        observation: Observation | None = None,
+    ) -> None:
+        self.store.update_status(
+            ResourceKind.TOOL_INVOCATION,
+            invocation.metadata.name,
+            invocation.metadata.namespace,
+            phase,
+            message,
+            {**self._event_payload(invocation, run), **data},
+            event_type=event_type,
+            event_context=self._context(invocation, run, event_type, phase),
+            observation=observation,
+        )
+
+    def _record_observation(
+        self,
+        invocation: ToolInvocationResource,
+        run: AgentRunResource,
+        observation: Observation,
+    ) -> None:
+        self.store.emit_event(
+            "ObservationRecorded",
+            ResourceKind.TOOL_INVOCATION,
+            invocation.metadata.name,
+            invocation.metadata.namespace,
+            f"Observation recorded for ToolInvocation {invocation.metadata.name}",
+            {
+                **self._event_payload(invocation, run),
+                "observation": observation.model_dump(mode="json", exclude_none=True, exclude_defaults=True),
+                "summary": observation.summary,
+            },
+            event_context=self._context(invocation, run, "RecordObservation", "ObservationRecorded"),
+        )
+
+    def _event_payload(self, invocation: ToolInvocationResource, run: AgentRunResource) -> dict[str, Any]:
+        return {
+            "workspace": invocation.metadata.namespace,
+            "agentRun": run.metadata.name,
+            "toolInvocation": invocation.metadata.name,
+            "tool": invocation.spec.tool,
+            "operation": invocation.spec.operation,
+        }
+
+    def _context(
+        self,
+        invocation: ToolInvocationResource,
+        run: AgentRunResource,
+        action: str,
+        reason: str,
+    ) -> EventContext:
+        return EventContext(
+            controller="ToolInvocationController",
+            action=action,
+            reason=reason,
+            correlation_id=resource_correlation_id(invocation) or resource_correlation_id(run),
+            workspace=invocation.metadata.namespace,
+            mission=run.spec.missionRef.name,
+        )
+
+    def _agent_run(self, invocation: ToolInvocationResource) -> AgentRunResource:
+        manifest = self.store.get(
+            ResourceKind.AGENT_RUN,
+            invocation.spec.agentRunRef.name,
+            invocation.metadata.namespace,
+        )
+        if manifest is None:
+            raise ReconcileError(f"AgentRun {invocation.spec.agentRunRef.name} not found")
+        run = parse_resource(manifest)
+        if not isinstance(run, AgentRunResource):
+            raise TypeError(f"expected AgentRunResource, got {type(run).__name__}")
+        return run
+
+    def _agent(self, run: AgentRunResource) -> AgentResource:
+        manifest = self.store.get(ResourceKind.AGENT, run.spec.agentRef.name, run.metadata.namespace)
+        if manifest is None:
+            raise ReconcileError(f"Agent {run.spec.agentRef.name} not found")
+        agent = parse_resource(manifest)
+        if not isinstance(agent, AgentResource):
+            raise TypeError(f"expected AgentResource, got {type(agent).__name__}")
+        return agent
+
+    @staticmethod
+    def _error_observation(reason: str, message: str) -> Observation:
+        return Observation(
+            summary=message,
+            error=ObservationError(reason=reason, message=message),
+        )
+
+
 class ControlPlane:
     def __init__(self, store: ResourceStore) -> None:
         self.store = store
@@ -1067,6 +1390,7 @@ class ControlPlane:
         self.knowledge_indexes = KnowledgeIndexController(store)
         self.contexts = ContextController(store)
         self.agent_runs = AgentRunController(store)
+        self.tool_invocations = ToolInvocationController(store)
         self.worker = LocalAgentRunWorker(store)
 
     async def reconcile_once(self) -> list[ReconcileResult]:
@@ -1077,7 +1401,9 @@ class ControlPlane:
             await self.knowledge_indexes.reconcile_once(),
             await self.contexts.reconcile_once(),
             await self.agent_runs.reconcile_once(),
+            await self.tool_invocations.reconcile_once(),
             await self.worker.reconcile_once(),
+            await self.tool_invocations.reconcile_once(),
             await self.agents.reconcile_once(),
             await self.fleets.reconcile_once(),
             await self.missions.reconcile_once(),

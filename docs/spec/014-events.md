@@ -19,7 +19,8 @@ change resource semantics.
 
 Events SHOULD include correlation identifiers that connect Platform, Workspace,
 Mission, Fleet, Agent, AgentRun, Context, Approval, Model, Tool,
-ToolInvocation, Observation, and Artifact activity for the same unit of work.
+Decision, ToolInvocation, embedded Observation data, and Artifact activity for
+the same unit of work.
 
 Correlation identifiers MUST be stable across controller, scheduler, runtime,
 and provider boundaries when propagated.
@@ -71,11 +72,19 @@ The event taxonomy SHOULD include resource applied, reconciliation started,
 reconciliation completed, admission rejected, template selected, capability
 resolved, model selected, context built, AgentRun scheduled, AgentRun started,
 policy evaluated, approval requested, approval granted, approval rejected, model
-invoked, ToolInvocation requested, ToolInvocation validated, ToolInvocation
-authorized, ToolInvocation denied, ToolInvocation waiting for approval,
-ToolInvocation started, ToolInvocation completed, ToolInvocation failed,
-ToolInvocation timed out, ToolInvocation cancelled, Observation recorded,
-artifact ready, completed, waiting, and failed.
+invoked, ToolInvocation created, ToolInvocation authorized, ToolInvocation
+denied, ToolInvocation waiting for approval, ToolInvocation started,
+ToolInvocation completed, ToolInvocation failed, ToolInvocation timed out,
+ToolInvocation cancelled, Observation recorded, artifact ready, completed,
+waiting, and failed. Decision-related event types SHOULD include
+DecisionProduced, DecisionValidated, DecisionRejected, and DecisionExecuted.
+Implementations MAY add separate ToolInvocation requested or validated events
+when they expose those lifecycle states.
+
+Decision events SHOULD include correlation identifier, AgentRun, Decision type,
+Decision version, iteration number when available, Model and Pilot identity when
+available, and rejection reason when applicable. Sensitive Decision payload data
+MUST be redacted according to Policy.
 
 ToolInvocation events MUST include correlation identifier, Workspace, AgentRun,
 ToolInvocation, Tool, operation, and runtime or provider actor. Sensitive
@@ -84,9 +93,10 @@ arguments and output MUST be redacted according to Policy.
 ## Trace Semantics
 
 Trace projections MUST be able to reconstruct the execution path for a Mission
-or AgentRun from resources and events. For tool-executing AgentRuns, trace MUST
-show each ToolInvocation, policy decision, execution phase, result, Observation,
-and related Artifacts.
+or AgentRun from resources and events. For Decision-driven AgentRuns, trace MUST
+distinguish Model intent from platform execution by showing each Decision,
+resulting ToolInvocation or Artifact, policy decision, execution phase, result,
+embedded Observation, and related Artifacts.
 
 Trace output MUST distinguish missing data from redacted data. Redaction MUST be
 driven by Policy and MUST NOT remove the fact that a ToolInvocation occurred.

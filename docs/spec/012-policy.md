@@ -34,6 +34,8 @@ equivalent conditions.
 Policy evaluation MUST be deterministic for the same inputs. Evaluation inputs
 SHOULD include Workspace, Mission, Fleet, Agent, AgentRun, action type, tool,
 provider, requested operation, resource references, actor, and correlation data.
+When an action is derived from a Decision, evaluation inputs SHOULD include
+Decision type, Decision version, and redacted Decision metadata when available.
 
 Policy evaluation MUST emit events for material decisions.
 

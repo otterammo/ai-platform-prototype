@@ -1,8 +1,8 @@
-# Platform Specification v1.1.0
+# Platform Specification v1.2.0
 
 ## Purpose
 
-This specification defines the v1.1.0 architecture and behavioral contracts for
+This specification defines the v1.2.0 architecture and behavioral contracts for
 the AI Platform. It is the normative source of truth for resources,
 controllers, runtimes, APIs, command-line tools, and extensions that claim
 compatibility with `ai.platform/v1`.
@@ -42,6 +42,15 @@ the incidental limits of any single system.
 The specification index is maintained in [README.md](README.md). Versioning
 rules for the Platform Specification and resource APIs are defined in
 [Versioning](020-versioning.md).
+
+## Foundational Protocols
+
+The platform has three foundational protocols:
+
+- Declarative Resources define desired and observed platform state.
+- Events define immutable lifecycle and audit history.
+- Decisions define provider-neutral Model intent interpreted by the Execution
+  Engine.
 
 ## Platform Goals
 

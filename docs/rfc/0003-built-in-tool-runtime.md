@@ -21,9 +21,9 @@ operations without introducing arbitrary plugin loading.
 
 ## Background
 
-RFC-0001 defines ToolInvocation, Observation, Tool contracts, and the runtime
-interface for executing one tool operation. RFC-0003 defines the first built-in
-Tool contracts that can satisfy that interface.
+RFC-0001 defines ToolInvocation, embedded Observation data, Tool contracts, and
+the runtime interface for executing one tool operation. RFC-0003 defines the
+first built-in Tool contracts that can satisfy that interface.
 
 ## Goals
 
@@ -35,9 +35,9 @@ Tool contracts that can satisfy that interface.
 
 ## Non-Goals
 
-This RFC does not define Pilot loop behavior, structured Model protocol,
-browser automation, GUI automation, remote repository pushes, package manager
-policy, or arbitrary plugin loading.
+This RFC does not define Execution Engine loop behavior, structured Model
+protocol, browser automation, GUI automation, remote repository pushes, package
+manager policy, or arbitrary plugin loading.
 
 ## Proposed Design
 

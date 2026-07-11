@@ -9,10 +9,16 @@ Use [template.md](template.md) for new RFCs.
 ## RFCs
 
 - [RFC-0001: Tool Invocation Framework](0001-tool-invocation-framework.md)
-- [RFC-0002: Pilot Execution Loop](0002-pilot-execution-loop.md)
+  - Implemented in Platform Specification `v1.1.0` by
+    [PR #12](https://github.com/otterammo/ai-platform-prototype/pull/12).
+- [RFC-0002: AgentRun Execution Engine Loop](0002-agentrun-execution-engine-loop.md)
+  - Draft; architecture review recommends revision before acceptance.
 - [RFC-0003: Built-In Tool Runtime](0003-built-in-tool-runtime.md)
+  - Draft.
 - [RFC-0004: Structured Model Protocol](0004-structured-model-protocol.md)
+  - Draft.
 - [RFC-0005: Multi-Turn Agent Runtime](0005-multi-turn-agent-runtime.md)
+  - Draft.
 
 ## Statuses
 

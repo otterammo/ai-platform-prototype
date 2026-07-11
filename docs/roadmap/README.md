@@ -4,6 +4,17 @@ The AI Platform roadmap is organized by capability milestones, not dates.
 Milestones describe what must become true before the platform advances in
 maturity.
 
+## Current Progress
+
+| Area | Status | Notes |
+| --- | --- | --- |
+| Foundation | Complete | Specification, RFC, ADR, roadmap, contributing, and review docs exist. |
+| RFC-0001 Tool Invocation Framework | Complete | Implemented in Platform Specification `v1.1.0` by [PR #12](https://github.com/otterammo/ai-platform-prototype/pull/12). |
+| RFC-0002 AgentRun Execution Engine Loop | Needs revision | Draft reviewed on 2026-07-11; do not implement before specification updates. |
+| Decision protocol | Specified | Platform Specification `v1.2.0` defines Decision as the Model-to-Execution Engine protocol. |
+| ToolInvocation resource contract | Complete | ToolInvocation is a Workspace-scoped AgentRun child with immutable spec, policy authorization, runtime execution, events, and trace projection. |
+| Observation model | Complete for v1.1 | Observation data is embedded in `ToolInvocation.status.observation` and projected through CLI, API, events, and trace. |
+
 ## Foundation
 
 Goals:
@@ -22,6 +33,8 @@ Exit criteria:
 
 - Specification, RFC, ADR, roadmap, contributing, and review docs exist.
 - Future significant work has a documented lifecycle.
+
+Status: Complete.
 
 ## Control Plane
 
@@ -77,6 +90,12 @@ Exit criteria:
 - AgentRun execution has clear retry, approval, artifact, and event semantics.
 - Runtime remains isolated from reconciliation and admission.
 
+Progress:
+
+- RFC-0001 added the first governed ToolInvocation execution slice.
+- RFC-0002 must be revised and specified before iterative AgentRun execution
+  begins.
+
 ## Distributed Runtime
 
 Goals:
@@ -128,6 +147,11 @@ Exit criteria:
 - Tool providers can be registered, invoked, governed, and observed through
   platform contracts.
 - Tool results can produce events and artifacts with provenance.
+
+Progress:
+
+- RFC-0001 is complete for the framework-level contract.
+- RFC-0003 remains Draft for built-in filesystem, git, and shell Tool Runtimes.
 
 ## Multi-Tenancy
 

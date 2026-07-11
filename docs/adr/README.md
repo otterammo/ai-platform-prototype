@@ -13,6 +13,9 @@ Use [template.md](template.md) for new ADRs.
 - [ADR 0003: Knowledge Index Architecture](0003-knowledge-index-architecture.md)
 - [ADR 0004: Policy Engine](0004-policy-engine.md)
 - [ADR 0005: Pilot Abstraction](0005-pilot-abstraction.md)
+- [ADR 0006: ToolInvocation Boundary](0006-tool-invocation-boundary.md)
+- [ADR 0007: Embedded Observations In v1.1](0007-embedded-observations-v1-1.md)
+- [ADR 0008: Decision Protocol Boundary](0008-decision-protocol-boundary.md)
 
 ## Statuses
 

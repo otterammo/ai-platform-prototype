@@ -3,10 +3,11 @@
 ## Purpose
 
 Pilot defines how an Agent reasons, prompts, routes model calls, handles
-fallback, and may orchestrate multiple models. Pilot is a platform concept owned
-by Agent configuration. It is not the same as Model.
+fallback, parses model responses, and produces Decisions. Pilot is a platform
+concept owned by Agent configuration. It is not the same as Model.
 
 Pilot MUST remain independent of any specific model provider.
+Pilot MUST NOT execute Decisions or create Resources.
 
 ## Relationship To Agent
 
@@ -35,6 +36,16 @@ is presented to the model.
 
 Runtime MAY render prompts according to the Pilot strategy after it receives a
 scheduled AgentRun and ready Context. Controllers MUST NOT build runtime prompts.
+
+## Decision Production
+
+Pilot owns provider adaptation and response parsing. It MUST adapt provider
+output into the platform Decision protocol before the Execution Engine
+interprets it.
+
+Pilot MUST NOT treat provider-native tool calls as platform actions. Provider
+native output is input to Decision production; the Execution Engine owns
+Decision validation and interpretation.
 
 ## Reasoning Configuration
 

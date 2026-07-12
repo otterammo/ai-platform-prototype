@@ -354,6 +354,9 @@ class GitToolRuntime(WorkspaceToolRuntime):
     def execute(self, invocation: ToolInvocationResource) -> Observation:
         try:
             workspace_root = self._workspace_root(invocation)
+            repo_error = self._workspace_repo_error(workspace_root, invocation)
+            if repo_error is not None:
+                return repo_error
             operation = invocation.spec.operation
             if operation == "status":
                 return self._status(workspace_root, invocation)
@@ -454,6 +457,64 @@ class GitToolRuntime(WorkspaceToolRuntime):
             payload={"current": str(current.payload.get("stdout", "")).strip(), "branches": branch_names},
         )
 
+    def _workspace_repo_error(self, workspace_root: Path, invocation: ToolInvocationResource) -> Observation | None:
+        command = ["git", "rev-parse", "--show-toplevel"]
+        timeout_seconds = invocation.spec.timeoutSeconds
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=workspace_root,
+                env=self._git_env(workspace_root),
+                text=True,
+                capture_output=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            timeout_payload: dict[str, Any] = {
+                "command": command,
+                "stdout": self._output_text(exc.stdout),
+                "stderr": self._output_text(exc.stderr),
+                "exitCode": None,
+                "timedOut": True,
+            }
+            return Observation(
+                summary="Git repository check timed out",
+                payload=timeout_payload,
+                error=ObservationError(
+                    reason="GitRepositoryCheckTimedOut",
+                    message="Git repository check timed out",
+                ),
+            )
+        check_payload: dict[str, Any] = {
+            "command": command,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "exitCode": completed.returncode,
+            "timedOut": False,
+        }
+        if completed.returncode != 0:
+            message = "Workspace root is not a Git repository"
+            return Observation(
+                summary=message,
+                payload=check_payload,
+                error=ObservationError(reason="GitRepositoryInvalid", message=message),
+            )
+        top_level_text = completed.stdout.strip()
+        top_level = Path(top_level_text).expanduser().resolve(strict=False)
+        if top_level != workspace_root:
+            message = "Git repository top-level must match workspace root"
+            return Observation(
+                summary=message,
+                payload={
+                    **check_payload,
+                    "workspaceRoot": str(workspace_root),
+                    "gitTopLevel": str(top_level),
+                },
+                error=ObservationError(reason="GitRepositoryEscaped", message=message),
+            )
+        return None
+
     def _run_git(
         self,
         workspace_root: Path,
@@ -463,18 +524,11 @@ class GitToolRuntime(WorkspaceToolRuntime):
         success_summary: str = "Git command completed",
     ) -> Observation:
         timeout_seconds = invocation.spec.timeoutSeconds
-        env = {
-            **os.environ,
-            "GIT_AUTHOR_NAME": "AI Platform",
-            "GIT_AUTHOR_EMAIL": "ai-platform@example.invalid",
-            "GIT_COMMITTER_NAME": "AI Platform",
-            "GIT_COMMITTER_EMAIL": "ai-platform@example.invalid",
-        }
         try:
             completed = subprocess.run(
                 command,
                 cwd=workspace_root,
-                env=env,
+                env=self._git_env(workspace_root),
                 text=True,
                 capture_output=True,
                 timeout=timeout_seconds,
@@ -509,6 +563,17 @@ class GitToolRuntime(WorkspaceToolRuntime):
             )
         return Observation(summary=success_summary, payload=command_payload)
 
+    @staticmethod
+    def _git_env(workspace_root: Path) -> dict[str, str]:
+        return {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "AI Platform",
+            "GIT_AUTHOR_EMAIL": "ai-platform@example.invalid",
+            "GIT_COMMITTER_NAME": "AI Platform",
+            "GIT_COMMITTER_EMAIL": "ai-platform@example.invalid",
+            "GIT_CEILING_DIRECTORIES": str(workspace_root.parent),
+        }
+
 
 class ShellToolRuntime(WorkspaceToolRuntime):
     runtime_id = "builtin.shell"
@@ -524,16 +589,10 @@ class ShellToolRuntime(WorkspaceToolRuntime):
             workspace_root = self._workspace_root(invocation)
             config = self._tool_config(invocation)
             argv = self._argv(invocation.spec.arguments)
-            command_name = Path(argv[0]).name
             allowed_commands = config.get("allowedCommands") or []
             if not isinstance(allowed_commands, list) or any(not isinstance(item, str) for item in allowed_commands):
                 raise ToolOperationError("InvalidConfiguration", "allowedCommands must be an array of strings")
-            if command_name not in allowed_commands:
-                raise ToolOperationError(
-                    "CommandDenied",
-                    f"command is not allowlisted: {command_name}",
-                    {"command": argv, "allowedCommands": allowed_commands},
-                )
+            self._validate_allowed_command(argv[0], allowed_commands)
             cwd, cwd_display = self._resolve_path(
                 workspace_root,
                 invocation.spec.arguments.get("cwd", "."),
@@ -564,6 +623,25 @@ class ShellToolRuntime(WorkspaceToolRuntime):
         if isinstance(raw_command, str) and raw_command.strip():
             return shlex.split(raw_command)
         raise ToolOperationError("InvalidCommand", "shell execute requires argv or command")
+
+    @staticmethod
+    def _validate_allowed_command(executable: str, allowed_commands: list[str]) -> None:
+        executable_path = Path(executable)
+        is_path_qualified = executable_path.name != executable or executable_path.is_absolute()
+        if is_path_qualified:
+            if executable not in allowed_commands:
+                raise ToolOperationError(
+                    "CommandDenied",
+                    f"command path is not exactly allowlisted: {executable}",
+                    {"command": [executable], "allowedCommands": allowed_commands},
+                )
+            return
+        if executable not in allowed_commands:
+            raise ToolOperationError(
+                "CommandDenied",
+                f"command is not allowlisted: {executable}",
+                {"command": [executable], "allowedCommands": allowed_commands},
+            )
 
     def _run_command(
         self,

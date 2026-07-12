@@ -737,18 +737,41 @@ def test_git_runtime_failure_case_is_structured(tmp_path: Path) -> None:
     failed = apply_invocation(store, "git", "status", {}, "git-not-repo")
 
     assert failed["status"]["phase"] == "Succeeded"
-    assert failed["status"]["observation"]["error"]["reason"] == "GitCommandFailed"
+    assert failed["status"]["observation"]["error"]["reason"] == "GitRepositoryInvalid"
     assert failed["status"]["observation"]["payload"]["exitCode"] != 0
+
+
+def test_git_runtime_rejects_parent_repository_discovery(tmp_path: Path) -> None:
+    parent_root = tmp_path / "parent"
+    parent_root.mkdir()
+    run_git(parent_root, "init")
+    (parent_root / "outside.txt").write_text("outside", encoding="utf-8")
+    run_git(parent_root, "add", "outside.txt")
+    run_git(parent_root, "commit", "-m", "docs: seed parent")
+    workspace_root = parent_root / "workspace"
+    workspace_root.mkdir()
+    store = make_builtin_store(
+        tmp_path,
+        workspace_root,
+        builtin_tool("git", ["status"]),
+        [{"match": {"tool": "git"}, "allow": True}],
+    )
+
+    failed = apply_invocation(store, "git", "status", {}, "git-parent-repo")
+
+    assert failed["status"]["phase"] == "Succeeded"
+    assert failed["status"]["observation"]["error"]["reason"] == "GitRepositoryInvalid"
+    assert failed["status"]["observation"]["payload"]["exitCode"] != 0
+    assert "outside.txt" not in failed["status"]["observation"]["payload"]["stdout"]
 
 
 def test_shell_runtime_success_timeout_nonzero_and_denied_command(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
-    python_name = Path(sys.executable).name
     store = make_builtin_store(
         tmp_path,
         workspace_root,
-        builtin_tool("shell", ["execute"], {"allowedCommands": [python_name]}),
+        builtin_tool("shell", ["execute"], {"allowedCommands": [sys.executable]}),
         [{"match": {"tool": "shell"}, "allow": True}],
     )
 
@@ -797,6 +820,32 @@ def test_shell_runtime_success_timeout_nonzero_and_denied_command(tmp_path: Path
     assert nonzero["status"]["observation"]["error"]["reason"] == "CommandFailed"
     assert nonzero["status"]["observation"]["payload"]["exitCode"] == 7
     assert denied["status"]["observation"]["error"]["reason"] == "CommandDenied"
+
+
+def test_shell_runtime_rejects_path_qualified_command_unless_exactly_allowed(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    executable = workspace_root / "echo"
+    executable.write_text("#!/bin/sh\necho unsafe\n", encoding="utf-8")
+    executable.chmod(0o755)
+    store = make_builtin_store(
+        tmp_path,
+        workspace_root,
+        builtin_tool("shell", ["execute"], {"allowedCommands": ["echo"]}),
+        [{"match": {"tool": "shell"}, "allow": True}],
+    )
+
+    denied = apply_invocation(
+        store,
+        "shell",
+        "execute",
+        {"argv": ["./echo"]},
+        "shell-path-denied",
+    )
+
+    assert denied["status"]["phase"] == "Succeeded"
+    assert denied["status"]["observation"]["error"]["reason"] == "CommandDenied"
+    assert "unsafe" not in denied["status"]["observation"]["payload"].get("stdout", "")
 
 
 def test_tool_invocation_cli_lists_describes_and_projects_observations(tmp_path: Path, capsys) -> None:

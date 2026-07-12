@@ -1084,7 +1084,7 @@ class ToolInvocationController:
     def __init__(self, store: ResourceStore, runtime_registry: ToolRuntimeRegistry | None = None) -> None:
         self.store = store
         self.policy_engine = PolicyEngine(store)
-        self.runtime_registry = runtime_registry or ToolRuntimeRegistry()
+        self.runtime_registry = runtime_registry or ToolRuntimeRegistry(store=store)
 
     async def reconcile_once(self) -> ReconcileResult:
         changed = 0

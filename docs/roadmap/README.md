@@ -12,6 +12,7 @@ maturity.
 | RFC-0001 Tool Invocation Framework | Complete | Implemented in Platform Specification `v1.1.0` by [PR #12](https://github.com/otterammo/ai-platform-prototype/pull/12). |
 | RFC-0002 AgentRun Execution Engine Loop | Complete | Implemented in Platform Specification `v1.3.0` by [PR #15](https://github.com/otterammo/ai-platform-prototype/pull/15). |
 | Decision and Model Protocol | Specified | Platform Specification `v1.2.0` introduced Decision, `v1.3.0` refined execution-loop handling, and `v1.4.0` defines Provider Adapter normalization. |
+| Platform kernel | Stable | Architecture discovery is paused after Platform Specification `v1.4.0`; validation now proceeds through implementation and dogfooding. |
 | ToolInvocation resource contract | Complete | ToolInvocation is a Workspace-scoped AgentRun child with immutable spec, policy authorization, runtime execution, events, and trace projection. |
 | Observation model | Complete for v1.1 | Observation data is embedded in `ToolInvocation.status.observation` and projected through CLI, API, events, and trace. |
 
@@ -154,7 +155,8 @@ Exit criteria:
 Progress:
 
 - RFC-0001 is complete for the framework-level contract.
-- RFC-0003 remains Draft for built-in filesystem, git, and shell Tool Runtimes.
+- RFC-0003 is implementing built-in filesystem, git, and shell Tool Runtimes.
+- RFC-0005 remains Draft and depends on RFC-0003 implementation feedback.
 
 ## Multi-Tenancy
 

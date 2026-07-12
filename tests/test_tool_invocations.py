@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -130,6 +133,124 @@ def make_store(tmp_path: Path, policy_rules: list[dict[str, Any]] | None = None)
     for manifest in base_manifests(policy_rules):
         store.apply(manifest)
     return store
+
+
+def make_builtin_store(
+    tmp_path: Path,
+    workspace_root: Path,
+    tool: dict[str, Any],
+    policy_rules: list[dict[str, Any]] | None = None,
+) -> ResourceStore:
+    store = ResourceStore(f"sqlite:///{tmp_path / 'platform.db'}", tmp_path / "platform")
+    tool_name = tool["metadata"]["name"]
+    for manifest in [
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Workspace",
+            "metadata": {"name": "demo"},
+            "spec": {"rootPath": str(workspace_root)},
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Mission",
+            "metadata": {"name": "runtime-check", "namespace": "demo"},
+            "spec": {"objective": "Validate runtime"},
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Fleet",
+            "metadata": {"name": "runtime-check-fleet", "namespace": "demo"},
+            "spec": {"workspace": "demo", "mission": "runtime-check"},
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Agent",
+            "metadata": {"name": "runtime-check-agent", "namespace": "demo"},
+            "spec": {
+                "workspace": "demo",
+                "mission": "runtime-check",
+                "fleet": "runtime-check-fleet",
+                "tools": [tool_name],
+            },
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "AgentRun",
+            "metadata": {"name": "run-1", "namespace": "demo"},
+            "spec": {
+                "agentRef": {"name": "runtime-check-agent"},
+                "missionRef": {"name": "runtime-check"},
+                "contextRef": {"name": "run-1-context"},
+            },
+        },
+        tool,
+    ]:
+        store.apply(manifest)
+    if policy_rules is not None:
+        store.apply(
+            {
+                "apiVersion": "ai.platform/v1",
+                "kind": "Policy",
+                "metadata": {"name": "default"},
+                "spec": {"rules": policy_rules},
+            }
+        )
+    return store
+
+
+def builtin_tool(name: str, operations: list[str], config: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "apiVersion": "ai.platform/v1",
+        "kind": "Tool",
+        "metadata": {"name": name},
+        "spec": {
+            "operations": operations,
+            **({"config": config} if config is not None else {}),
+        },
+    }
+
+
+def apply_invocation(
+    store: ResourceStore,
+    tool: str,
+    operation: str,
+    arguments: dict[str, Any],
+    name: str,
+) -> dict[str, Any]:
+    store.apply(
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "ToolInvocation",
+            "metadata": {"name": name, "namespace": "demo"},
+            "spec": {
+                "agentRunRef": {"name": "run-1"},
+                "tool": tool,
+                "operation": operation,
+                "arguments": arguments,
+            },
+        }
+    )
+    asyncio.run(ToolInvocationController(store).reconcile_once())
+    invocation = store.get(ResourceKind.TOOL_INVOCATION, name, "demo")
+    assert invocation is not None
+    return invocation
+
+
+def run_git(workspace_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=workspace_root,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.invalid",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        },
+        text=True,
+        capture_output=True,
+        check=True,
+    )
 
 
 def test_tool_invocation_and_tool_definition_parse() -> None:
@@ -459,6 +580,272 @@ def test_tool_invocation_runtime_timeout_marks_timed_out(tmp_path: Path) -> None
     }
     assert "ToolInvocationTimedOut" in event_types
     assert "ToolInvocationCompleted" not in event_types
+
+
+def test_filesystem_runtime_read_write_append_mkdir_list_exists_and_stat(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    store = make_builtin_store(
+        tmp_path,
+        workspace_root,
+        builtin_tool("filesystem", ["read", "write", "append", "mkdir", "list", "exists", "stat"]),
+        [{"match": {"tool": "filesystem"}, "allow": True}],
+    )
+
+    mkdir = apply_invocation(store, "filesystem", "mkdir", {"path": "docs"}, "fs-mkdir")
+    write = apply_invocation(
+        store,
+        "filesystem",
+        "write",
+        {"path": "docs/SUMMARY.md", "content": "one\n"},
+        "fs-write",
+    )
+    append = apply_invocation(
+        store,
+        "filesystem",
+        "append",
+        {"path": "docs/SUMMARY.md", "content": "two\n"},
+        "fs-append",
+    )
+    read = apply_invocation(store, "filesystem", "read", {"path": "docs/SUMMARY.md"}, "fs-read")
+    exists = apply_invocation(store, "filesystem", "exists", {"path": "docs/SUMMARY.md"}, "fs-exists")
+    stat = apply_invocation(store, "filesystem", "stat", {"path": "docs/SUMMARY.md"}, "fs-stat")
+    listed = apply_invocation(store, "filesystem", "list", {"path": "docs"}, "fs-list")
+
+    assert mkdir["status"]["phase"] == "Succeeded"
+    assert write["status"]["observation"]["payload"]["overwritten"] is False
+    assert append["status"]["observation"]["payload"]["created"] is False
+    assert read["status"]["observation"]["payload"]["content"] == "one\ntwo\n"
+    assert exists["status"]["observation"]["payload"] == {
+        "path": "docs/SUMMARY.md",
+        "exists": True,
+        "type": "file",
+    }
+    assert stat["status"]["observation"]["payload"]["permissions"]["readable"] is True
+    assert listed["status"]["observation"]["payload"]["entries"][0]["path"] == "docs/SUMMARY.md"
+
+
+def test_filesystem_runtime_reports_invalid_path_traversal_and_overwrite_errors(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    (workspace_root / "existing.txt").write_text("original", encoding="utf-8")
+    store = make_builtin_store(
+        tmp_path,
+        workspace_root,
+        builtin_tool("filesystem", ["read", "write"]),
+        [{"match": {"tool": "filesystem"}, "allow": True}],
+    )
+
+    invalid = apply_invocation(store, "filesystem", "read", {}, "fs-invalid")
+    traversal = apply_invocation(
+        store,
+        "filesystem",
+        "write",
+        {"path": "../escape.txt", "content": "nope"},
+        "fs-traversal",
+    )
+    overwrite = apply_invocation(
+        store,
+        "filesystem",
+        "write",
+        {"path": "existing.txt", "content": "changed", "overwrite": False},
+        "fs-overwrite",
+    )
+
+    assert invalid["status"]["observation"]["error"]["reason"] == "InvalidPath"
+    assert traversal["status"]["observation"]["error"]["reason"] == "PathTraversalDenied"
+    assert overwrite["status"]["observation"]["error"]["reason"] == "PathExists"
+    assert not (tmp_path / "escape.txt").exists()
+    assert (workspace_root / "existing.txt").read_text(encoding="utf-8") == "original"
+
+
+def test_filesystem_runtime_policy_denial_prevents_write(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    store = make_builtin_store(
+        tmp_path,
+        workspace_root,
+        builtin_tool("filesystem", ["write"]),
+        [{"match": {"tool": "filesystem", "operation": "write"}, "deny": True}],
+    )
+
+    denied = apply_invocation(
+        store,
+        "filesystem",
+        "write",
+        {"path": "denied.txt", "content": "nope"},
+        "fs-denied",
+    )
+
+    assert denied["status"]["phase"] == "Denied"
+    assert denied["status"]["observation"]["error"]["reason"] == "PolicyDenied"
+    assert not (workspace_root / "denied.txt").exists()
+    event_types = {
+        event["type"]
+        for event in store.list_events(namespace="demo", resource_kind=ResourceKind.TOOL_INVOCATION, limit=100)
+        if event["resourceName"] == "fs-denied"
+    }
+    assert "ToolInvocationDenied" in event_types
+    assert "ToolInvocationStarted" not in event_types
+
+
+def test_git_runtime_status_diff_add_commit_and_branch(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    run_git(workspace_root, "init")
+    (workspace_root / "README.md").write_text("# Demo\n", encoding="utf-8")
+    run_git(workspace_root, "add", "README.md")
+    run_git(workspace_root, "commit", "-m", "docs: seed readme")
+    store = make_builtin_store(
+        tmp_path,
+        workspace_root,
+        builtin_tool("git", ["status", "diff", "add", "commit", "branch"]),
+        [{"match": {"tool": "git"}, "allow": True}],
+    )
+
+    clean = apply_invocation(store, "git", "status", {}, "git-clean")
+    (workspace_root / "README.md").write_text("# Demo\n\nChanged.\n", encoding="utf-8")
+    modified = apply_invocation(store, "git", "status", {}, "git-modified")
+    diff = apply_invocation(store, "git", "diff", {"path": "README.md"}, "git-diff")
+    branch = apply_invocation(store, "git", "branch", {"name": "feature/runtime"}, "git-branch")
+    (workspace_root / "SUMMARY.md").write_text("# Summary\n", encoding="utf-8")
+    added = apply_invocation(store, "git", "add", {"paths": ["README.md", "SUMMARY.md"]}, "git-add")
+    commit = apply_invocation(store, "git", "commit", {"message": "docs: add summary"}, "git-commit")
+
+    assert clean["status"]["observation"]["payload"]["clean"] is True
+    assert any("README.md" in entry for entry in modified["status"]["observation"]["payload"]["entries"])
+    assert "+Changed." in diff["status"]["observation"]["payload"]["stdout"]
+    assert "feature/runtime" in branch["status"]["observation"]["payload"]["branches"]
+    assert added["status"]["observation"]["payload"]["paths"] == ["README.md", "SUMMARY.md"]
+    assert commit["status"]["observation"]["payload"]["commit"]
+    assert (
+        apply_invocation(store, "git", "status", {}, "git-final-status")["status"]["observation"]["payload"]["clean"]
+        is True
+    )
+
+
+def test_git_runtime_failure_case_is_structured(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    store = make_builtin_store(
+        tmp_path,
+        workspace_root,
+        builtin_tool("git", ["status"]),
+        [{"match": {"tool": "git"}, "allow": True}],
+    )
+
+    failed = apply_invocation(store, "git", "status", {}, "git-not-repo")
+
+    assert failed["status"]["phase"] == "Succeeded"
+    assert failed["status"]["observation"]["error"]["reason"] == "GitRepositoryInvalid"
+    assert failed["status"]["observation"]["payload"]["exitCode"] != 0
+
+
+def test_git_runtime_rejects_parent_repository_discovery(tmp_path: Path) -> None:
+    parent_root = tmp_path / "parent"
+    parent_root.mkdir()
+    run_git(parent_root, "init")
+    (parent_root / "outside.txt").write_text("outside", encoding="utf-8")
+    run_git(parent_root, "add", "outside.txt")
+    run_git(parent_root, "commit", "-m", "docs: seed parent")
+    workspace_root = parent_root / "workspace"
+    workspace_root.mkdir()
+    store = make_builtin_store(
+        tmp_path,
+        workspace_root,
+        builtin_tool("git", ["status"]),
+        [{"match": {"tool": "git"}, "allow": True}],
+    )
+
+    failed = apply_invocation(store, "git", "status", {}, "git-parent-repo")
+
+    assert failed["status"]["phase"] == "Succeeded"
+    assert failed["status"]["observation"]["error"]["reason"] == "GitRepositoryInvalid"
+    assert failed["status"]["observation"]["payload"]["exitCode"] != 0
+    assert "outside.txt" not in failed["status"]["observation"]["payload"]["stdout"]
+
+
+def test_shell_runtime_success_timeout_nonzero_and_denied_command(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    store = make_builtin_store(
+        tmp_path,
+        workspace_root,
+        builtin_tool("shell", ["execute"], {"allowedCommands": [sys.executable]}),
+        [{"match": {"tool": "shell"}, "allow": True}],
+    )
+
+    success = apply_invocation(
+        store,
+        "shell",
+        "execute",
+        {"argv": [sys.executable, "-c", "print('ok')"]},
+        "shell-success",
+    )
+    timeout = apply_invocation(
+        store,
+        "shell",
+        "execute",
+        {"argv": [sys.executable, "-c", "import time; time.sleep(0.2)"], "timeoutSeconds": 0.05},
+        "shell-timeout",
+    )
+    nonzero = apply_invocation(
+        store,
+        "shell",
+        "execute",
+        {"argv": [sys.executable, "-c", "import sys; sys.exit(7)"]},
+        "shell-nonzero",
+    )
+    denied_tmp_path = tmp_path / "denied"
+    denied_workspace_root = denied_tmp_path / "workspace"
+    denied_workspace_root.mkdir(parents=True)
+    denied_store = make_builtin_store(
+        denied_tmp_path,
+        denied_workspace_root,
+        builtin_tool("shell", ["execute"], {"allowedCommands": ["echo"]}),
+        [{"match": {"tool": "shell"}, "allow": True}],
+    )
+    denied = apply_invocation(
+        denied_store,
+        "shell",
+        "execute",
+        {"argv": [sys.executable, "-c", "print('nope')"]},
+        "shell-denied",
+    )
+
+    assert success["status"]["observation"]["payload"]["stdout"] == "ok\n"
+    assert success["status"]["observation"]["payload"]["exitCode"] == 0
+    assert timeout["status"]["observation"]["error"]["reason"] == "CommandTimedOut"
+    assert timeout["status"]["observation"]["payload"]["timedOut"] is True
+    assert nonzero["status"]["observation"]["error"]["reason"] == "CommandFailed"
+    assert nonzero["status"]["observation"]["payload"]["exitCode"] == 7
+    assert denied["status"]["observation"]["error"]["reason"] == "CommandDenied"
+
+
+def test_shell_runtime_rejects_path_qualified_command_unless_exactly_allowed(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    executable = workspace_root / "echo"
+    executable.write_text("#!/bin/sh\necho unsafe\n", encoding="utf-8")
+    executable.chmod(0o755)
+    store = make_builtin_store(
+        tmp_path,
+        workspace_root,
+        builtin_tool("shell", ["execute"], {"allowedCommands": ["echo"]}),
+        [{"match": {"tool": "shell"}, "allow": True}],
+    )
+
+    denied = apply_invocation(
+        store,
+        "shell",
+        "execute",
+        {"argv": ["./echo"]},
+        "shell-path-denied",
+    )
+
+    assert denied["status"]["phase"] == "Succeeded"
+    assert denied["status"]["observation"]["error"]["reason"] == "CommandDenied"
+    assert "unsafe" not in denied["status"]["observation"]["payload"].get("stdout", "")
 
 
 def test_tool_invocation_cli_lists_describes_and_projects_observations(tmp_path: Path, capsys) -> None:

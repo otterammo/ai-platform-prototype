@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -188,10 +190,37 @@ def run_resource(store: ResourceStore) -> Any:
     return parse_resource(manifest)
 
 
+def run_git_command(workspace_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=workspace_root,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.invalid",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        },
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+
 def runtime_with(
     store: ResourceStore, model: SequenceModel, registry: ToolRuntimeRegistry | None = None
 ) -> AgentRuntime:
     return AgentRuntime(store, model_client_factory=lambda _config, _store: model, tool_runtime_registry=registry)
+
+
+def invoke_tool_decision(tool: str, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "version": "v1",
+        "type": "invoke_tool",
+        "tool": tool,
+        "operation": operation,
+        "arguments": arguments,
+    }
 
 
 def test_execution_engine_successful_decision_tool_observation_complete_trace(tmp_path: Path) -> None:
@@ -221,6 +250,145 @@ def test_execution_engine_successful_decision_tool_observation_complete_trace(tm
     assert trace is not None
     trace_run = trace["fleets"][0]["agents"][0]["agentRuns"][0]
     assert trace_run["executionFrames"][0]["toolInvocation"] == "run-1-tool-1-0001-1"
+
+
+def test_execution_engine_dogfoods_filesystem_and_git_runtime(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    run_git_command(workspace_root, "init")
+    (workspace_root / "README.md").write_text("# Demo\n\nThis project validates runtime providers.\n", encoding="utf-8")
+    run_git_command(workspace_root, "add", "README.md")
+    run_git_command(workspace_root, "commit", "-m", "docs: seed readme")
+    store = ResourceStore(f"sqlite:///{tmp_path / 'platform.db'}", tmp_path / "platform")
+    for manifest in [
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Workspace",
+            "metadata": {"name": "demo"},
+            "spec": {"rootPath": str(workspace_root)},
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Mission",
+            "metadata": {"name": "runtime-dogfood", "namespace": "demo"},
+            "spec": {"objective": "Read README, write SUMMARY.md, and commit it"},
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Fleet",
+            "metadata": {"name": "runtime-dogfood-fleet", "namespace": "demo"},
+            "spec": {"workspace": "demo", "mission": "runtime-dogfood"},
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Agent",
+            "metadata": {"name": "runner", "namespace": "demo"},
+            "spec": {
+                "workspace": "demo",
+                "mission": "runtime-dogfood",
+                "fleet": "runtime-dogfood-fleet",
+                "tools": ["filesystem", "git"],
+            },
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "AgentRun",
+            "metadata": {"name": "run-1", "namespace": "demo"},
+            "spec": {
+                "agentRef": {"name": "runner"},
+                "missionRef": {"name": "runtime-dogfood"},
+                "contextRef": {"name": "run-1-context"},
+            },
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Context",
+            "metadata": {
+                "name": "run-1-context",
+                "namespace": "demo",
+                "ownerReferences": [{"kind": "AgentRun", "name": "run-1", "controller": True}],
+            },
+            "spec": {
+                "mission": "runtime-dogfood",
+                "agentRun": "run-1",
+                "query": "Dogfood runtime providers",
+                "knowledgeIndex": "default",
+            },
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Tool",
+            "metadata": {"name": "filesystem"},
+            "spec": {"operations": ["read", "write"], "timeoutSeconds": 5},
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Tool",
+            "metadata": {"name": "git"},
+            "spec": {"operations": ["add", "commit"], "timeoutSeconds": 5},
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Policy",
+            "metadata": {"name": "default"},
+            "spec": {
+                "rules": [
+                    {"match": {"tool": "model"}, "allow": True},
+                    {"match": {"tool": "filesystem"}, "allow": True},
+                    {"match": {"tool": "git"}, "allow": True},
+                ]
+            },
+        },
+    ]:
+        store.apply(manifest)
+    store.update_status(
+        ResourceKind.CONTEXT,
+        "run-1-context",
+        "demo",
+        "Ready",
+        "Context ready",
+        {"renderedContext": "Context:\nDogfood the real runtime providers", "chunkCount": 0, "sources": []},
+        event_type="ContextBuilt",
+    )
+    store.update_status(
+        ResourceKind.AGENT_RUN,
+        "run-1",
+        "demo",
+        "Scheduled",
+        "AgentRun scheduled for dogfood",
+        {"worker": "test"},
+        event_type="AgentRunScheduled",
+    )
+    model = SequenceModel(
+        [
+            invoke_tool_decision("filesystem", "read", {"path": "README.md"}),
+            invoke_tool_decision(
+                "filesystem",
+                "write",
+                {"path": "SUMMARY.md", "content": "# Summary\n\nRuntime providers can read and write files.\n"},
+            ),
+            invoke_tool_decision("git", "add", {"paths": ["SUMMARY.md"]}),
+            invoke_tool_decision("git", "commit", {"message": "docs: add runtime summary"}),
+            complete_decision("Dogfood workload completed"),
+        ]
+    )
+
+    asyncio.run(runtime_with(store, model).run(run_resource(store)))
+
+    run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    assert run is not None
+    assert run["status"]["phase"] == "Succeeded"
+    assert (workspace_root / "SUMMARY.md").read_text(encoding="utf-8").startswith("# Summary")
+    assert run_git_command(workspace_root, "log", "-1", "--pretty=%s").stdout.strip() == "docs: add runtime summary"
+    frames = run["status"]["data"]["executionFrames"]
+    assert [frame["decision"]["tool"] for frame in frames[:-1]] == ["filesystem", "filesystem", "git", "git"]
+    assert [frame["toolInvocationPhase"] for frame in frames[:-1]] == ["Succeeded"] * 4
+    trace = build_trace(store, "runtime-dogfood", "demo")
+    assert trace is not None
+    trace_run = trace["fleets"][0]["agents"][0]["agentRuns"][0]
+    assert len(trace_run["toolInvocations"]) == 4
+    event_types = {event["type"] for event in store.list_events(namespace="demo", limit=None)}
+    assert {"ToolInvocationAuthorized", "ToolInvocationCompleted", "ObservationRecorded"}.issubset(event_types)
 
 
 def test_completed_agentrun_does_not_resume_or_duplicate_tool_invocation(tmp_path: Path) -> None:

@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import shlex
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Protocol, TypeVar
@@ -50,6 +53,14 @@ class ToolRuntimeError(Exception):
     pass
 
 
+class ToolOperationError(Exception):
+    def __init__(self, reason: str, message: str, payload: dict[str, Any] | None = None) -> None:
+        self.reason = reason
+        self.message = message
+        self.payload = payload or {}
+        super().__init__(message)
+
+
 class ToolRuntime(Protocol):
     runtime_id: str
 
@@ -68,9 +79,665 @@ class FakeToolRuntime:
         )
 
 
+class WorkspaceToolRuntime:
+    def __init__(self, store: ResourceStore) -> None:
+        self.store = store
+
+    def _workspace(self, invocation: ToolInvocationResource) -> WorkspaceResource:
+        workspace_name = invocation.metadata.namespace
+        if workspace_name is None:
+            raise ToolRuntimeError("ToolInvocation must name a Workspace")
+        manifest = self.store.get(ResourceKind.WORKSPACE, workspace_name)
+        if manifest is None:
+            raise ToolRuntimeError(f"Workspace {workspace_name} not found")
+        workspace = parse_resource(manifest)
+        if not isinstance(workspace, WorkspaceResource):
+            raise TypeError(f"expected WorkspaceResource, got {type(workspace).__name__}")
+        return workspace
+
+    def _workspace_root(self, invocation: ToolInvocationResource) -> Path:
+        workspace = self._workspace(invocation)
+        return workspace.spec.resolved_root(self.store.platform_root, workspace.metadata.name).resolve(strict=False)
+
+    def _tool_config(self, invocation: ToolInvocationResource) -> dict[str, Any]:
+        manifest = self.store.get(ResourceKind.TOOL, invocation.spec.tool)
+        if manifest is None:
+            return {}
+        tool = parse_resource(manifest)
+        if not isinstance(tool, ToolResource):
+            return {}
+        return dict(tool.spec.config)
+
+    def _resolve_path(self, workspace_root: Path, raw_path: Any, *, allow_root: bool = False) -> tuple[Path, str]:
+        if not isinstance(raw_path, str):
+            raise ToolOperationError("InvalidPath", "path must be a string")
+        if not raw_path:
+            raise ToolOperationError("InvalidPath", "path must not be empty")
+        if "\\" in raw_path:
+            raise ToolOperationError("InvalidPath", "path must use slash separators")
+        if raw_path == ".":
+            if not allow_root:
+                raise ToolOperationError("InvalidPath", "path must identify a file or directory below workspace root")
+            relative_path = Path(".")
+        else:
+            parts = raw_path.split("/")
+            if any(part in {"", ".", ".."} for part in parts):
+                reason = "PathTraversalDenied" if ".." in parts else "InvalidPath"
+                raise ToolOperationError(reason, "path must be normalized and workspace-relative", {"path": raw_path})
+            relative_path = Path(raw_path)
+        if relative_path.is_absolute():
+            raise ToolOperationError("InvalidPath", "path must be workspace-relative", {"path": raw_path})
+        resolved = (workspace_root / relative_path).resolve(strict=False)
+        try:
+            resolved.relative_to(workspace_root)
+        except ValueError as exc:
+            raise ToolOperationError(
+                "PathTraversalDenied",
+                "path resolves outside workspace",
+                {"path": raw_path},
+            ) from exc
+        display_path = "." if relative_path == Path(".") else relative_path.as_posix()
+        return resolved, display_path
+
+    def _resolve_optional_paths(self, workspace_root: Path, arguments: dict[str, Any]) -> list[str]:
+        raw_paths = arguments.get("paths")
+        raw_path = arguments.get("path")
+        if raw_paths is None and raw_path is None:
+            return []
+        if raw_paths is None:
+            raw_paths = [raw_path]
+        if not isinstance(raw_paths, list) or not raw_paths:
+            raise ToolOperationError("InvalidPath", "paths must be a non-empty array")
+        paths: list[str] = []
+        for item in raw_paths:
+            _resolved, display_path = self._resolve_path(workspace_root, item)
+            paths.append(display_path)
+        return paths
+
+    @staticmethod
+    def _error_observation(error: ToolOperationError) -> Observation:
+        return Observation(
+            summary=error.message,
+            payload=error.payload,
+            error=ObservationError(reason=error.reason, message=error.message),
+        )
+
+    @staticmethod
+    def _os_error(reason: str, path: str, exc: OSError) -> Observation:
+        message = f"{reason}: {path}"
+        return Observation(
+            summary=message,
+            payload={"path": path, "errno": exc.errno},
+            error=ObservationError(reason=reason, message=message),
+        )
+
+    @staticmethod
+    def _output_text(value: str | bytes | None) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return value
+
+
+class FilesystemToolRuntime(WorkspaceToolRuntime):
+    runtime_id = "builtin.filesystem"
+
+    def execute(self, invocation: ToolInvocationResource) -> Observation:
+        try:
+            workspace_root = self._workspace_root(invocation)
+            operation = invocation.spec.operation
+            if operation == "read":
+                return self._read(workspace_root, invocation.spec.arguments)
+            if operation == "write":
+                return self._write(workspace_root, invocation.spec.arguments)
+            if operation == "append":
+                return self._append(workspace_root, invocation.spec.arguments)
+            if operation == "mkdir":
+                return self._mkdir(workspace_root, invocation.spec.arguments)
+            if operation == "list":
+                return self._list(workspace_root, invocation.spec.arguments)
+            if operation == "exists":
+                return self._exists(workspace_root, invocation.spec.arguments)
+            if operation == "stat":
+                return self._stat(workspace_root, invocation.spec.arguments)
+            raise ToolOperationError(
+                "UnsupportedOperation",
+                f"filesystem runtime cannot execute operation {operation}",
+                {"operation": operation},
+            )
+        except ToolOperationError as exc:
+            return self._error_observation(exc)
+
+    def _read(self, workspace_root: Path, arguments: dict[str, Any]) -> Observation:
+        path, display_path = self._resolve_path(workspace_root, arguments.get("path"))
+        if not path.exists():
+            raise ToolOperationError("PathNotFound", f"path not found: {display_path}", {"path": display_path})
+        if not path.is_file():
+            raise ToolOperationError("InvalidPath", f"path is not a file: {display_path}", {"path": display_path})
+        try:
+            content = path.read_text(encoding="utf-8")
+        except PermissionError as exc:
+            return self._os_error("PermissionDenied", display_path, exc)
+        return Observation(
+            summary=f"Read {display_path}",
+            payload={"path": display_path, "content": content, "bytes": len(content.encode("utf-8"))},
+        )
+
+    def _write(self, workspace_root: Path, arguments: dict[str, Any]) -> Observation:
+        path, display_path = self._resolve_path(workspace_root, arguments.get("path"))
+        content = arguments.get("content")
+        if not isinstance(content, str):
+            raise ToolOperationError("InvalidArguments", "content must be a string", {"path": display_path})
+        overwrite = arguments.get("overwrite", True)
+        if not isinstance(overwrite, bool):
+            raise ToolOperationError("InvalidArguments", "overwrite must be a boolean", {"path": display_path})
+        if path.exists() and path.is_dir():
+            raise ToolOperationError("InvalidPath", f"path is a directory: {display_path}", {"path": display_path})
+        if path.exists() and not overwrite:
+            raise ToolOperationError("PathExists", f"path already exists: {display_path}", {"path": display_path})
+        if not path.parent.exists():
+            raise ToolOperationError(
+                "PathNotFound",
+                f"parent directory not found: {Path(display_path).parent.as_posix()}",
+                {"path": display_path},
+            )
+        existed = path.exists()
+        try:
+            path.write_text(content, encoding="utf-8")
+        except PermissionError as exc:
+            return self._os_error("PermissionDenied", display_path, exc)
+        return Observation(
+            summary=f"Wrote {display_path}",
+            payload={
+                "path": display_path,
+                "bytes": len(content.encode("utf-8")),
+                "overwritten": existed,
+            },
+        )
+
+    def _append(self, workspace_root: Path, arguments: dict[str, Any]) -> Observation:
+        path, display_path = self._resolve_path(workspace_root, arguments.get("path"))
+        content = arguments.get("content")
+        if not isinstance(content, str):
+            raise ToolOperationError("InvalidArguments", "content must be a string", {"path": display_path})
+        if path.exists() and path.is_dir():
+            raise ToolOperationError("InvalidPath", f"path is a directory: {display_path}", {"path": display_path})
+        if not path.parent.exists():
+            raise ToolOperationError(
+                "PathNotFound",
+                f"parent directory not found: {Path(display_path).parent.as_posix()}",
+                {"path": display_path},
+            )
+        created = not path.exists()
+        try:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(content)
+        except PermissionError as exc:
+            return self._os_error("PermissionDenied", display_path, exc)
+        return Observation(
+            summary=f"Appended {display_path}",
+            payload={"path": display_path, "bytes": len(content.encode("utf-8")), "created": created},
+        )
+
+    def _mkdir(self, workspace_root: Path, arguments: dict[str, Any]) -> Observation:
+        path, display_path = self._resolve_path(workspace_root, arguments.get("path"))
+        parents = arguments.get("parents", True)
+        exist_ok = arguments.get("existOk", True)
+        if not isinstance(parents, bool) or not isinstance(exist_ok, bool):
+            raise ToolOperationError("InvalidArguments", "parents and existOk must be booleans", {"path": display_path})
+        try:
+            path.mkdir(parents=parents, exist_ok=exist_ok)
+        except FileExistsError as exc:
+            return self._os_error("PathExists", display_path, exc)
+        except PermissionError as exc:
+            return self._os_error("PermissionDenied", display_path, exc)
+        return Observation(summary=f"Created directory {display_path}", payload={"path": display_path})
+
+    def _list(self, workspace_root: Path, arguments: dict[str, Any]) -> Observation:
+        path, display_path = self._resolve_path(workspace_root, arguments.get("path", "."), allow_root=True)
+        if not path.exists():
+            raise ToolOperationError("PathNotFound", f"path not found: {display_path}", {"path": display_path})
+        if not path.is_dir():
+            raise ToolOperationError("InvalidPath", f"path is not a directory: {display_path}", {"path": display_path})
+        entries = [
+            self._entry_payload(workspace_root, item) for item in sorted(path.iterdir(), key=lambda item: item.name)
+        ]
+        return Observation(summary=f"Listed {display_path}", payload={"path": display_path, "entries": entries})
+
+    def _exists(self, workspace_root: Path, arguments: dict[str, Any]) -> Observation:
+        path, display_path = self._resolve_path(workspace_root, arguments.get("path"), allow_root=True)
+        exists = path.exists()
+        payload: dict[str, Any] = {"path": display_path, "exists": exists}
+        if exists:
+            payload["type"] = self._path_type(path)
+        return Observation(summary=f"Checked {display_path}", payload=payload)
+
+    def _stat(self, workspace_root: Path, arguments: dict[str, Any]) -> Observation:
+        path, display_path = self._resolve_path(workspace_root, arguments.get("path"), allow_root=True)
+        if not path.exists():
+            raise ToolOperationError("PathNotFound", f"path not found: {display_path}", {"path": display_path})
+        payload = self._entry_payload(workspace_root, path)
+        payload["permissions"] = {
+            "readable": os.access(path, os.R_OK),
+            "writable": os.access(path, os.W_OK),
+            "executable": os.access(path, os.X_OK),
+        }
+        return Observation(summary=f"Statted {display_path}", payload=payload)
+
+    def _entry_payload(self, workspace_root: Path, path: Path) -> dict[str, Any]:
+        relative_path = "." if path == workspace_root else path.relative_to(workspace_root).as_posix()
+        stat_result = path.lstat()
+        return {
+            "name": path.name,
+            "path": relative_path,
+            "type": self._path_type(path),
+            "size": stat_result.st_size,
+            "mode": oct(stat_result.st_mode & 0o777),
+            "modifiedTime": datetime.fromtimestamp(stat_result.st_mtime, UTC).isoformat(),
+        }
+
+    @staticmethod
+    def _path_type(path: Path) -> str:
+        if path.is_symlink():
+            return "symlink"
+        if path.is_dir():
+            return "directory"
+        if path.is_file():
+            return "file"
+        return "other"
+
+
+class GitToolRuntime(WorkspaceToolRuntime):
+    runtime_id = "builtin.git"
+
+    def execute(self, invocation: ToolInvocationResource) -> Observation:
+        try:
+            workspace_root = self._workspace_root(invocation)
+            repo_error = self._workspace_repo_error(workspace_root, invocation)
+            if repo_error is not None:
+                return repo_error
+            operation = invocation.spec.operation
+            if operation == "status":
+                return self._status(workspace_root, invocation)
+            if operation == "diff":
+                return self._diff(workspace_root, invocation)
+            if operation == "add":
+                return self._add(workspace_root, invocation)
+            if operation == "commit":
+                return self._commit(workspace_root, invocation)
+            if operation == "branch":
+                return self._branch(workspace_root, invocation)
+            raise ToolOperationError(
+                "UnsupportedOperation",
+                f"git runtime cannot execute operation {operation}",
+                {"operation": operation},
+            )
+        except ToolOperationError as exc:
+            return self._error_observation(exc)
+
+    def _status(self, workspace_root: Path, invocation: ToolInvocationResource) -> Observation:
+        status = self._run_git(workspace_root, ["git", "status", "--porcelain=v1", "--untracked-files=all"], invocation)
+        if status.error is not None:
+            return status
+        branch = self._run_git(workspace_root, ["git", "branch", "--show-current"], invocation)
+        branch_name = "" if branch.error else str(branch.payload.get("stdout", "")).strip()
+        entries = [line for line in str(status.payload.get("stdout", "")).splitlines() if line]
+        return Observation(
+            summary="Git status completed",
+            payload={"branch": branch_name, "clean": not entries, "entries": entries},
+        )
+
+    def _diff(self, workspace_root: Path, invocation: ToolInvocationResource) -> Observation:
+        staged = invocation.spec.arguments.get("staged", False)
+        if not isinstance(staged, bool):
+            raise ToolOperationError("InvalidArguments", "staged must be a boolean")
+        command = ["git", "diff"]
+        if staged:
+            command.append("--staged")
+        paths = self._resolve_optional_paths(workspace_root, invocation.spec.arguments)
+        if paths:
+            command.extend(["--", *paths])
+        return self._run_git(workspace_root, command, invocation, success_summary="Git diff completed")
+
+    def _add(self, workspace_root: Path, invocation: ToolInvocationResource) -> Observation:
+        paths = self._resolve_optional_paths(workspace_root, invocation.spec.arguments)
+        if not paths:
+            raise ToolOperationError("InvalidPath", "git add requires path or paths")
+        result = self._run_git(
+            workspace_root,
+            ["git", "add", "--", *paths],
+            invocation,
+            success_summary="Git add completed",
+        )
+        if result.error is None:
+            result.payload["paths"] = paths
+        return result
+
+    def _commit(self, workspace_root: Path, invocation: ToolInvocationResource) -> Observation:
+        message = invocation.spec.arguments.get("message")
+        if not isinstance(message, str) or not message.strip():
+            raise ToolOperationError("InvalidArguments", "git commit requires a non-empty message")
+        allow_empty = invocation.spec.arguments.get("allowEmpty", False)
+        if not isinstance(allow_empty, bool):
+            raise ToolOperationError("InvalidArguments", "allowEmpty must be a boolean")
+        command = ["git", "commit", "-m", message]
+        if allow_empty:
+            command.append("--allow-empty")
+        result = self._run_git(workspace_root, command, invocation, success_summary="Git commit completed")
+        if result.error is not None:
+            return result
+        commit = self._run_git(workspace_root, ["git", "rev-parse", "HEAD"], invocation)
+        if commit.error is None:
+            result.payload["commit"] = str(commit.payload.get("stdout", "")).strip()
+        return result
+
+    def _branch(self, workspace_root: Path, invocation: ToolInvocationResource) -> Observation:
+        name = invocation.spec.arguments.get("name")
+        if name is not None:
+            if not isinstance(name, str) or not name.strip() or name.startswith("-"):
+                raise ToolOperationError("InvalidArguments", "branch name must be a non-option string")
+            created = self._run_git(
+                workspace_root,
+                ["git", "branch", name],
+                invocation,
+                success_summary="Git branch created",
+            )
+            if created.error is not None:
+                return created
+        current = self._run_git(workspace_root, ["git", "branch", "--show-current"], invocation)
+        branches = self._run_git(workspace_root, ["git", "branch", "--format=%(refname:short)"], invocation)
+        if current.error is not None:
+            return current
+        if branches.error is not None:
+            return branches
+        branch_names = [line for line in str(branches.payload.get("stdout", "")).splitlines() if line]
+        return Observation(
+            summary="Git branch completed",
+            payload={"current": str(current.payload.get("stdout", "")).strip(), "branches": branch_names},
+        )
+
+    def _workspace_repo_error(self, workspace_root: Path, invocation: ToolInvocationResource) -> Observation | None:
+        command = ["git", "rev-parse", "--show-toplevel"]
+        timeout_seconds = invocation.spec.timeoutSeconds
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=workspace_root,
+                env=self._git_env(workspace_root),
+                text=True,
+                capture_output=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            timeout_payload: dict[str, Any] = {
+                "command": command,
+                "stdout": self._output_text(exc.stdout),
+                "stderr": self._output_text(exc.stderr),
+                "exitCode": None,
+                "timedOut": True,
+            }
+            return Observation(
+                summary="Git repository check timed out",
+                payload=timeout_payload,
+                error=ObservationError(
+                    reason="GitRepositoryCheckTimedOut",
+                    message="Git repository check timed out",
+                ),
+            )
+        check_payload: dict[str, Any] = {
+            "command": command,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "exitCode": completed.returncode,
+            "timedOut": False,
+        }
+        if completed.returncode != 0:
+            message = "Workspace root is not a Git repository"
+            return Observation(
+                summary=message,
+                payload=check_payload,
+                error=ObservationError(reason="GitRepositoryInvalid", message=message),
+            )
+        top_level_text = completed.stdout.strip()
+        top_level = Path(top_level_text).expanduser().resolve(strict=False)
+        if top_level != workspace_root:
+            message = "Git repository top-level must match workspace root"
+            return Observation(
+                summary=message,
+                payload={
+                    **check_payload,
+                    "workspaceRoot": str(workspace_root),
+                    "gitTopLevel": str(top_level),
+                },
+                error=ObservationError(reason="GitRepositoryEscaped", message=message),
+            )
+        return None
+
+    def _run_git(
+        self,
+        workspace_root: Path,
+        command: list[str],
+        invocation: ToolInvocationResource,
+        *,
+        success_summary: str = "Git command completed",
+    ) -> Observation:
+        timeout_seconds = invocation.spec.timeoutSeconds
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=workspace_root,
+                env=self._git_env(workspace_root),
+                text=True,
+                capture_output=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            timeout_payload: dict[str, Any] = {
+                "command": command,
+                "stdout": self._output_text(exc.stdout),
+                "stderr": self._output_text(exc.stderr),
+                "exitCode": None,
+                "timedOut": True,
+            }
+            return Observation(
+                summary="Git command timed out",
+                payload=timeout_payload,
+                error=ObservationError(reason="GitCommandTimedOut", message="Git command timed out"),
+            )
+        command_payload: dict[str, Any] = {
+            "command": command,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "exitCode": completed.returncode,
+            "timedOut": False,
+        }
+        if completed.returncode != 0:
+            message = f"Git command failed with exit code {completed.returncode}"
+            return Observation(
+                summary=message,
+                payload=command_payload,
+                error=ObservationError(reason="GitCommandFailed", message=message),
+            )
+        return Observation(summary=success_summary, payload=command_payload)
+
+    @staticmethod
+    def _git_env(workspace_root: Path) -> dict[str, str]:
+        return {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "AI Platform",
+            "GIT_AUTHOR_EMAIL": "ai-platform@example.invalid",
+            "GIT_COMMITTER_NAME": "AI Platform",
+            "GIT_COMMITTER_EMAIL": "ai-platform@example.invalid",
+            "GIT_CEILING_DIRECTORIES": str(workspace_root.parent),
+        }
+
+
+class ShellToolRuntime(WorkspaceToolRuntime):
+    runtime_id = "builtin.shell"
+
+    def execute(self, invocation: ToolInvocationResource) -> Observation:
+        try:
+            if invocation.spec.operation != "execute":
+                raise ToolOperationError(
+                    "UnsupportedOperation",
+                    f"shell runtime cannot execute operation {invocation.spec.operation}",
+                    {"operation": invocation.spec.operation},
+                )
+            workspace_root = self._workspace_root(invocation)
+            config = self._tool_config(invocation)
+            argv = self._argv(invocation.spec.arguments)
+            allowed_commands = config.get("allowedCommands") or []
+            if not isinstance(allowed_commands, list) or any(not isinstance(item, str) for item in allowed_commands):
+                raise ToolOperationError("InvalidConfiguration", "allowedCommands must be an array of strings")
+            self._validate_allowed_command(argv[0], allowed_commands)
+            cwd, cwd_display = self._resolve_path(
+                workspace_root,
+                invocation.spec.arguments.get("cwd", "."),
+                allow_root=True,
+            )
+            if not cwd.is_dir():
+                raise ToolOperationError(
+                    "InvalidWorkingDirectory",
+                    f"working directory is not a directory: {cwd_display}",
+                    {"cwd": cwd_display},
+                )
+            return self._run_command(invocation, argv, cwd, cwd_display)
+        except ToolOperationError as exc:
+            return self._error_observation(exc)
+
+    @staticmethod
+    def _argv(arguments: dict[str, Any]) -> list[str]:
+        raw_argv = arguments.get("argv")
+        raw_command = arguments.get("command")
+        if raw_argv is not None:
+            if (
+                not isinstance(raw_argv, list)
+                or not raw_argv
+                or any(not isinstance(item, str) or not item for item in raw_argv)
+            ):
+                raise ToolOperationError("InvalidCommand", "argv must be a non-empty array of strings")
+            return raw_argv
+        if isinstance(raw_command, str) and raw_command.strip():
+            return shlex.split(raw_command)
+        raise ToolOperationError("InvalidCommand", "shell execute requires argv or command")
+
+    @staticmethod
+    def _validate_allowed_command(executable: str, allowed_commands: list[str]) -> None:
+        executable_path = Path(executable)
+        is_path_qualified = executable_path.name != executable or executable_path.is_absolute()
+        if is_path_qualified:
+            if executable not in allowed_commands:
+                raise ToolOperationError(
+                    "CommandDenied",
+                    f"command path is not exactly allowlisted: {executable}",
+                    {"command": [executable], "allowedCommands": allowed_commands},
+                )
+            return
+        if executable not in allowed_commands:
+            raise ToolOperationError(
+                "CommandDenied",
+                f"command is not allowlisted: {executable}",
+                {"command": [executable], "allowedCommands": allowed_commands},
+            )
+
+    def _run_command(
+        self,
+        invocation: ToolInvocationResource,
+        argv: list[str],
+        cwd: Path,
+        cwd_display: str,
+    ) -> Observation:
+        timeout_seconds = self._shell_timeout(invocation)
+        env = {
+            "HOME": str(cwd),
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+            "PATH": os.environ.get("PATH", ""),
+        }
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=cwd,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            payload = self._command_payload(
+                argv,
+                cwd_display,
+                self._output_text(exc.stdout),
+                self._output_text(exc.stderr),
+                None,
+                True,
+            )
+            return Observation(
+                summary="Command timed out",
+                payload=payload,
+                error=ObservationError(reason="CommandTimedOut", message="Command timed out"),
+            )
+        payload = self._command_payload(
+            argv,
+            cwd_display,
+            completed.stdout,
+            completed.stderr,
+            completed.returncode,
+            False,
+        )
+        if completed.returncode != 0:
+            message = f"Command exited with code {completed.returncode}"
+            return Observation(
+                summary=message,
+                payload=payload,
+                error=ObservationError(reason="CommandFailed", message=message),
+            )
+        return Observation(summary="Command completed", payload=payload)
+
+    def _shell_timeout(self, invocation: ToolInvocationResource) -> float | None:
+        raw_timeout = invocation.spec.arguments.get("timeoutSeconds")
+        if raw_timeout is None:
+            return invocation.spec.timeoutSeconds
+        if not isinstance(raw_timeout, (int, float)) or isinstance(raw_timeout, bool) or raw_timeout <= 0:
+            raise ToolOperationError("InvalidArguments", "timeoutSeconds must be a positive number")
+        if invocation.spec.timeoutSeconds is None:
+            return float(raw_timeout)
+        return min(float(raw_timeout), invocation.spec.timeoutSeconds)
+
+    @staticmethod
+    def _command_payload(
+        argv: list[str],
+        cwd: str,
+        stdout: str,
+        stderr: str,
+        exit_code: int | None,
+        timed_out: bool,
+    ) -> dict[str, Any]:
+        return {
+            "command": argv,
+            "cwd": cwd,
+            "stdout": stdout,
+            "stderr": stderr,
+            "exitCode": exit_code,
+            "timedOut": timed_out,
+            "sandbox": {"workspaceCwd": cwd, "shell": False},
+        }
+
+
 class ToolRuntimeRegistry:
-    def __init__(self, runtimes: dict[str, ToolRuntime] | None = None) -> None:
+    def __init__(self, runtimes: dict[str, ToolRuntime] | None = None, *, store: ResourceStore | None = None) -> None:
         self._runtimes: dict[str, ToolRuntime] = {"fake": FakeToolRuntime()}
+        if store is not None:
+            self._runtimes.update(
+                {
+                    "filesystem": FilesystemToolRuntime(store),
+                    "git": GitToolRuntime(store),
+                    "shell": ShellToolRuntime(store),
+                }
+            )
         if runtimes:
             self._runtimes.update(runtimes)
 
@@ -117,7 +784,7 @@ class AgentRuntime:
         self.store = store
         self.policy_engine = PolicyEngine(store)
         self.model_client_factory = model_client_factory
-        self.tool_runtime_registry = tool_runtime_registry or ToolRuntimeRegistry()
+        self.tool_runtime_registry = tool_runtime_registry or ToolRuntimeRegistry(store=store)
 
     async def run(self, agent_run: AgentRunResource) -> dict[str, str]:
         namespace = agent_run.metadata.namespace

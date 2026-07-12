@@ -10,7 +10,7 @@ TBD.
 
 ## Status
 
-Draft.
+Implementing.
 
 ## Motivation
 
@@ -53,6 +53,8 @@ Filesystem operations:
 - `append`
 - `list`
 - `mkdir`
+- `exists`
+- `stat`
 
 Filesystem operations must be restricted to the Workspace root. Runtime must
 reject absolute paths, path traversal outside the Workspace root, and symlink

@@ -1,8 +1,8 @@
-# Platform Specification v1.2.0
+# Platform Specification v1.3.0
 
 ## Purpose
 
-This specification defines the v1.2.0 architecture and behavioral contracts for
+This specification defines the v1.3.0 architecture and behavioral contracts for
 the AI Platform. It is the normative source of truth for resources,
 controllers, runtimes, APIs, command-line tools, and extensions that claim
 compatibility with `ai.platform/v1`.

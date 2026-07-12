@@ -57,6 +57,9 @@ Agent MUST remain independent of any specific model provider. If Agent reference
 a Model, the reference MUST be expressed through Pilot or a Pilot-compatible
 routing contract.
 
+Agent configuration MAY provide default AgentRun execution budgets. Runtime
+enforces the effective budget, and Pilot or Model MUST NOT alter it.
+
 ## AgentRun Creation
 
 Agent controllers create AgentRuns. Each AgentRun is an execution attempt for

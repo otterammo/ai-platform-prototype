@@ -37,6 +37,10 @@ provider, requested operation, resource references, actor, and correlation data.
 When an action is derived from a Decision, evaluation inputs SHOULD include
 Decision type, Decision version, and redacted Decision metadata when available.
 
+Execution Engine policy inputs SHOULD also include iteration number, attempt
+number, budget snapshot, ToolInvocation identity when applicable, and
+correlation ID.
+
 Policy evaluation MUST emit events for material decisions.
 
 ## Authorization
@@ -46,6 +50,10 @@ approval MUST pause before the guarded side effect occurs.
 
 Runtime MUST NOT bypass policy by changing Model, Tool, provider, operation
 name, or request shape after denial.
+
+When Policy denies a ToolInvocation derived from a Decision, runtime MUST create
+or update the ToolInvocation as `Denied` and return a denial Observation to the
+execution loop unless Policy marks the denial terminal.
 
 ## ToolInvocation Authorization
 
@@ -69,6 +77,11 @@ aggregate waiting status.
 When Approval is granted, the control plane SHOULD resume eligible AgentRuns.
 When Approval is rejected, the AgentRun MUST fail or remain waiting according to
 policy.
+
+`WaitingForApproval` is a waiting condition on the blocked action, normally a
+ToolInvocation. It is not a separate AgentRun terminal phase. The Model MUST NOT
+be repeatedly invoked while the AgentRun is waiting for the approval needed by
+the same iteration.
 
 ## Inheritance And Scope
 

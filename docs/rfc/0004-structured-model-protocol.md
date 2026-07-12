@@ -58,10 +58,13 @@ or:
 {
   "version": "v1",
   "type": "complete",
-  "artifact": {
-    "kind": "ImplementationSummary",
-    "summary": "Login page implemented"
-  }
+  "summary": "Login page implemented",
+  "outputs": [
+    {
+      "type": "workspace-change",
+      "ref": "workspace://..."
+    }
+  ]
 }
 ```
 
@@ -96,9 +99,9 @@ A Decision is not a platform resource and does not bypass resource admission,
 Policy, Approval, or trace contracts. It is the provider-neutral protocol object
 that the Execution Engine interprets into governed platform state.
 
-A `complete` Decision must include enough structured data to produce the
-required Artifact resources or to mark the AgentRun complete according to the
-effective execution strategy.
+A `complete` Decision must include `summary` and `outputs` fields. The
+Execution Engine validates required Mission outputs and creates a final summary
+Artifact unless the Mission explicitly disables it.
 
 Malformed Decisions are validation failures. The Execution Engine must not infer
 a ToolInvocation from unstructured prose.

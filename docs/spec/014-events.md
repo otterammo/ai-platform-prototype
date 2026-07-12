@@ -77,18 +77,47 @@ denied, ToolInvocation waiting for approval, ToolInvocation started,
 ToolInvocation completed, ToolInvocation failed, ToolInvocation timed out,
 ToolInvocation cancelled, Observation recorded, artifact ready, completed,
 waiting, and failed. Decision-related event types SHOULD include
-DecisionProduced, DecisionValidated, DecisionRejected, and DecisionExecuted.
+DecisionRequested, DecisionProduced, DecisionValidated, and DecisionRejected.
 Implementations MAY add separate ToolInvocation requested or validated events
 when they expose those lifecycle states.
 
-Decision events SHOULD include correlation identifier, AgentRun, Decision type,
-Decision version, iteration number when available, Model and Pilot identity when
-available, and rejection reason when applicable. Sensitive Decision payload data
-MUST be redacted according to Policy.
+Execution Engine event types MUST include:
+
+- `ExecutionEngineStarted`
+- `ExecutionFramePrepared`
+- `DecisionRequested`
+- `DecisionProduced`
+- `DecisionValidated`
+- `DecisionRejected`
+- `ToolInvocationCreated`
+- `ToolInvocationObserved`
+- `ObservationDelivered`
+- `ExecutionBudgetUpdated`
+- `ExecutionRetryScheduled`
+- `InputRequested`
+- `InputReceived`
+- `CancellationRequested`
+- `CancellationAcknowledged`
+- `ExecutionFinalizing`
+- `ExecutionCompleted`
+- `ExecutionFailed`
+- `ExecutionCancelled`
+- `ExecutionTimedOut`
+- `ExecutionBudgetExceeded`
+
+Decision and execution-loop events SHOULD include correlation identifier,
+AgentRun, iteration number, attempt number, Decision type, Decision version,
+Model and Pilot identity when available, budget snapshot when available, and
+reason or rejection reason when applicable. Sensitive Decision payload data MUST
+be redacted according to Policy.
 
 ToolInvocation events MUST include correlation identifier, Workspace, AgentRun,
 ToolInvocation, Tool, operation, and runtime or provider actor. Sensitive
 arguments and output MUST be redacted according to Policy.
+
+Events MUST identify ToolInvocation where applicable. Sensitive tool arguments,
+model prompts, secrets, and full file content MUST be redacted or referenced
+rather than copied indiscriminately into Events.
 
 ## Trace Semantics
 
@@ -97,6 +126,13 @@ or AgentRun from resources and events. For Decision-driven AgentRuns, trace MUST
 distinguish Model intent from platform execution by showing each Decision,
 resulting ToolInvocation or Artifact, policy decision, execution phase, result,
 embedded Observation, and related Artifacts.
+
+For iterative AgentRuns, trace MUST reconstruct AgentRun start, ExecutionFrame
+preparation, Decision production and validation, ToolInvocation creation, Policy
+evaluation, Approval request and decision when applicable, ToolInvocation
+execution, Observation delivery, retry, budget updates, input waits,
+finalization, Artifact creation, cancellation, timeout, budget exhaustion, and
+terminal reason.
 
 Trace output MUST distinguish missing data from redacted data. Redaction MUST be
 driven by Policy and MUST NOT remove the fact that a ToolInvocation occurred.

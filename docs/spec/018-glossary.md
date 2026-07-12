@@ -46,6 +46,12 @@ A structured, versioned instruction returned by a Model through Pilot and
 interpreted by the Execution Engine. Decision represents intent, is not a
 Resource, and is the canonical protocol between intelligence and execution.
 
+## Execution Budget
+
+The effective limits enforced by the Execution Engine for one AgentRun,
+including iteration, model invocation, ToolInvocation, Decision failure, tool
+failure, wall-time, and token budgets.
+
 ## Event
 
 An immutable record of material platform activity associated with resources,
@@ -56,6 +62,12 @@ actors, actions, reasons, and correlation data.
 The runtime component that owns AgentRun control flow, validates and interprets
 Decisions, creates ToolInvocations, integrates Policy, handles Observations,
 applies retries, manages iteration, and records terminal state.
+
+## ExecutionFrame
+
+An internal, non-resource representation of the canonical Mission, Context,
+Agent, budget, Decision, Observation, input, failure, and workspace summary data
+supplied to Pilot for one Decision request.
 
 ## Fleet
 
@@ -72,6 +84,12 @@ coordination strategy for Fleets.
 A monotonically increasing metadata value representing desired-state changes to
 a resource.
 
+## Iteration
+
+One Execution Engine cycle that prepares an ExecutionFrame, requests a Decision,
+validates that Decision, processes it, and records the resulting Observation,
+input wait, finalization, or terminal state.
+
 ## Knowledge
 
 A Workspace-scoped declaration of source material available for indexing and
@@ -81,6 +99,12 @@ Context assembly.
 
 A Workspace-scoped resource representing indexed Knowledge, retrieval readiness,
 source freshness, chunks, and provenance.
+
+## Lease
+
+A time-bounded execution ownership record identifying the worker allowed to
+advance one AgentRun execution loop. Distributed implementations SHOULD pair a
+lease with a fencing token or execution epoch.
 
 ## Mission
 
@@ -101,6 +125,12 @@ Execution Engine.
 
 A status value recording the latest metadata.generation observed by the
 responsible controller.
+
+## Observation Window
+
+The bounded set of recent full execution frames, summarized older execution
+history, unresolved failures, pending approvals, current workspace changes, and
+required outputs supplied to Pilot for continuation.
 
 ## Observation
 
@@ -131,6 +161,11 @@ effects.
 
 The subsystem responsible for executing scheduled AgentRuns, invoking Pilots,
 Models, and Tools, producing Artifacts, and reporting execution status.
+
+## Terminal Reason
+
+The structured reason an AgentRun entered a terminal state, including success,
+explicit failure, cancellation, timeout, or budget exhaustion.
 
 ## Scheduler
 

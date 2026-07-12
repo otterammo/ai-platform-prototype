@@ -20,6 +20,10 @@ ToolInvocation is Workspace-scoped. A ToolInvocation MUST be owned by exactly
 one AgentRun in the same Workspace and MUST reference the Tool and operation it
 requests.
 
+A ToolInvocation MUST NOT create a new AgentRun. One AgentRun may own many
+ToolInvocations, but the Execution Engine may have at most one active
+ToolInvocation for the active Decision.
+
 Observation data is embedded in `ToolInvocation.status.observation` for v1.1.
 An embedded Observation MUST describe the ToolInvocation that produced it
 through the containing ToolInvocation resource.
@@ -45,6 +49,10 @@ ToolInvocation spec SHOULD include an idempotency key for side-effecting
 operations when one can be derived. It MAY include requested risk level, timeout
 override, and output handling preferences when those values are not fully
 determined by the Tool contract.
+
+For ToolInvocations created from `invoke_tool` Decisions, ToolInvocation name or
+identity MUST be deterministic from AgentRun identity, AgentRun generation,
+iteration number, and Decision attempt or stable Decision ID.
 
 ToolInvocation spec MUST be immutable after creation.
 
@@ -75,6 +83,9 @@ or approval completion.
 Once a ToolInvocation reaches a terminal phase, its terminal result MUST NOT be
 mutated. Corrections MUST be represented by a later event, updated projection,
 future Observation resource, or replacement ToolInvocation.
+
+A completed ToolInvocation MUST NOT execute again during retry, resume,
+reconciliation, or replay.
 
 ## Embedded Observation Model
 
@@ -133,6 +144,10 @@ The Decision protocol that converts Model intent into Execution Engine input is
 defined separately from this framework. An `invoke_tool` Decision becomes a
 ToolInvocation only after Execution Engine validation and interpretation.
 
+Each `invoke_tool` Decision creates exactly one ToolInvocation. Runtime MUST
+reconcile an existing ToolInvocation after recovery rather than create a
+duplicate invocation.
+
 ## Tool Runtime Interface
 
 Tool Runtimes execute authorized ToolInvocation operations. A Tool Runtime MUST
@@ -155,6 +170,10 @@ Denied ToolInvocations MUST NOT execute. Approval-required ToolInvocations MUST
 pause the AgentRun before the guarded side effect occurs. Runtime MUST NOT retry,
 rename, reshape, or route a denied ToolInvocation to bypass Policy.
 
+When a ToolInvocation is blocked by approval, `WaitingForApproval` is a waiting
+condition on the ToolInvocation or AgentRun status. It is not a separate
+AgentRun terminal phase.
+
 ## Safety
 
 Runtime MUST enforce:
@@ -167,6 +186,9 @@ Runtime MUST enforce:
 Runtime SHOULD preserve cancellation, redaction, and idempotency metadata when
 those values are available. Tool-specific sandbox requirements are defined by
 Tool contracts and concrete Tool Runtime specifications.
+
+A ToolInvocation timeout MUST remain visible on the ToolInvocation itself even
+if the parent AgentRun later retries or fails.
 
 ## Events And Trace
 

@@ -70,7 +70,8 @@ Custom schedulers MAY select worker classes, priorities, placement, and queues
 for AgentRuns. They MUST schedule only AgentRuns.
 
 Custom workers execute scheduled AgentRuns. They MUST report status, honor
-policy, consume Context, validate and interpret Decisions, produce Artifact
+policy, consume Context, validate and interpret Decisions, enforce execution
+budgets, honor cancellation, preserve lease ownership, produce Artifact
 resources, and emit events.
 
 ## Compatibility

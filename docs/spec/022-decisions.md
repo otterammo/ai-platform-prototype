@@ -101,8 +101,11 @@ Example:
 }
 ```
 
-A `complete` Decision MUST include an `artifact` object with enough structured
-data for the Execution Engine to produce required Artifacts or terminal output.
+A `complete` Decision MUST include:
+
+- `summary`: required human-readable summary.
+- `outputs`: array of output references or descriptors. The array MAY be empty
+  only when the Mission permits a no-output result.
 
 Example:
 
@@ -110,19 +113,24 @@ Example:
 {
   "version": "v1",
   "type": "complete",
-  "artifact": {
-    "summary": "...",
-    "outputs": []
-  }
+  "summary": "Implemented and tested the requested change.",
+  "outputs": [
+    {
+      "type": "workspace-change",
+      "ref": "workspace://..."
+    }
+  ]
 }
 ```
 
-A `fail` Decision MUST include `reason` and `message` fields.
+A `fail` Decision MUST include `reason` and `retryable` fields. It MAY include
+`message` or other diagnostic fields when Policy permits recording them.
 
-A `request_input` Decision MUST include a `request` object that describes the
-needed input, expected shape, and reason. If the platform has no supported input
-mechanism for the request, the Execution Engine MUST reject the Decision or fail
-the AgentRun according to its retry and failure policy.
+A `request_input` Decision MUST include a persisted prompt, question, or request
+object that describes the needed input, expected shape, and reason. If the
+platform has no supported input mechanism for the request, the Execution Engine
+MUST reject the Decision or fail the AgentRun according to its retry and failure
+policy.
 
 Decision payloads MAY include provider-neutral diagnostic fields such as
 `rationale` only when Policy permits recording them. Decision payloads MUST NOT
@@ -131,35 +139,55 @@ include secrets unless a future secure protocol explicitly permits them.
 ## Validation
 
 Execution Engine MUST validate each Decision before interpretation. Validation
-MUST include:
+MUST follow this pipeline:
 
-- schema version
-- required fields
-- supported Decision type
-- argument structure
+```text
+Provider response
+-> Pilot parsing
+-> Decision schema validation
+-> Decision version validation
+-> Decision semantic validation
+-> Agent capability validation
+-> Execution budget validation
+-> Policy evaluation where applicable
+-> Platform action
+```
+
+Failure reasons MUST distinguish:
+
+- `DecisionParseFailed`
+- `DecisionValidationFailed`
+- `DecisionVersionUnsupported`
+- `DecisionTypeUnsupported`
+- `CapabilityViolation`
+- `ToolArgumentsInvalid`
 
 Execution Engine MUST reject unsupported versions or unsupported types unless an
 explicit compatibility adapter exists. Execution Engine MUST reject malformed
 Decisions without inferring intent from natural language or provider-specific
 payloads.
 
-Invalid Decisions MUST fail deterministically. The Execution Engine MAY retry a
-model call according to AgentRun retry policy, but it MUST NOT perform side
-effects from an invalid Decision and MUST preserve enough status or event data
-to explain the rejection.
+Invalid Decisions MUST fail deterministically. The Execution Engine MAY invoke
+the Pilot again with validation feedback according to AgentRun retry policy and
+`maxDecisionFailures`, but it MUST NOT perform side effects from an invalid
+Decision and MUST preserve enough status or event data to explain the rejection.
+
+Unknown Decision types MUST be rejected. They MUST NOT be treated as
+natural-language completion.
 
 ## Interpretation
 
 Decision interpretation is owned by the Execution Engine.
 
 For `invoke_tool`, the Execution Engine validates the Decision and then creates
-or resumes a ToolInvocation resource. The ToolInvocation lifecycle, Policy
+or resumes exactly one deterministic ToolInvocation resource. The ToolInvocation lifecycle, Policy
 authorization, approval waiting, Tool Runtime execution, embedded Observation,
 and trace are governed by the ToolInvocation specification.
 
-For `complete`, the Execution Engine validates the Decision and records required
-Artifacts or terminal AgentRun status according to the AgentRun and Runtime
-specifications.
+For `complete`, the Execution Engine validates required Mission outputs,
+records output references, creates a final summary Artifact unless explicitly
+disabled by the Mission, and then records terminal AgentRun status. Failure to
+finalize required outputs transitions the AgentRun to `Failed`.
 
 For `fail`, the Execution Engine validates the Decision and records a terminal
 failure status and events.
@@ -168,6 +196,10 @@ For `request_input`, the Execution Engine validates the Decision and maps it to
 supported platform waiting state, approval/input resources, or deterministic
 failure.
 
+Completion MUST be explicit. The Execution Engine MUST NOT infer success from
+inactivity, an empty response, absence of a tool request, or natural-language
+text.
+
 Decision interpretation MUST NOT bypass Resource admission, Policy, Approval,
 Workspace isolation, status ownership, Events, or trace contracts.
 
@@ -175,10 +207,10 @@ Workspace isolation, status ownership, Events, or trace contracts.
 
 Execution Engine SHOULD emit Decision-related events when those states occur:
 
+- `DecisionRequested`
 - `DecisionProduced`
 - `DecisionValidated`
 - `DecisionRejected`
-- `DecisionExecuted`
 
 Decision events SHOULD include:
 
@@ -186,8 +218,10 @@ Decision events SHOULD include:
 - AgentRun reference
 - Decision type
 - Decision version
-- iteration number when available
+- iteration number
+- attempt number
 - Model and Pilot identity when available
+- budget snapshot when available
 - rejection reason when applicable
 
 Decision event payloads SHOULD include enough information for trace
@@ -218,7 +252,8 @@ state, and any rejection or retry.
 ## Compatibility
 
 Decision protocol versions are independent from Resource `apiVersion` values.
-The v1 Decision protocol is part of Platform Specification `v1.2.0`.
+The v1 Decision protocol was introduced in Platform Specification `v1.2.0` and
+its execution-loop semantics are refined by Platform Specification `v1.3.0`.
 
 Future Decision versions SHOULD remain backward compatible where practical.
 Execution Engines MAY reject unsupported Decision versions. Model providers

@@ -19,6 +19,23 @@ JsonDict = dict[str, Any]
 JsonDictList = list[JsonDict]
 
 DECISION_EVENT_TYPES = {
+    "ExecutionEngineStarted",
+    "ExecutionFramePrepared",
+    "DecisionRequested",
+    "DecisionProduced",
+    "DecisionValidated",
+    "DecisionRejected",
+    "ToolInvocationCreated",
+    "ToolInvocationObserved",
+    "ObservationDelivered",
+    "ExecutionBudgetUpdated",
+    "ExecutionRetryScheduled",
+    "ExecutionFinalizing",
+    "ExecutionCompleted",
+    "ExecutionFailed",
+    "ExecutionCancelled",
+    "ExecutionTimedOut",
+    "ExecutionBudgetExceeded",
     "FleetTemplateSelected",
     "CapabilityResolved",
     "ToolResolved",
@@ -296,10 +313,15 @@ def _agent_run_trace(
     artifacts: JsonDictList,
     events: JsonDictList,
 ) -> JsonDict:
+    status_data = run.status.data
     return {
         "name": run.metadata.name,
         "status": run.status.phase,
         "context": run.spec.contextRef.name,
+        "executionState": status_data.get("executionState"),
+        "budgetUsage": status_data.get("budgetUsage") or {},
+        "terminalReason": status_data.get("terminalReason"),
+        "executionFrames": status_data.get("executionFrames") or [],
         "artifacts": [artifact for artifact in artifacts if artifact.get("agentRun") == run.metadata.name],
         "toolInvocations": [_tool_invocation_trace(invocation, events) for invocation in _tool_invocations(store, run)],
         "events": _resource_events(events, ResourceKind.AGENT_RUN.value, run.metadata.name),
@@ -373,6 +395,31 @@ def _agent_detail_lines(agent: JsonDict) -> list[str]:
     for run in agent.get("agentRuns") or []:
         lines.append(f"AgentRun {run['name']}")
         lines.append(f"Context {run['context']}")
+        if run.get("budgetUsage"):
+            budget = run["budgetUsage"]
+            lines.append(
+                "Budget "
+                f"{budget.get('iterations', 0)} iterations, "
+                f"{budget.get('modelInvocations', 0)} model calls, "
+                f"{budget.get('toolInvocations', 0)} tool calls"
+            )
+        for frame in run.get("executionFrames") or []:
+            lines.append(f"Frame {frame.get('iteration')}")
+            decision = frame.get("decision") or {}
+            raw_decision = frame.get("rawDecision")
+            if isinstance(decision, dict) and decision.get("type"):
+                lines.append(f"Decision {decision.get('type')}")
+            elif raw_decision:
+                lines.append("Decision produced")
+            validation = frame.get("decisionValidation") or {}
+            if validation.get("status"):
+                lines.append(f"Decision validation {validation.get('status')}")
+            if frame.get("toolInvocation"):
+                lines.append(f"ToolInvocation {frame['toolInvocation']}")
+            observation = frame.get("observation") or {}
+            if observation.get("summary"):
+                lines.append("Observation")
+                lines.append(str(observation["summary"]))
         for artifact in run.get("artifacts") or []:
             lines.append(f"Artifact {artifact.get('name') or artifact.get('path')}")
         for invocation in run.get("toolInvocations") or []:
@@ -485,6 +532,22 @@ def _timeline_message(event: JsonDict) -> str:
         "ToolInvocationFailed": f"ToolInvocation {resource_name} failed",
         "ToolInvocationTimedOut": f"ToolInvocation {resource_name} timed out",
         "ObservationRecorded": f"Observation recorded for {resource_name}",
+        "ExecutionEngineStarted": f"Execution Engine started for AgentRun {resource_name}",
+        "ExecutionFramePrepared": f"Execution frame prepared for AgentRun {resource_name}",
+        "DecisionRequested": f"Decision requested for AgentRun {resource_name}",
+        "DecisionProduced": f"Decision produced for AgentRun {resource_name}",
+        "DecisionValidated": f"Decision validated for AgentRun {resource_name}",
+        "DecisionRejected": f"Decision rejected for AgentRun {resource_name}",
+        "ToolInvocationObserved": f"ToolInvocation observed for AgentRun {resource_name}",
+        "ObservationDelivered": f"Observation delivered for AgentRun {resource_name}",
+        "ExecutionBudgetUpdated": f"Execution budget updated for AgentRun {resource_name}",
+        "ExecutionRetryScheduled": f"Execution retry scheduled for AgentRun {resource_name}",
+        "ExecutionFinalizing": f"Execution finalizing for AgentRun {resource_name}",
+        "ExecutionCompleted": f"Execution completed for AgentRun {resource_name}",
+        "ExecutionFailed": f"Execution failed for AgentRun {resource_name}",
+        "ExecutionCancelled": f"Execution cancelled for AgentRun {resource_name}",
+        "ExecutionTimedOut": f"Execution timed out for AgentRun {resource_name}",
+        "ExecutionBudgetExceeded": f"Execution budget exceeded for AgentRun {resource_name}",
     }
     fallback = event.get("message") or event_type
     return labels.get(event_type, str(fallback))

@@ -29,6 +29,13 @@ Approve the action:
 platform approve <approval-name> --by day0-user --reason "Day 0 tutorial"
 ```
 
+To stop a waiting run instead of approving it, request cancellation on the
+AgentRun:
+
+```bash
+platform cancel agentrun <run-name> -n day0
+```
+
 Wait for completion:
 
 ```bash
@@ -42,4 +49,4 @@ platform trace mission implement-login-page -n day0
 ```
 
 The trace should include the approval request, approval grant, AgentRun resume,
-and Mission completion.
+ExecutionFrames, and Mission completion.

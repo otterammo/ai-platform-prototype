@@ -18,7 +18,7 @@ from .knowledge import DEFAULT_INDEX_NAME, KeywordRetriever, KnowledgeIndexer
 from .observability import build_timeline, build_trace, describe_resource, format_timeline, format_trace
 from .policy import ApprovalService
 from .resources import ResourceKind, parse_resource_documents
-from .storage import DEFAULT_DB_URL, ResourceStore
+from .storage import CONTROLLER_FIELD_MANAGER, DEFAULT_DB_URL, ResourceStore
 
 RESOURCE_ALIASES = {
     "workspace": ResourceKind.WORKSPACE.value,
@@ -113,6 +113,12 @@ def build_parser() -> argparse.ArgumentParser:
     delete_parser.add_argument("kind", type=normalize_kind)
     delete_parser.add_argument("name")
     delete_parser.add_argument("-n", "--namespace")
+
+    cancel_parser = subparsers.add_parser("cancel", help="Request AgentRun cancellation")
+    cancel_parser.add_argument("kind", type=normalize_kind)
+    cancel_parser.add_argument("name")
+    cancel_parser.add_argument("-n", "--namespace", required=True)
+    cancel_parser.add_argument("-o", "--output", choices=["yaml", "json"], default="yaml")
 
     describe_parser = subparsers.add_parser("describe", help="Describe a resource with related events")
     describe_parser.add_argument("kind", type=normalize_kind)
@@ -298,6 +304,18 @@ async def run_async(args: argparse.Namespace) -> int:
             print(f"{args.kind} {args.name} not found", file=sys.stderr)
             return 1
         print(f"deleted {args.kind} {args.name}")
+        return 0
+
+    if args.command == "cancel":
+        if args.kind != ResourceKind.AGENT_RUN.value:
+            print("cancel currently supports only AgentRun", file=sys.stderr)
+            return 2
+        try:
+            cancelled = _request_agent_run_cancellation(store, args.name, args.namespace)
+        except KeyError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print_data(cancelled, args.output)
         return 0
 
     if args.command == "reconcile":
@@ -555,6 +573,17 @@ def _get_resource(store: ResourceStore, kind: str, name: str, namespace: str | N
     if len(matches) == 1:
         return matches[0]
     return None
+
+
+def _request_agent_run_cancellation(store: ResourceStore, name: str, namespace: str) -> dict[str, Any]:
+    manifest = store.get(ResourceKind.AGENT_RUN, name, namespace)
+    if manifest is None:
+        raise KeyError(f"AgentRun {namespace}/{name} not found")
+    next_manifest = dict(manifest)
+    spec = dict(next_manifest.get("spec") or {})
+    spec["cancellationRequested"] = True
+    next_manifest["spec"] = spec
+    return store.apply(next_manifest, field_manager=CONTROLLER_FIELD_MANAGER)
 
 
 def _search_result(chunk: dict[str, Any]) -> dict[str, Any]:

@@ -32,7 +32,13 @@ from .resources import (
     WorkspaceResource,
     parse_resource,
 )
-from .runtime import AgentRuntime, ToolRuntimeError, ToolRuntimeRegistry
+from .runtime import (
+    AGENT_RUN_TERMINAL_PHASES,
+    ENGINE_RESUMABLE_PHASES,
+    AgentRuntime,
+    ToolRuntimeError,
+    ToolRuntimeRegistry,
+)
 from .storage import CONTROLLER_FIELD_MANAGER, ResourceStore
 
 MISSION_GENERATION_ANNOTATION = "ai.platform/mission-generation"
@@ -857,11 +863,11 @@ class AgentController:
             phase, event_type, message = "Succeeded", "AgentCompleted", "AgentRun completed successfully"
             data = {"agentRun": run.metadata.name, **run.status.data}
             clear_keys = ["pendingApproval"]
-        elif run.status.phase == "Failed":
+        elif run.status.phase in (AGENT_RUN_TERMINAL_PHASES - {"Succeeded"}):
             phase, event_type, message = "Failed", "AgentFailed", run.status.message or "AgentRun failed"
             data = {"agentRun": run.metadata.name, **run.status.data}
             clear_keys = ["pendingApproval"]
-        elif run.status.phase == "WaitingForApproval":
+        elif run.status.phase == "WaitingForApproval" or run.status.data.get("pendingApproval"):
             phase, event_type, message = "Waiting", "AgentWaiting", run.status.message or "AgentRun waiting"
             data = {"agentRun": run.metadata.name, **run.status.data}
             clear_keys = None
@@ -1037,7 +1043,9 @@ class LocalAgentRunWorker:
             run = parse_resource(manifest)
             if not isinstance(run, AgentRunResource):
                 continue
-            if run.status.phase != "Scheduled" or not is_current(run):
+            if run.status.phase not in ENGINE_RESUMABLE_PHASES and run.status.phase != "WaitingForApproval":
+                continue
+            if not is_current(run) and not run.spec.cancellationRequested:
                 continue
             try:
                 await self.runtime.run(run)

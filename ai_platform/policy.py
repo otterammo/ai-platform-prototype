@@ -439,11 +439,17 @@ class ApprovalService:
         run = parse_resource(run_manifest)
         if not isinstance(run, AgentRunResource):
             return
+        execution_state = run.status.data.get("executionState")
+        resume_phase = (
+            execution_state
+            if isinstance(execution_state, str) and execution_state != "WaitingForApproval"
+            else "Pending"
+        )
         self.store.update_status(
             ResourceKind.AGENT_RUN,
             run.metadata.name,
             run.metadata.namespace,
-            "Pending",
+            resume_phase,
             f"Approval {approval.metadata.name} granted by {actor}; AgentRun resumed",
             {"approval": approval.metadata.name, "approvalId": approval.metadata.name, "approvedBy": actor},
             event_type="AgentRunResumed",

@@ -1072,15 +1072,16 @@ class ResourceStore:
         reason: str,
         message: str | None,
     ) -> JsonDictList:
+        failed_phases = {"Failed", "Cancelled", "TimedOut", "BudgetExceeded"}
         condition_values: dict[str, bool] = {
             "WaitingForApproval": phase == "Waiting",
             "Reconciling": phase == "Reconciling",
             "Running": phase in {"Reconciling", "Running"},
             "Completed": phase in {"Succeeded", "Completed"},
-            "Failed": phase == "Failed",
+            "Failed": phase in failed_phases,
         }
         if kind in {ResourceKind.AGENT.value, ResourceKind.FLEET.value}:
-            condition_values["Scheduled"] = phase in {"Pending", "Running", "Succeeded", "Failed"}
+            condition_values["Scheduled"] = phase in {"Pending", "Running", "Succeeded", *failed_phases}
 
         by_type = {str(condition.get("type")): dict(condition) for condition in existing_conditions}
         for condition_type, is_true in condition_values.items():

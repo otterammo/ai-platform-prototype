@@ -1,27 +1,49 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, TypeVar
+from typing import Any, Callable, Protocol, TypeVar
 
 from .events import CORRELATION_ID_ANNOTATION, CORRELATION_ID_STATUS_KEY, EventContext
-from .models import Message, build_model_client
-from .policy import PolicyEngine, RuntimeAction
+from .models import Message, ModelClient, build_model_client
+from .policy import ApprovalRequired, PolicyDenied, PolicyEngine, RuntimeAction
 from .resources import (
     AgentResource,
     AgentRunResource,
     ContextResource,
+    ExecutionSpec,
     MissionResource,
     ModelConfig,
     ModelResource,
     Observation,
+    ObservationError,
     ResourceKind,
     ToolInvocationResource,
+    ToolOperationSpec,
+    ToolResource,
     WorkspaceResource,
     parse_resource,
 )
 from .storage import CONTROLLER_FIELD_MANAGER, ResourceStore
 
 _ResourceT = TypeVar("_ResourceT")
+ModelClientFactory = Callable[[ModelConfig, ResourceStore | None], ModelClient]
+
+AGENT_RUN_TERMINAL_PHASES = {"Succeeded", "Failed", "Cancelled", "TimedOut", "BudgetExceeded"}
+ENGINE_RESUMABLE_PHASES = {
+    "Scheduled",
+    "Starting",
+    "AwaitingDecision",
+    "DecisionReady",
+    "ProcessingDecision",
+    "WaitingForTool",
+    "WaitingForObservation",
+    "Finalizing",
+}
+TOOL_TERMINAL_PHASES = {"Succeeded", "Failed", "Denied", "TimedOut", "Cancelled"}
 
 
 class ToolRuntimeError(Exception):
@@ -73,79 +95,818 @@ def run_correlation_id(run: AgentRunResource) -> str | None:
     return value if isinstance(value, str) else None
 
 
+class DecisionValidationError(Exception):
+    def __init__(self, reason: str, message: str) -> None:
+        self.reason = reason
+        self.message = message
+        super().__init__(message)
+
+
+def utciso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
 class AgentRuntime:
-    def __init__(self, store: ResourceStore) -> None:
+    def __init__(
+        self,
+        store: ResourceStore,
+        *,
+        model_client_factory: ModelClientFactory = build_model_client,
+        tool_runtime_registry: ToolRuntimeRegistry | None = None,
+    ) -> None:
         self.store = store
         self.policy_engine = PolicyEngine(store)
+        self.model_client_factory = model_client_factory
+        self.tool_runtime_registry = tool_runtime_registry or ToolRuntimeRegistry()
 
     async def run(self, agent_run: AgentRunResource) -> dict[str, str]:
         namespace = agent_run.metadata.namespace
         if namespace is None:
             raise ValueError("AgentRun must have a namespace")
 
-        agent = self._load_resource(ResourceKind.AGENT, agent_run.spec.agentRef.name, namespace, AgentResource)
-        mission = self._load_resource(ResourceKind.MISSION, agent_run.spec.missionRef.name, namespace, MissionResource)
-        workspace = self._load_resource(ResourceKind.WORKSPACE, namespace, None, WorkspaceResource)
-        context = self._load_resource(ResourceKind.CONTEXT, agent_run.spec.contextRef.name, namespace, ContextResource)
+        for _step in range(1000):
+            run = self._refresh_run(agent_run)
+            if run.status.phase in AGENT_RUN_TERMINAL_PHASES:
+                return {"status": run.status.phase}
+            if run.status.phase == "Pending":
+                return {"status": run.status.phase}
+            if run.status.phase == "WaitingForApproval" and not run.spec.cancellationRequested:
+                return {"status": run.status.phase}
+
+            agent = self._load_resource(ResourceKind.AGENT, run.spec.agentRef.name, namespace, AgentResource)
+            mission = self._load_resource(ResourceKind.MISSION, run.spec.missionRef.name, namespace, MissionResource)
+            workspace = self._load_resource(ResourceKind.WORKSPACE, namespace, None, WorkspaceResource)
+            context = self._load_resource(ResourceKind.CONTEXT, run.spec.contextRef.name, namespace, ContextResource)
+
+            cancelled = self._cancel_if_requested(run)
+            if cancelled is not None:
+                return {"status": cancelled.status.phase}
+            timed_out = self._timeout_if_expired(run)
+            if timed_out is not None:
+                return {"status": timed_out.status.phase}
+
+            phase = run.status.phase
+            if phase == "Scheduled":
+                run = self._start_engine(run, agent)
+                if run.status.phase == "WaitingForApproval":
+                    return {"status": run.status.phase}
+                continue
+            if phase == "Starting":
+                run = self._prepare_execution(run, agent, context)
+                if run.status.phase in AGENT_RUN_TERMINAL_PHASES:
+                    return {"status": run.status.phase}
+                continue
+            if phase == "AwaitingDecision":
+                run = await self._request_decision(run, agent, mission, workspace, context)
+                if run.status.phase in {"AwaitingDecision", "WaitingForApproval"}:
+                    return {"status": run.status.phase}
+                continue
+            if phase == "DecisionReady":
+                run = self._validate_current_decision(run, agent)
+                continue
+            if phase == "ProcessingDecision":
+                run = self._process_current_decision(run, agent, mission)
+                continue
+            if phase == "WaitingForTool":
+                run = await self._resume_waiting_for_tool(run, agent)
+                if run.status.phase in {"WaitingForTool", "WaitingForApproval"}:
+                    return {"status": run.status.phase}
+                continue
+            if phase == "WaitingForObservation":
+                run = self._deliver_observation(run)
+                continue
+            if phase == "Finalizing":
+                run = self._finalize_run(run, agent, mission, workspace)
+                if run.status.phase == "Succeeded":
+                    artifact_path = run.status.data.get("artifactPath")
+                    return {"artifactPath": str(artifact_path)} if artifact_path else {"status": "Succeeded"}
+                return {"status": run.status.phase}
+            return {"status": run.status.phase}
+
+        raise RuntimeError(f"Execution Engine exceeded local step guard for AgentRun {agent_run.metadata.name}")
+
+    def _start_engine(self, run: AgentRunResource, agent: AgentResource) -> AgentRunResource:
+        data = dict(run.status.data)
+        data.setdefault("executionStartedAt", utciso())
+        data["executionState"] = "Starting"
+        data["executionOwner"] = "local"
+        data["executionEpoch"] = int(data.get("executionEpoch", 0)) + 1
+        data.setdefault("executionFrames", [])
+        data.setdefault("budgetUsage", self._initial_budget_usage())
+        data["executionBudget"] = self._budget_snapshot(run.spec.execution)
+        started = self._transition(
+            run,
+            "Starting",
+            "Execution Engine started",
+            data,
+            "ExecutionEngineStarted",
+            "StartExecutionEngine",
+            "ExecutionEngineStarted",
+        )
+        self._emit_run_event(
+            started,
+            "AgentRunStarted",
+            "AgentRun execution started",
+            {"agent": agent.metadata.name, "budget": data["executionBudget"]},
+            "StartAgentRun",
+            "AgentRunStarted",
+        )
+        try:
+            self._authorize_declared_tools(agent, started)
+        except ApprovalRequired:
+            return self._refresh_run(started)
+        except PolicyDenied as exc:
+            return self._fail_run(started, exc.reason, "PolicyDenied", retryable=False)
+        return started
+
+    def _prepare_execution(
+        self,
+        run: AgentRunResource,
+        agent: AgentResource,
+        context: ContextResource,
+    ) -> AgentRunResource:
         if context.status.phase != "Ready":
-            raise RuntimeError(f"Context {context.metadata.name} is {context.status.phase}, not Ready")
+            return self._fail_run(
+                run,
+                f"Context {context.metadata.name} is {context.status.phase}, not Ready",
+                "ContextNotReady",
+                retryable=True,
+            )
         rendered_context = context.status.data.get("renderedContext")
         if not isinstance(rendered_context, str):
-            raise RuntimeError(f"Context {context.metadata.name} does not contain renderedContext")
-
-        self.store.update_status(
-            ResourceKind.AGENT_RUN,
-            agent_run.metadata.name,
-            namespace,
-            "Running",
-            "AgentRun execution started",
-            {"agent": agent.metadata.name, "context": context.metadata.name},
-            event_type="AgentRunStarted",
-            event_context=self._context(agent_run, "StartAgentRun", "AgentRunStarted"),
+            return self._fail_run(
+                run,
+                f"Context {context.metadata.name} does not contain renderedContext",
+                "ContextNotReady",
+                retryable=True,
+            )
+        if not run.status.data.get("contextConsumed"):
+            self._emit_context_consumed(run, context, agent)
+        data = dict(run.status.data)
+        data["executionState"] = "AwaitingDecision"
+        data["context"] = context.metadata.name
+        data["contextRevision"] = context.metadata.generation
+        data["agent"] = agent.metadata.name
+        data["contextConsumed"] = True
+        return self._transition(
+            run,
+            "AwaitingDecision",
+            "Execution frame prepared",
+            data,
+            "ExecutionFramePrepared",
+            "PrepareExecutionFrame",
+            "ExecutionFramePrepared",
         )
 
-        self._authorize_declared_tools(agent, agent_run)
+    async def _request_decision(
+        self,
+        run: AgentRunResource,
+        agent: AgentResource,
+        mission: MissionResource,
+        workspace: WorkspaceResource,
+        context: ContextResource,
+    ) -> AgentRunResource:
+        frame_result = self._ensure_active_frame(run, agent, mission, context)
+        if frame_result.status.phase in AGENT_RUN_TERMINAL_PHASES:
+            return frame_result
+        run = frame_result
+        data = dict(run.status.data)
+        usage = self._budget_usage(data)
+        budget = run.spec.execution
+        if usage["modelInvocations"] >= budget.maxModelInvocations:
+            return self._budget_exceeded(run, "maxModelInvocations")
+
+        frame, frames = self._active_frame(data)
+        attempt = int(frame.get("modelAttempts", 0)) + 1
+        frame["modelAttempts"] = attempt
+        frame["decisionRequestedAt"] = utciso()
+        frame["state"] = "decision-requested"
+        usage["modelInvocations"] += 1
+        usage["wallTimeSeconds"] = self._wall_time_seconds(data)
+        frame["budgetUsage"] = dict(usage)
+        data["budgetUsage"] = usage
+        data["executionFrames"] = frames
+        data["activeFrameIndex"] = frames.index(frame)
+        run = self._save_run_data(run, data)
+        self._emit_budget_updated(run, usage, budget)
+
         model_config = self._model_for_agent(agent, mission, workspace)
-        messages = self._build_messages(mission, rendered_context)
-        client = build_model_client(model_config, store=self.store)
-        self._emit_context_consumed(agent_run, context, agent)
+        try:
+            self._authorize(
+                agent,
+                run,
+                "model",
+                "invoke",
+                {"provider": model_config.provider, "model": model_config.model},
+            )
+        except ApprovalRequired:
+            return self._refresh_run(run)
+        except PolicyDenied as exc:
+            return self._fail_run(run, exc.reason, "PolicyDenied", retryable=False)
 
-        self._authorize(
-            agent,
-            agent_run,
-            "model",
-            "invoke",
-            {"provider": model_config.provider, "model": model_config.model},
+        self._emit_run_event(
+            run,
+            "DecisionRequested",
+            f"Decision requested for iteration {frame['iteration']}",
+            {
+                "iteration": frame["iteration"],
+                "attempt": attempt,
+                "model": model_config.model,
+                "provider": model_config.provider,
+                "budget": dict(usage),
+            },
+            "RequestDecision",
+            "DecisionRequested",
         )
-        self.store.emit_event(
+        self._emit_run_event(
+            run,
             "ModelInvoked",
-            ResourceKind.AGENT_RUN,
-            agent_run.metadata.name,
-            namespace,
             f"Invoking {model_config.provider}:{model_config.model}",
-            {"provider": model_config.provider, "model": model_config.model},
-            event_context=self._context(agent_run, "InvokeModel", "ModelInvoked"),
+            {"provider": model_config.provider, "model": model_config.model, "iteration": frame["iteration"]},
+            "InvokeModel",
+            "ModelInvoked",
         )
-        output = await client.generate(messages)
-        artifact_path = self._write_artifact(workspace, mission, agent, agent_run, output)
-        artifact = self._record_artifact_resource(agent_run, agent, mission, artifact_path)
 
-        self.store.update_status(
-            ResourceKind.AGENT_RUN,
-            agent_run.metadata.name,
-            namespace,
+        messages = self._build_messages(mission, context, data, frame)
+        client = self.model_client_factory(model_config, self.store)
+        try:
+            raw_decision = await asyncio.wait_for(client.generate(messages), timeout=model_config.timeoutSeconds)
+        except asyncio.TimeoutError:
+            frame["modelError"] = {
+                "reason": "ModelInvocationTimedOut",
+                "message": f"Model invocation timed out after {model_config.timeoutSeconds:g} seconds",
+                "attempt": attempt,
+            }
+            data["executionFrames"] = frames
+            self._save_run_data(run, data)
+            return self._timed_out(run, "ModelInvocationTimedOut", frame["modelError"]["message"])
+        except Exception as exc:
+            frame["modelError"] = {"reason": "ModelInvocationFailed", "message": str(exc), "attempt": attempt}
+            frame["retryCount"] = int(frame.get("retryCount", 0)) + 1
+            frame["modelRetryCount"] = int(frame.get("modelRetryCount", 0)) + 1
+            data["executionFrames"] = frames
+            self._save_run_data(run, data)
+            if frame["modelRetryCount"] <= budget.maxModelRetries:
+                self._emit_retry_scheduled(run, frame, "ModelInvocationFailed", str(exc))
+                return self._refresh_run(run)
+            return self._fail_run(run, str(exc), "ModelInvocationFailed", retryable=True)
+
+        data = dict(self._refresh_run(run).status.data)
+        frame, frames = self._active_frame(data)
+        frame["rawDecision"] = raw_decision
+        frame["decisionProducedAt"] = utciso()
+        frame["state"] = "decision-produced"
+        frame["modelInvocation"] = {
+            "provider": model_config.provider,
+            "model": model_config.model,
+            "attempt": attempt,
+        }
+        data["executionFrames"] = frames
+        data["activeDecisionSummary"] = {"raw": self._redact_text(raw_decision)}
+        return self._transition(
+            run,
+            "DecisionReady",
+            "Decision produced",
+            data,
+            "DecisionProduced",
+            "ProduceDecision",
+            "DecisionProduced",
+        )
+
+    def _validate_current_decision(self, run: AgentRunResource, agent: AgentResource) -> AgentRunResource:
+        data = dict(run.status.data)
+        usage = self._budget_usage(data)
+        frame, frames = self._active_frame(data)
+        raw_decision = frame.get("rawDecision")
+        try:
+            decision = self._parse_and_validate_decision(raw_decision, agent, run, usage)
+        except DecisionValidationError as exc:
+            usage["decisionFailures"] += 1
+            usage["failures"] += 1
+            frame["state"] = "decision-rejected"
+            frame["decisionValidation"] = {
+                "status": "Rejected",
+                "reason": exc.reason,
+                "message": exc.message,
+                "validatedAt": utciso(),
+            }
+            frame.setdefault("rejections", []).append(frame["decisionValidation"])
+            frame["retryCount"] = int(frame.get("retryCount", 0)) + 1
+            frame["invalidDecisionRetryCount"] = int(frame.get("invalidDecisionRetryCount", 0)) + 1
+            frame["budgetUsage"] = dict(usage)
+            data["budgetUsage"] = usage
+            data["executionFrames"] = frames
+            data["activeDecisionSummary"] = {"rejected": exc.reason, "message": exc.message}
+            self._emit_run_event(
+                run,
+                "DecisionRejected",
+                exc.message,
+                {
+                    "iteration": frame["iteration"],
+                    "attempt": frame.get("modelAttempts", 1),
+                    "reason": exc.reason,
+                    "budget": dict(usage),
+                },
+                "RejectDecision",
+                exc.reason,
+            )
+            if usage["decisionFailures"] <= run.spec.execution.maxDecisionFailures:
+                rejected = self._transition(
+                    run,
+                    "AwaitingDecision",
+                    exc.message,
+                    data,
+                    "DecisionRejected",
+                    "RejectDecision",
+                    exc.reason,
+                )
+                self._emit_retry_scheduled(rejected, frame, exc.reason, exc.message)
+                return rejected
+            data["terminalReason"] = exc.reason
+            data["retryable"] = False
+            data["diagnosticSummary"] = exc.message
+            return self._transition(
+                run,
+                "Failed",
+                exc.message,
+                data,
+                "ExecutionFailed",
+                "FailAgentRun",
+                exc.reason,
+            )
+
+        frame["decision"] = decision
+        frame["decisionValidation"] = {
+            "status": "Accepted",
+            "reason": "DecisionValidated",
+            "validatedAt": utciso(),
+        }
+        frame["state"] = "decision-validated"
+        frame["budgetUsage"] = dict(usage)
+        data["executionFrames"] = frames
+        data["budgetUsage"] = usage
+        data["activeDecisionSummary"] = self._decision_summary(decision)
+        return self._transition(
+            run,
+            "ProcessingDecision",
+            f"Decision {decision['type']} validated",
+            data,
+            "DecisionValidated",
+            "ValidateDecision",
+            "DecisionValidated",
+        )
+
+    def _process_current_decision(
+        self,
+        run: AgentRunResource,
+        agent: AgentResource,
+        mission: MissionResource,
+    ) -> AgentRunResource:
+        cancelled = self._cancel_if_requested(run)
+        if cancelled is not None:
+            return cancelled
+        data = dict(run.status.data)
+        frame, frames = self._active_frame(data)
+        decision = frame.get("decision")
+        if not isinstance(decision, dict):
+            return self._fail_run(run, "No persisted Decision to process", "DecisionValidationFailed", retryable=False)
+        decision_type = decision.get("type")
+        if decision_type == "invoke_tool":
+            if frame.get("toolInvocation"):
+                return self._transition(
+                    run,
+                    "WaitingForTool",
+                    f"Waiting for ToolInvocation {frame['toolInvocation']}",
+                    data,
+                    "ToolInvocationCreated",
+                    "WaitForTool",
+                    "ToolInvocationCreated",
+                )
+            return self._create_tool_invocation(run, agent, decision, frame, frames, data)
+        if decision_type == "complete":
+            frame["state"] = "finalizing"
+            frame["finalizingAt"] = utciso()
+            data["completionDecision"] = decision
+            data["executionFrames"] = frames
+            return self._transition(
+                run,
+                "Finalizing",
+                "Execution finalizing",
+                data,
+                "ExecutionFinalizing",
+                "FinalizeExecution",
+                "ExecutionFinalizing",
+            )
+        if decision_type == "fail":
+            reason = str(decision.get("reason") or "AgentRun failed by Decision")
+            retryable = bool(decision.get("retryable"))
+            return self._fail_run(run, reason, "DecisionFailed", retryable=retryable)
+        return self._fail_run(
+            run, f"Unsupported Decision type {decision_type}", "DecisionTypeUnsupported", retryable=False
+        )
+
+    def _create_tool_invocation(
+        self,
+        run: AgentRunResource,
+        agent: AgentResource,
+        decision: dict[str, Any],
+        frame: dict[str, Any],
+        frames: list[dict[str, Any]],
+        data: dict[str, Any],
+    ) -> AgentRunResource:
+        cancelled = self._cancel_if_requested(run)
+        if cancelled is not None:
+            return cancelled
+        usage = self._budget_usage(data)
+        if usage["toolInvocations"] >= run.spec.execution.maxToolInvocations:
+            return self._budget_exceeded(run, "maxToolInvocations")
+
+        namespace = run.metadata.namespace
+        if namespace is None:
+            raise ValueError("AgentRun must have a namespace")
+        tool_name = str(decision["tool"])
+        operation_name = str(decision["operation"])
+        tool, operation = self._tool_and_operation(tool_name, operation_name)
+        invocation_name = self._tool_invocation_name(run, frame)
+        existing = self.store.get(ResourceKind.TOOL_INVOCATION, invocation_name, namespace)
+        if existing is None:
+            timeout = operation.timeoutSeconds or tool.spec.timeoutSeconds
+            manifest = {
+                "apiVersion": "ai.platform/v1",
+                "kind": "ToolInvocation",
+                "metadata": {
+                    "name": invocation_name,
+                    "namespace": namespace,
+                    "ownerReferences": [{"kind": "AgentRun", "name": run.metadata.name, "controller": True}],
+                },
+                "spec": {
+                    "agentRunRef": {"name": run.metadata.name},
+                    "tool": tool_name,
+                    "operation": operation_name,
+                    "arguments": decision["arguments"],
+                    "correlationId": run_correlation_id(run),
+                    "idempotencyKey": self._idempotency_key(run, frame, decision),
+                    "timeoutSeconds": timeout,
+                    "riskLevel": operation.riskLevel or tool.spec.riskLevel,
+                },
+            }
+            self.store.apply(
+                manifest,
+                event_context=self._context(run, "CreateToolInvocation", "ToolInvocationCreated"),
+                field_manager=CONTROLLER_FIELD_MANAGER,
+            )
+            usage["toolInvocations"] += 1
+            self._emit_budget_updated(run, usage, run.spec.execution)
+
+        frame["toolInvocation"] = invocation_name
+        frame["state"] = "waiting-for-tool"
+        frame["toolInvocationCreatedAt"] = frame.get("toolInvocationCreatedAt") or utciso()
+        frame["budgetUsage"] = dict(usage)
+        data["budgetUsage"] = usage
+        data["executionFrames"] = frames
+        data["activeToolInvocation"] = invocation_name
+        data["activeDecisionSummary"] = self._decision_summary(decision)
+        data["executionState"] = "WaitingForTool"
+        data.setdefault("completedToolInvocations", [])
+        data.setdefault("unresolvedToolInvocations", [])
+        data["agent"] = agent.metadata.name
+        return self._transition(
+            run,
+            "WaitingForTool",
+            f"ToolInvocation {invocation_name} created",
+            data,
+            "ToolInvocationCreated",
+            "CreateToolInvocation",
+            "ToolInvocationCreated",
+        )
+
+    async def _resume_waiting_for_tool(self, run: AgentRunResource, agent: AgentResource) -> AgentRunResource:
+        data = dict(run.status.data)
+        frame, frames = self._active_frame(data)
+        invocation_name = frame.get("toolInvocation") or data.get("activeToolInvocation")
+        if not isinstance(invocation_name, str):
+            return self._fail_run(run, "No active ToolInvocation recorded", "ExecutionStateInvalid", retryable=False)
+        invocation = self._tool_invocation(invocation_name, run.metadata.namespace)
+        if invocation.status.phase == "Running":
+            observation = self._error_observation(
+                "ExecutionStateUnknown",
+                "ToolInvocation was already Running; refusing to replay execution",
+            )
+            self._set_tool_status(
+                invocation,
+                run,
+                "Failed",
+                observation.summary,
+                "ToolInvocationFailed",
+                {"error": observation.summary},
+                observation=observation,
+            )
+            self._record_observation(invocation, run, observation)
+            invocation = self._tool_invocation(invocation_name, run.metadata.namespace)
+        if invocation.status.phase == "WaitingForApproval" and self._approval_is_pending(invocation):
+            return run
+        if invocation.status.phase not in TOOL_TERMINAL_PHASES:
+            status = await self._execute_tool_invocation(run, agent, invocation, frame, frames, data)
+            if status == "waiting":
+                return self._refresh_run(run)
+            invocation = self._tool_invocation(invocation_name, run.metadata.namespace)
+        if invocation.status.phase in TOOL_TERMINAL_PHASES:
+            frame["state"] = "tool-observed"
+            frame["toolInvocationPhase"] = invocation.status.phase
+            frame["toolObservedAt"] = utciso()
+            data["executionFrames"] = frames
+            data["activeToolInvocation"] = invocation.metadata.name
+            return self._transition(
+                run,
+                "WaitingForObservation",
+                f"ToolInvocation {invocation.metadata.name} observed",
+                data,
+                "ToolInvocationObserved",
+                "ObserveToolInvocation",
+                "ToolInvocationObserved",
+            )
+        return self._refresh_run(run)
+
+    async def _execute_tool_invocation(
+        self,
+        run: AgentRunResource,
+        agent: AgentResource,
+        invocation: ToolInvocationResource,
+        frame: dict[str, Any],
+        frames: list[dict[str, Any]],
+        data: dict[str, Any],
+    ) -> str:
+        usage = self._budget_usage(data)
+        while True:
+            try:
+                tool, operation = self._tool_and_operation(invocation.spec.tool, invocation.spec.operation)
+                self._validate_arguments(
+                    invocation.spec.arguments, operation, f"ToolInvocation {invocation.metadata.name} arguments"
+                )
+                decision = self.policy_engine.authorize(
+                    self._runtime_action(invocation, run, agent),
+                    pause_agent_run=False,
+                    approval_agent_run=True,
+                )
+            except ApprovalRequired as exc:
+                self._set_tool_status(
+                    invocation,
+                    run,
+                    "WaitingForApproval",
+                    f"ToolInvocation waiting for approval {exc.approval_id}",
+                    "ToolInvocationWaitingForApproval",
+                    {"approval": exc.approval_id, "approvalId": exc.approval_id, "policyDecision": "RequireApproval"},
+                )
+                self._transition(
+                    run,
+                    "WaitingForTool",
+                    f"Waiting for approval {exc.approval_id}",
+                    {
+                        **data,
+                        "pendingApproval": exc.approval_id,
+                        "approval": exc.approval_id,
+                        "approvalId": exc.approval_id,
+                    },
+                    "ExecutionFramePrepared",
+                    "WaitForApproval",
+                    "ApprovalRequired",
+                )
+                return "waiting"
+            except PolicyDenied as exc:
+                observation = self._error_observation("PolicyDenied", exc.reason)
+                self._set_tool_status(
+                    invocation,
+                    run,
+                    "Denied",
+                    "ToolInvocation denied by Policy",
+                    "ToolInvocationDenied",
+                    {"policyDecision": "Deny", "reason": exc.reason},
+                    observation=observation,
+                )
+                self._record_observation(invocation, run, observation)
+                return "terminal"
+            except Exception as exc:
+                observation = self._error_observation("ToolInvocationFailed", str(exc))
+                self._set_tool_status(
+                    invocation,
+                    run,
+                    "Failed",
+                    str(exc),
+                    "ToolInvocationFailed",
+                    {"error": str(exc)},
+                    observation=observation,
+                )
+                self._record_observation(invocation, run, observation)
+                return "terminal"
+
+            runtime = self.tool_runtime_registry.resolve(invocation)
+            runtime_id = runtime.runtime_id
+            self._set_tool_status(
+                invocation,
+                run,
+                "Authorized",
+                "ToolInvocation authorized by Policy",
+                "ToolInvocationAuthorized",
+                {
+                    "runtime": runtime_id,
+                    "policyDecision": decision.effect.value,
+                    "policy": decision.policy_name,
+                    "ruleIndex": decision.rule_index,
+                },
+            )
+            self._set_tool_status(
+                invocation,
+                run,
+                "Running",
+                "ToolInvocation execution started",
+                "ToolInvocationStarted",
+                {"runtime": runtime_id},
+            )
+            try:
+                observation = await self._execute_runtime(runtime, invocation, tool, operation)
+            except TimeoutError:
+                timeout_seconds = self._effective_timeout(invocation, tool, operation)
+                timeout_display = f"{timeout_seconds:g}" if timeout_seconds is not None else "unknown"
+                message = f"ToolInvocation timed out after {timeout_display} seconds"
+                usage["toolFailures"] += 1
+                usage["failures"] += 1
+                frame["toolRetryCount"] = int(frame.get("toolRetryCount", 0)) + 1
+                frame["budgetUsage"] = dict(usage)
+                data["budgetUsage"] = usage
+                data["executionFrames"] = frames
+                self._save_run_data(run, data)
+                observation = self._error_observation("ToolInvocationTimedOut", message)
+                self._set_tool_status(
+                    invocation,
+                    run,
+                    "TimedOut",
+                    message,
+                    "ToolInvocationTimedOut",
+                    {"runtime": runtime_id, "error": message, "timeoutSeconds": timeout_seconds},
+                    observation=observation,
+                )
+                self._record_observation(invocation, run, observation)
+                return "terminal"
+            except Exception as exc:
+                usage["toolFailures"] += 1
+                usage["failures"] += 1
+                frame["toolRetryCount"] = int(frame.get("toolRetryCount", 0)) + 1
+                frame["retryCount"] = int(frame.get("retryCount", 0)) + 1
+                frame["budgetUsage"] = dict(usage)
+                data["budgetUsage"] = usage
+                data["executionFrames"] = frames
+                self._save_run_data(run, data)
+                if usage["toolFailures"] > run.spec.execution.maxToolFailures:
+                    observation = self._error_observation("ToolFailureBudgetExceeded", str(exc))
+                    self._set_tool_status(
+                        invocation,
+                        run,
+                        "Failed",
+                        str(exc),
+                        "ToolInvocationFailed",
+                        {"runtime": runtime_id, "error": str(exc)},
+                        observation=observation,
+                    )
+                    self._record_observation(invocation, run, observation)
+                    self._budget_exceeded(run, "maxToolFailures")
+                    return "terminal"
+                if frame["toolRetryCount"] <= run.spec.execution.maxToolRetries:
+                    self._emit_retry_scheduled(run, frame, "ToolRuntimeError", str(exc))
+                    self.store.update_status(
+                        ResourceKind.TOOL_INVOCATION,
+                        invocation.metadata.name,
+                        invocation.metadata.namespace,
+                        "Pending",
+                        "Tool runtime retry scheduled",
+                        {"runtime": runtime_id, "retryCount": frame["toolRetryCount"]},
+                        event_context=self._tool_context(
+                            invocation, run, "RetryToolInvocation", "ExecutionRetryScheduled"
+                        ),
+                    )
+                    invocation = self._tool_invocation(invocation.metadata.name, invocation.metadata.namespace)
+                    continue
+                observation = self._error_observation("ToolRuntimeError", str(exc))
+                self._set_tool_status(
+                    invocation,
+                    run,
+                    "Failed",
+                    str(exc),
+                    "ToolInvocationFailed",
+                    {"runtime": runtime_id, "error": str(exc)},
+                    observation=observation,
+                )
+                self._record_observation(invocation, run, observation)
+                return "terminal"
+
+            self._set_tool_status(
+                invocation,
+                run,
+                "Succeeded",
+                "ToolInvocation completed successfully",
+                "ToolInvocationCompleted",
+                {"runtime": runtime_id},
+                observation=observation,
+            )
+            self._record_observation(invocation, run, observation)
+            return "terminal"
+
+    def _deliver_observation(self, run: AgentRunResource) -> AgentRunResource:
+        data = dict(run.status.data)
+        frame, frames = self._active_frame(data)
+        invocation_name = frame.get("toolInvocation") or data.get("activeToolInvocation")
+        if not isinstance(invocation_name, str):
+            return self._fail_run(run, "No ToolInvocation to deliver", "ExecutionStateInvalid", retryable=False)
+        invocation = self._tool_invocation(invocation_name, run.metadata.namespace)
+        observation = invocation.status.observation
+        if observation is None:
+            return self._fail_run(
+                run,
+                f"ToolInvocation {invocation.metadata.name} has no Observation",
+                "ObservationMissing",
+                retryable=True,
+            )
+        observation_payload = observation.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
+        frame["observation"] = observation_payload
+        frame["observationDeliveredAt"] = utciso()
+        frame["state"] = "observation-delivered"
+        data["executionFrames"] = frames
+        completed = list(data.get("completedToolInvocations") or [])
+        unresolved = list(data.get("unresolvedToolInvocations") or [])
+        if observation.error is None:
+            if invocation.metadata.name not in completed:
+                completed.append(invocation.metadata.name)
+            data["lastSuccessfulIteration"] = frame["iteration"]
+        elif invocation.metadata.name not in unresolved:
+            unresolved.append(invocation.metadata.name)
+        data["completedToolInvocations"] = completed
+        data["unresolvedToolInvocations"] = unresolved
+        data["executionState"] = "AwaitingDecision"
+        return self._transition(
+            run,
+            "AwaitingDecision",
+            f"Observation delivered for ToolInvocation {invocation.metadata.name}",
+            data,
+            "ObservationDelivered",
+            "DeliverObservation",
+            "ObservationDelivered",
+            clear_data_keys=[
+                "activeDecisionSummary",
+                "activeToolInvocation",
+                "pendingApproval",
+                "approval",
+                "approvalId",
+            ],
+        )
+
+    def _finalize_run(
+        self,
+        run: AgentRunResource,
+        agent: AgentResource,
+        mission: MissionResource,
+        workspace: WorkspaceResource,
+    ) -> AgentRunResource:
+        data = dict(run.status.data)
+        frame, frames = self._active_frame(data)
+        decision = frame.get("decision")
+        if not isinstance(decision, dict) or decision.get("type") != "complete":
+            return self._fail_run(run, "No completion Decision to finalize", "FinalizationFailed", retryable=True)
+        try:
+            self._validate_outputs(mission, decision)
+            artifact_path = self._write_artifact(workspace, mission, agent, run, str(decision["summary"]))
+            artifact = self._record_artifact_resource(run, agent, mission, artifact_path)
+        except ApprovalRequired:
+            return self._refresh_run(run)
+        except Exception as exc:
+            return self._fail_run(run, str(exc), "FinalizationFailed", retryable=True)
+        frame["state"] = "finalized"
+        frame["finalizedAt"] = utciso()
+        data["executionFrames"] = frames
+        data["artifact"] = artifact["metadata"]["name"]
+        data["artifactPath"] = str(artifact_path)
+        data["completedOutputs"] = decision.get("outputs", [])
+        data["terminalReason"] = "Completed"
+        data["retryable"] = False
+        data["diagnosticSummary"] = decision["summary"]
+        data["executionState"] = "Succeeded"
+        succeeded = self._transition(
+            run,
             "Succeeded",
             "AgentRun completed successfully",
-            {
-                "artifact": artifact["metadata"]["name"],
-                "artifactPath": str(artifact_path),
-                "context": context.metadata.name,
-                "agent": agent.metadata.name,
-            },
-            event_type="AgentRunCompleted",
-            event_context=self._context(agent_run, "CompleteAgentRun", "AgentRunCompleted"),
+            data,
+            "ExecutionCompleted",
+            "CompleteExecution",
+            "ExecutionCompleted",
+            clear_data_keys=["activeDecisionSummary", "activeToolInvocation", "activeFrameIndex"],
         )
-        return {"artifactPath": str(artifact_path)}
+        self._emit_run_event(
+            succeeded,
+            "AgentRunCompleted",
+            "AgentRun completed successfully",
+            {"artifact": artifact["metadata"]["name"], "artifactPath": str(artifact_path)},
+            "CompleteAgentRun",
+            "AgentRunCompleted",
+        )
+        return succeeded
 
     def _authorize_declared_tools(self, agent: AgentResource, run: AgentRunResource) -> None:
         for tool_name in agent.spec.tools:
@@ -208,7 +969,14 @@ class AgentRuntime:
             return model.spec.config
         return agent.spec.model or mission.spec.model or workspace.spec.model
 
-    def _build_messages(self, mission: MissionResource, rendered_context: str) -> list[Message]:
+    def _build_messages(
+        self,
+        mission: MissionResource,
+        context: ContextResource,
+        data: dict[str, Any],
+        frame: dict[str, Any],
+    ) -> list[Message]:
+        rendered_context = context.status.data.get("renderedContext")
         user_parts = []
         if mission.spec.objective:
             user_parts.append(f"Objective: {mission.spec.objective}")
@@ -220,12 +988,27 @@ class AgentRuntime:
             outputs = ", ".join(name for name, enabled in mission.spec.outputs.items() if enabled)
             if outputs:
                 user_parts.append(f"Requested outputs: {outputs}")
+        prior_frames = [
+            {
+                "iteration": item.get("iteration"),
+                "decision": item.get("decision"),
+                "observation": item.get("observation"),
+                "validation": item.get("decisionValidation"),
+            }
+            for item in data.get("executionFrames", [])
+            if isinstance(item, dict) and item.get("iteration") != frame.get("iteration")
+        ]
+        if prior_frames:
+            user_parts.append(f"Prior execution frames:\n{json.dumps(prior_frames, sort_keys=True)}")
+        if frame.get("rejections"):
+            user_parts.append(f"Validation feedback:\n{json.dumps(frame['rejections'], sort_keys=True)}")
         return [
             {
                 "role": "system",
                 "content": (
                     "You are an autonomous agent in a declarative AI control plane. "
-                    "Produce a concise artifact that advances the mission objective."
+                    "Return exactly one JSON Decision object using version v1 and type "
+                    "invoke_tool, complete, or fail. Do not return natural-language text outside JSON."
                 ),
             },
             {"role": "user", "content": "\n\n".join(user_parts)},
@@ -319,3 +1102,770 @@ class AgentRuntime:
     @staticmethod
     def _artifact_relative_path(mission: MissionResource, run: AgentRunResource) -> Path:
         return Path("artifacts") / mission.metadata.name / f"{run.metadata.name}.md"
+
+    def _refresh_run(self, run: AgentRunResource) -> AgentRunResource:
+        return self._load_resource(ResourceKind.AGENT_RUN, run.metadata.name, run.metadata.namespace, AgentRunResource)
+
+    def _transition(
+        self,
+        run: AgentRunResource,
+        phase: str,
+        message: str,
+        data: dict[str, Any],
+        event_type: str,
+        action: str,
+        reason: str,
+        *,
+        clear_data_keys: list[str] | None = None,
+    ) -> AgentRunResource:
+        data = dict(data)
+        data["executionState"] = phase
+        usage = self._budget_usage(data)
+        usage["wallTimeSeconds"] = self._wall_time_seconds(data)
+        data["budgetUsage"] = usage
+        manifest = self.store.update_status(
+            ResourceKind.AGENT_RUN,
+            run.metadata.name,
+            run.metadata.namespace,
+            phase,
+            message,
+            data,
+            event_type=event_type,
+            event_context=self._context(run, action, reason),
+            clear_data_keys=clear_data_keys,
+        )
+        parsed = parse_resource(manifest)
+        if not isinstance(parsed, AgentRunResource):
+            raise TypeError(f"expected AgentRunResource, got {type(parsed).__name__}")
+        return parsed
+
+    def _save_run_data(self, run: AgentRunResource, data: dict[str, Any]) -> AgentRunResource:
+        manifest = self.store.update_status(
+            ResourceKind.AGENT_RUN,
+            run.metadata.name,
+            run.metadata.namespace,
+            run.status.phase,
+            run.status.message,
+            data,
+            event_context=self._context(run, "PersistExecutionState", "ExecutionStatePersisted"),
+        )
+        parsed = parse_resource(manifest)
+        if not isinstance(parsed, AgentRunResource):
+            raise TypeError(f"expected AgentRunResource, got {type(parsed).__name__}")
+        return parsed
+
+    def _emit_run_event(
+        self,
+        run: AgentRunResource,
+        event_type: str,
+        message: str,
+        payload: dict[str, Any],
+        action: str,
+        reason: str,
+    ) -> None:
+        self.store.emit_event(
+            event_type,
+            ResourceKind.AGENT_RUN,
+            run.metadata.name,
+            run.metadata.namespace,
+            message,
+            {
+                "agentRun": run.metadata.name,
+                "budget": run.status.data.get("budgetUsage"),
+                **payload,
+            },
+            event_context=self._context(run, action, reason),
+        )
+
+    def _ensure_active_frame(
+        self,
+        run: AgentRunResource,
+        agent: AgentResource,
+        mission: MissionResource,
+        context: ContextResource,
+    ) -> AgentRunResource:
+        data = dict(run.status.data)
+        frames = self._frames(data)
+        active_index = data.get("activeFrameIndex")
+        active = frames[active_index] if isinstance(active_index, int) and 0 <= active_index < len(frames) else None
+        if active is not None:
+            state = str(active.get("state") or "")
+            if state in {"observation-delivered", "finalized", "decision-rejected"}:
+                active = None
+            elif state == "tool-observed":
+                data["executionFrames"] = frames
+                return self._transition(
+                    run,
+                    "WaitingForObservation",
+                    "Waiting for Observation delivery",
+                    data,
+                    "ExecutionFramePrepared",
+                    "ResumeObservationFrame",
+                    "ExecutionFramePrepared",
+                )
+        if active is not None:
+            state = str(active.get("state") or "")
+            if active.get("toolInvocation") and not active.get("observation"):
+                data["executionFrames"] = frames
+                data["activeToolInvocation"] = active["toolInvocation"]
+                return self._transition(
+                    run,
+                    "WaitingForTool",
+                    f"Waiting for ToolInvocation {active['toolInvocation']}",
+                    data,
+                    "ExecutionFramePrepared",
+                    "ResumeToolFrame",
+                    "ExecutionFramePrepared",
+                )
+            if active.get("decision") and state not in {"observation-delivered", "finalized", "decision-rejected"}:
+                data["executionFrames"] = frames
+                return self._transition(
+                    run,
+                    "ProcessingDecision",
+                    "Resuming persisted Decision",
+                    data,
+                    "ExecutionFramePrepared",
+                    "ResumeDecisionFrame",
+                    "ExecutionFramePrepared",
+                )
+            if active.get("rawDecision") and state not in {"observation-delivered", "finalized", "decision-rejected"}:
+                data["executionFrames"] = frames
+                return self._transition(
+                    run,
+                    "DecisionReady",
+                    "Resuming persisted Decision response",
+                    data,
+                    "ExecutionFramePrepared",
+                    "ResumeDecisionFrame",
+                    "ExecutionFramePrepared",
+                )
+            if state == "decision-requested" and not active.get("rawDecision"):
+                return run
+            if state not in {"observation-delivered", "finalized", "decision-rejected"}:
+                return run
+
+        usage = self._budget_usage(data)
+        if usage["iterations"] >= run.spec.execution.maxIterations:
+            return self._budget_exceeded(run, "maxIterations")
+        usage["iterations"] += 1
+        usage["wallTimeSeconds"] = self._wall_time_seconds(data)
+        iteration = usage["iterations"]
+        frame = {
+            "iteration": iteration,
+            "state": "prepared",
+            "preparedAt": utciso(),
+            "retryCount": 0,
+            "modelRetryCount": 0,
+            "invalidDecisionRetryCount": 0,
+            "toolRetryCount": 0,
+            "budgetUsage": dict(usage),
+            "agent": agent.metadata.name,
+            "mission": mission.metadata.name,
+            "context": context.metadata.name,
+            "contextRevision": context.metadata.generation,
+            "correlationId": run_correlation_id(run),
+            "pilot": (agent.spec.pilot.model_dump(mode="json", exclude_none=True) if agent.spec.pilot else None),
+        }
+        frames.append(frame)
+        data["executionFrames"] = frames
+        data["activeFrameIndex"] = len(frames) - 1
+        data["budgetUsage"] = usage
+        return self._transition(
+            run,
+            "AwaitingDecision",
+            f"Execution frame {iteration} prepared",
+            data,
+            "ExecutionFramePrepared",
+            "PrepareExecutionFrame",
+            "ExecutionFramePrepared",
+        )
+
+    @staticmethod
+    def _frames(data: dict[str, Any]) -> list[dict[str, Any]]:
+        frames = data.get("executionFrames")
+        return [dict(item) for item in frames] if isinstance(frames, list) else []
+
+    def _active_frame(self, data: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        frames = self._frames(data)
+        active_index = data.get("activeFrameIndex")
+        if not isinstance(active_index, int) or not 0 <= active_index < len(frames):
+            raise RuntimeError("AgentRun has no active ExecutionFrame")
+        return frames[active_index], frames
+
+    @staticmethod
+    def _initial_budget_usage() -> dict[str, Any]:
+        return {
+            "iterations": 0,
+            "modelInvocations": 0,
+            "toolInvocations": 0,
+            "decisionFailures": 0,
+            "toolFailures": 0,
+            "failures": 0,
+            "wallTimeSeconds": 0.0,
+            "inputTokens": "Unknown",
+            "outputTokens": "Unknown",
+        }
+
+    def _budget_usage(self, data: dict[str, Any]) -> dict[str, Any]:
+        usage = self._initial_budget_usage()
+        raw = data.get("budgetUsage")
+        if isinstance(raw, dict):
+            usage.update(raw)
+        for key in (
+            "iterations",
+            "modelInvocations",
+            "toolInvocations",
+            "decisionFailures",
+            "toolFailures",
+            "failures",
+        ):
+            usage[key] = int(usage.get(key) or 0)
+        usage["wallTimeSeconds"] = float(usage.get("wallTimeSeconds") or 0.0)
+        return usage
+
+    @staticmethod
+    def _budget_snapshot(budget: ExecutionSpec) -> dict[str, Any]:
+        return budget.model_dump(mode="json")
+
+    def _wall_time_seconds(self, data: dict[str, Any]) -> float:
+        started_at = data.get("executionStartedAt")
+        if not isinstance(started_at, str):
+            return 0.0
+        try:
+            started = datetime.fromisoformat(started_at)
+        except ValueError:
+            return 0.0
+        return max(0.0, (datetime.now(UTC) - started).total_seconds())
+
+    def _emit_budget_updated(self, run: AgentRunResource, usage: dict[str, Any], budget: ExecutionSpec) -> None:
+        self._emit_run_event(
+            run,
+            "ExecutionBudgetUpdated",
+            "Execution budget usage updated",
+            {"usage": dict(usage), "limits": self._budget_snapshot(budget)},
+            "UpdateBudget",
+            "ExecutionBudgetUpdated",
+        )
+
+    def _cancel_if_requested(self, run: AgentRunResource) -> AgentRunResource | None:
+        if not run.spec.cancellationRequested:
+            return None
+        data = dict(run.status.data)
+        if not data.get("cancellationRequestedEvent"):
+            data["cancellationRequestedEvent"] = utciso()
+            self._emit_run_event(
+                run,
+                "CancellationRequested",
+                "AgentRun cancellation requested",
+                {"agentRun": run.metadata.name},
+                "RequestCancellation",
+                "CancellationRequested",
+            )
+        self._emit_run_event(
+            run,
+            "CancellationAcknowledged",
+            "AgentRun cancellation acknowledged",
+            {"agentRun": run.metadata.name},
+            "AcknowledgeCancellation",
+            "CancellationAcknowledged",
+        )
+        data["terminalReason"] = "CancellationRequested"
+        data["retryable"] = False
+        data["diagnosticSummary"] = "AgentRun cancelled"
+        return self._transition(
+            run,
+            "Cancelled",
+            "AgentRun cancelled",
+            data,
+            "ExecutionCancelled",
+            "CancelExecution",
+            "ExecutionCancelled",
+            clear_data_keys=[
+                "activeDecisionSummary",
+                "activeToolInvocation",
+                "pendingApproval",
+                "approval",
+                "approvalId",
+            ],
+        )
+
+    def _timeout_if_expired(self, run: AgentRunResource) -> AgentRunResource | None:
+        data = dict(run.status.data)
+        if "executionStartedAt" not in data:
+            return None
+        wall_time = self._wall_time_seconds(data)
+        if wall_time < run.spec.execution.maxWallTimeSeconds:
+            return None
+        return self._timed_out(
+            run,
+            "AgentRunTimedOut",
+            f"AgentRun timed out after {run.spec.execution.maxWallTimeSeconds:g} seconds",
+        )
+
+    def _timed_out(self, run: AgentRunResource, reason: str, message: str) -> AgentRunResource:
+        data = dict(run.status.data)
+        data["terminalReason"] = reason
+        data["retryable"] = False
+        data["diagnosticSummary"] = message
+        return self._transition(
+            run,
+            "TimedOut",
+            message,
+            data,
+            "ExecutionTimedOut",
+            "TimeoutExecution",
+            reason,
+            clear_data_keys=[
+                "activeDecisionSummary",
+                "activeToolInvocation",
+                "pendingApproval",
+                "approval",
+                "approvalId",
+            ],
+        )
+
+    def _budget_exceeded(self, run: AgentRunResource, limit: str) -> AgentRunResource:
+        data = dict(run.status.data)
+        usage = self._budget_usage(data)
+        usage["wallTimeSeconds"] = self._wall_time_seconds(data)
+        data["budgetUsage"] = usage
+        data["exceededBudget"] = limit
+        data["terminalReason"] = "BudgetExceeded"
+        data["retryable"] = False
+        data["diagnosticSummary"] = f"Execution budget exceeded: {limit}"
+        return self._transition(
+            run,
+            "BudgetExceeded",
+            f"Execution budget exceeded: {limit}",
+            data,
+            "ExecutionBudgetExceeded",
+            "ExceedBudget",
+            limit,
+            clear_data_keys=[
+                "activeDecisionSummary",
+                "activeToolInvocation",
+                "pendingApproval",
+                "approval",
+                "approvalId",
+            ],
+        )
+
+    def _fail_run(self, run: AgentRunResource, message: str, reason: str, *, retryable: bool) -> AgentRunResource:
+        data = dict(run.status.data)
+        data["terminalReason"] = reason
+        data["retryable"] = retryable
+        data["diagnosticSummary"] = message
+        failed = self._transition(
+            run,
+            "Failed",
+            message,
+            data,
+            "ExecutionFailed",
+            "FailExecution",
+            reason,
+            clear_data_keys=[
+                "activeDecisionSummary",
+                "activeToolInvocation",
+                "pendingApproval",
+                "approval",
+                "approvalId",
+            ],
+        )
+        self._emit_run_event(
+            failed,
+            "AgentRunFailed",
+            message,
+            {"error": message, "reason": reason, "retryable": retryable},
+            "FailAgentRun",
+            reason,
+        )
+        return failed
+
+    def _parse_and_validate_decision(
+        self,
+        raw_decision: Any,
+        agent: AgentResource,
+        run: AgentRunResource,
+        usage: dict[str, Any],
+    ) -> dict[str, Any]:
+        if isinstance(raw_decision, str):
+            try:
+                decision = json.loads(raw_decision)
+            except json.JSONDecodeError as exc:
+                raise DecisionValidationError(
+                    "DecisionParseFailed", f"Decision response is not valid JSON: {exc}"
+                ) from exc
+        elif isinstance(raw_decision, dict):
+            decision = raw_decision
+        else:
+            raise DecisionValidationError("DecisionParseFailed", "Decision response must be an object")
+
+        if not isinstance(decision, dict):
+            raise DecisionValidationError("DecisionValidationFailed", "Decision must be a JSON object")
+        if decision.get("version") != "v1":
+            raise DecisionValidationError("DecisionVersionUnsupported", "Decision version must be v1")
+        decision_type = decision.get("type")
+        if not isinstance(decision_type, str):
+            raise DecisionValidationError("DecisionValidationFailed", "Decision type is required")
+        if decision_type == "request_input":
+            raise DecisionValidationError("DecisionTypeUnsupported", "request_input is not implemented")
+        if decision_type not in {"invoke_tool", "complete", "fail"}:
+            raise DecisionValidationError("DecisionTypeUnsupported", f"Unsupported Decision type: {decision_type}")
+
+        if decision_type == "invoke_tool":
+            tool = decision.get("tool")
+            operation = decision.get("operation")
+            arguments = decision.get("arguments")
+            if not isinstance(tool, str) or not tool:
+                raise DecisionValidationError("DecisionValidationFailed", "invoke_tool Decision requires tool")
+            if not isinstance(operation, str) or not operation:
+                raise DecisionValidationError("DecisionValidationFailed", "invoke_tool Decision requires operation")
+            if not isinstance(arguments, dict):
+                raise DecisionValidationError(
+                    "DecisionValidationFailed", "invoke_tool Decision requires arguments object"
+                )
+            if tool not in agent.spec.tools:
+                raise DecisionValidationError(
+                    "CapabilityViolation", f"Agent {agent.metadata.name} cannot use Tool {tool}"
+                )
+            if usage["toolInvocations"] >= run.spec.execution.maxToolInvocations:
+                raise DecisionValidationError("DecisionValidationFailed", "ToolInvocation budget is exhausted")
+            try:
+                _tool, operation_spec = self._tool_and_operation(tool, operation)
+                self._validate_arguments(arguments, operation_spec, f"Decision {tool}.{operation} arguments")
+            except DecisionValidationError:
+                raise
+            except Exception as exc:
+                raise DecisionValidationError("ToolArgumentsInvalid", str(exc)) from exc
+            return {
+                "version": "v1",
+                "type": "invoke_tool",
+                "tool": tool,
+                "operation": operation,
+                "arguments": arguments,
+            }
+
+        if decision_type == "complete":
+            summary = decision.get("summary")
+            outputs = decision.get("outputs")
+            if not isinstance(summary, str) or not summary.strip():
+                raise DecisionValidationError("DecisionValidationFailed", "complete Decision requires summary")
+            if not isinstance(outputs, list):
+                raise DecisionValidationError("DecisionValidationFailed", "complete Decision requires outputs array")
+            if any(not isinstance(item, dict) for item in outputs):
+                raise DecisionValidationError("DecisionValidationFailed", "complete Decision outputs must be objects")
+            return {"version": "v1", "type": "complete", "summary": summary, "outputs": outputs}
+
+        reason = decision.get("reason")
+        retryable = decision.get("retryable")
+        if not isinstance(reason, str) or not reason.strip():
+            raise DecisionValidationError("DecisionValidationFailed", "fail Decision requires reason")
+        if not isinstance(retryable, bool):
+            raise DecisionValidationError("DecisionValidationFailed", "fail Decision requires retryable boolean")
+        return {"version": "v1", "type": "fail", "reason": reason, "retryable": retryable}
+
+    @staticmethod
+    def _decision_summary(decision: dict[str, Any]) -> dict[str, Any]:
+        decision_type = str(decision.get("type"))
+        if decision_type == "invoke_tool":
+            return {
+                "type": "invoke_tool",
+                "version": decision.get("version"),
+                "tool": decision.get("tool"),
+                "operation": decision.get("operation"),
+            }
+        if decision_type == "complete":
+            return {
+                "type": "complete",
+                "version": decision.get("version"),
+                "summary": AgentRuntime._redact_text(str(decision.get("summary") or "")),
+                "outputCount": len(decision.get("outputs") or []),
+            }
+        if decision_type == "fail":
+            return {
+                "type": "fail",
+                "version": decision.get("version"),
+                "reason": decision.get("reason"),
+                "retryable": decision.get("retryable"),
+            }
+        return {"type": decision_type}
+
+    @staticmethod
+    def _redact_text(value: str, limit: int = 240) -> str:
+        compact = " ".join(value.split())
+        if len(compact) <= limit:
+            return compact
+        return f"{compact[: limit - 3]}..."
+
+    def _tool_and_operation(self, tool_name: str, operation_name: str) -> tuple[ToolResource, ToolOperationSpec]:
+        manifest = self.store.get(ResourceKind.TOOL, tool_name)
+        if manifest is None:
+            raise DecisionValidationError("CapabilityViolation", f"Tool {tool_name} not found")
+        tool = parse_resource(manifest)
+        if not isinstance(tool, ToolResource):
+            raise TypeError(f"expected ToolResource, got {type(tool).__name__}")
+        if not tool.spec.operations:
+            raise DecisionValidationError(
+                "CapabilityViolation", f"Tool {tool_name} does not define supported operations"
+            )
+        operation = next((candidate for candidate in tool.spec.operations if candidate.name == operation_name), None)
+        if operation is None:
+            raise DecisionValidationError(
+                "CapabilityViolation",
+                f"Tool {tool_name} does not support operation {operation_name}",
+            )
+        return tool, operation
+
+    def _validate_arguments(
+        self,
+        arguments: dict[str, Any],
+        operation: ToolOperationSpec,
+        path: str,
+    ) -> None:
+        if operation.inputSchema:
+            self._validate_schema_value(arguments, operation.inputSchema, path)
+
+    def _validate_schema_value(self, value: Any, schema: dict[str, Any], path: str) -> None:
+        expected_type = schema.get("type")
+        if expected_type is not None and not self._schema_type_matches(value, expected_type):
+            expected = ", ".join(expected_type) if isinstance(expected_type, list) else str(expected_type)
+            raise DecisionValidationError("ToolArgumentsInvalid", f"{path} must be {expected}")
+        enum = schema.get("enum")
+        if isinstance(enum, list) and value not in enum:
+            raise DecisionValidationError("ToolArgumentsInvalid", f"{path} must be one of: {', '.join(map(str, enum))}")
+        if schema.get("type") == "object" or isinstance(value, dict):
+            if not isinstance(value, dict):
+                raise DecisionValidationError("ToolArgumentsInvalid", f"{path} must be object")
+            required = schema.get("required") or []
+            if not isinstance(required, list):
+                raise DecisionValidationError("ToolArgumentsInvalid", f"{path} schema required must be a list")
+            for field_name in required:
+                if not isinstance(field_name, str):
+                    raise DecisionValidationError(
+                        "ToolArgumentsInvalid", f"{path} schema required entries must be strings"
+                    )
+                if field_name not in value:
+                    raise DecisionValidationError("ToolArgumentsInvalid", f"{path}.{field_name} is required")
+            properties = schema.get("properties") or {}
+            if not isinstance(properties, dict):
+                raise DecisionValidationError("ToolArgumentsInvalid", f"{path} schema properties must be an object")
+            for field_name, property_schema in properties.items():
+                if field_name in value and isinstance(property_schema, dict):
+                    self._validate_schema_value(value[field_name], property_schema, f"{path}.{field_name}")
+        if schema.get("type") == "array" or isinstance(value, list):
+            if not isinstance(value, list):
+                raise DecisionValidationError("ToolArgumentsInvalid", f"{path} must be array")
+            items_schema = schema.get("items")
+            if items_schema is not None and not isinstance(items_schema, dict):
+                raise DecisionValidationError("ToolArgumentsInvalid", f"{path} schema items must be an object")
+            if isinstance(items_schema, dict):
+                for index, item in enumerate(value):
+                    self._validate_schema_value(item, items_schema, f"{path}[{index}]")
+
+    @staticmethod
+    def _schema_type_matches(value: Any, expected_type: Any) -> bool:
+        if isinstance(expected_type, list):
+            return any(AgentRuntime._schema_type_matches(value, item) for item in expected_type)
+        if expected_type == "object":
+            return isinstance(value, dict)
+        if expected_type == "array":
+            return isinstance(value, list)
+        if expected_type == "string":
+            return isinstance(value, str)
+        if expected_type == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if expected_type == "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if expected_type == "boolean":
+            return isinstance(value, bool)
+        if expected_type == "null":
+            return value is None
+        return True
+
+    @staticmethod
+    def _validate_outputs(mission: MissionResource, decision: dict[str, Any]) -> None:
+        required_outputs = {name for name, enabled in mission.spec.outputs.items() if enabled}
+        outputs = decision.get("outputs") or []
+        if required_outputs and not outputs:
+            raise RuntimeError("Completion Decision did not include required outputs")
+        output_names = {
+            str(item.get("name") or item.get("type") or item.get("ref")) for item in outputs if isinstance(item, dict)
+        }
+        missing = sorted(required_outputs - output_names)
+        if missing:
+            raise RuntimeError(f"Completion Decision missing required outputs: {', '.join(missing)}")
+
+    @staticmethod
+    def _tool_invocation_name(run: AgentRunResource, frame: dict[str, Any]) -> str:
+        generation = run.status.observedGeneration or run.metadata.generation
+        return f"{run.metadata.name}-tool-{generation}-{int(frame['iteration']):04d}-1"
+
+    @staticmethod
+    def _idempotency_key(run: AgentRunResource, frame: dict[str, Any], decision: dict[str, Any]) -> str:
+        payload = {
+            "agentRun": run.metadata.name,
+            "generation": run.status.observedGeneration or run.metadata.generation,
+            "iteration": frame.get("iteration"),
+            "decision": decision,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _tool_invocation(self, name: str, namespace: str | None) -> ToolInvocationResource:
+        manifest = self.store.get(ResourceKind.TOOL_INVOCATION, name, namespace)
+        if manifest is None:
+            raise RuntimeError(f"ToolInvocation {name} not found")
+        invocation = parse_resource(manifest)
+        if not isinstance(invocation, ToolInvocationResource):
+            raise TypeError(f"expected ToolInvocationResource, got {type(invocation).__name__}")
+        return invocation
+
+    def _approval_is_pending(self, invocation: ToolInvocationResource) -> bool:
+        approval_id = invocation.status.data.get("approvalId") or invocation.status.data.get("approval")
+        if not isinstance(approval_id, str):
+            return False
+        approval = self.store.get(ResourceKind.APPROVAL, approval_id)
+        return bool(approval and (approval.get("status") or {}).get("phase") == "Pending")
+
+    async def _execute_runtime(
+        self,
+        runtime: ToolRuntime,
+        invocation: ToolInvocationResource,
+        tool: ToolResource,
+        operation: ToolOperationSpec,
+    ) -> Observation:
+        execute = asyncio.to_thread(runtime.execute, invocation)
+        timeout_seconds = self._effective_timeout(invocation, tool, operation)
+        if timeout_seconds is None:
+            return await execute
+        try:
+            return await asyncio.wait_for(execute, timeout=timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError from exc
+
+    @staticmethod
+    def _effective_timeout(
+        invocation: ToolInvocationResource,
+        tool: ToolResource,
+        operation: ToolOperationSpec,
+    ) -> float | None:
+        return invocation.spec.timeoutSeconds or operation.timeoutSeconds or tool.spec.timeoutSeconds
+
+    def _runtime_action(
+        self,
+        invocation: ToolInvocationResource,
+        run: AgentRunResource,
+        agent: AgentResource,
+    ) -> RuntimeAction:
+        return RuntimeAction(
+            tool=invocation.spec.tool,
+            operation=invocation.spec.operation,
+            details={
+                "toolInvocation": invocation.metadata.name,
+                "arguments": invocation.spec.arguments,
+            },
+            workspace=invocation.metadata.namespace,
+            mission=run.spec.missionRef.name,
+            agent=agent.metadata.name,
+            agentRun=run.metadata.name,
+            correlation_id=run_correlation_id(run),
+        )
+
+    def _set_tool_status(
+        self,
+        invocation: ToolInvocationResource,
+        run: AgentRunResource,
+        phase: str,
+        message: str,
+        event_type: str,
+        data: dict[str, Any],
+        *,
+        observation: Observation | None = None,
+    ) -> None:
+        self.store.update_status(
+            ResourceKind.TOOL_INVOCATION,
+            invocation.metadata.name,
+            invocation.metadata.namespace,
+            phase,
+            message,
+            {**self._tool_event_payload(invocation, run), **data},
+            event_type=event_type,
+            event_context=self._tool_context(invocation, run, event_type, phase),
+            observation=observation,
+        )
+
+    def _record_observation(
+        self,
+        invocation: ToolInvocationResource,
+        run: AgentRunResource,
+        observation: Observation,
+    ) -> None:
+        self.store.emit_event(
+            "ObservationRecorded",
+            ResourceKind.TOOL_INVOCATION,
+            invocation.metadata.name,
+            invocation.metadata.namespace,
+            f"Observation recorded for ToolInvocation {invocation.metadata.name}",
+            {
+                **self._tool_event_payload(invocation, run),
+                "observation": observation.model_dump(mode="json", exclude_none=True, exclude_defaults=True),
+                "summary": observation.summary,
+            },
+            event_context=self._tool_context(invocation, run, "RecordObservation", "ObservationRecorded"),
+        )
+
+    @staticmethod
+    def _tool_event_payload(invocation: ToolInvocationResource, run: AgentRunResource) -> dict[str, Any]:
+        return {
+            "workspace": invocation.metadata.namespace,
+            "agentRun": run.metadata.name,
+            "toolInvocation": invocation.metadata.name,
+            "tool": invocation.spec.tool,
+            "operation": invocation.spec.operation,
+        }
+
+    def _tool_context(
+        self,
+        invocation: ToolInvocationResource,
+        run: AgentRunResource,
+        action: str,
+        reason: str,
+    ) -> EventContext:
+        return EventContext(
+            controller="AgentRuntime",
+            action=action,
+            reason=reason,
+            correlation_id=run_correlation_id(run),
+            workspace=invocation.metadata.namespace,
+            mission=run.spec.missionRef.name,
+        )
+
+    @staticmethod
+    def _error_observation(reason: str, message: str) -> Observation:
+        return Observation(
+            summary=message,
+            error=ObservationError(reason=reason, message=message),
+        )
+
+    def _emit_retry_scheduled(
+        self,
+        run: AgentRunResource,
+        frame: dict[str, Any],
+        reason: str,
+        message: str,
+    ) -> None:
+        self._emit_run_event(
+            run,
+            "ExecutionRetryScheduled",
+            message,
+            {
+                "iteration": frame.get("iteration"),
+                "retryCount": frame.get("retryCount", 0),
+                "modelRetryCount": frame.get("modelRetryCount", 0),
+                "invalidDecisionRetryCount": frame.get("invalidDecisionRetryCount", 0),
+                "toolRetryCount": frame.get("toolRetryCount", 0),
+                "reason": reason,
+            },
+            "ScheduleRetry",
+            reason,
+        )

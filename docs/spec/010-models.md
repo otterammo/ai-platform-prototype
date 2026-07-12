@@ -4,7 +4,7 @@
 
 Model describes a replaceable model backend available to the platform. A Model
 defines provider identity, capabilities, limits, and configuration needed by a
-Pilot to invoke that backend.
+Pilot and Provider Adapter to invoke that backend.
 
 Models MUST remain replaceable. Missions, Fleets, and Agents SHOULD avoid
 depending on provider-specific behavior unless a provider-specific contract is
@@ -22,7 +22,7 @@ be used if the platform defines a secure provider contract.
 
 Model provider identifies the backend family or protocol. Provider configuration
 MAY include endpoint, model identifier, credential reference, timeout, sampling
-settings, and provider-specific options.
+settings, Provider Adapter selection, and provider-specific options.
 
 Provider-specific settings MUST be isolated to Model configuration or
 provider-specific extension fields. They MUST NOT leak into Mission semantics.
@@ -37,8 +37,9 @@ class.
 Capability matching SHOULD happen before AgentRun execution. A Pilot MUST NOT
 select a Model that fails required capability constraints.
 
-Models produce provider output that Pilot adapts into Decisions. A Model MUST
-NOT directly create platform Resources, ToolInvocations, Artifacts, or Events.
+Models produce provider output that Provider Adapters normalize into Decisions.
+A Model MUST NOT directly create platform Resources, ToolInvocations,
+Artifacts, or Events.
 
 ## Limits
 
@@ -66,7 +67,7 @@ reason, and correlation data.
 
 ## Replacement
 
-A Model can be replaced by changing routing, capability matching, or provider
-configuration without changing Mission intent. Replacing a Model MUST preserve
-Decision compatibility, resource ownership, policy evaluation, event
-traceability, and Artifact ownership.
+A Model can be replaced by changing routing, capability matching, Provider
+Adapter selection, or provider configuration without changing Mission intent.
+Replacing a Model MUST preserve Decision compatibility, resource ownership,
+policy evaluation, event traceability, and Artifact ownership.

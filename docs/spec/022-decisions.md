@@ -10,20 +10,25 @@ Decision represents intent. It is not a Resource. The Execution Engine
 determines how Decision intent maps to platform resources, status, events, and
 trace.
 
-The platform has three foundational protocols:
+The platform has four foundational protocols:
 
 - Declarative Resources for desired and observed platform state.
 - Events for immutable lifecycle and audit history.
 - Decisions for provider-neutral Model intent consumed by the Execution Engine.
+- Model Protocol for normalizing provider-specific responses into canonical
+  Decisions.
 
 ## Participants
 
-Pilot owns prompt construction, model routing, provider adaptation, response
-parsing, and Decision production. Pilot MUST NOT execute Decisions and MUST NOT
-create Resources.
+Pilot owns prompt construction, model routing, fallback, and Provider Adapter
+selection. Pilot MUST NOT execute Decisions and MUST NOT create Resources.
 
-Model produces provider-specific output that Pilot adapts into the platform
-Decision protocol. Model MUST NOT directly create platform Resources.
+Provider Adapter owns provider-specific request construction, response parsing,
+metadata extraction, and canonical Decision production. Provider Adapter MUST
+NOT execute Decisions and MUST NOT create Resources.
+
+Model produces provider-specific output that Provider Adapter adapts into the
+platform Decision protocol. Model MUST NOT directly create platform Resources.
 
 Execution Engine owns Decision validation, Decision interpretation,
 ToolInvocation creation, Policy integration, Observation handling, retries,
@@ -143,7 +148,8 @@ MUST follow this pipeline:
 
 ```text
 Provider response
--> Pilot parsing
+-> Provider Adapter parsing
+-> Canonical Decision production
 -> Decision schema validation
 -> Decision version validation
 -> Decision semantic validation
@@ -252,8 +258,10 @@ state, and any rejection or retry.
 ## Compatibility
 
 Decision protocol versions are independent from Resource `apiVersion` values.
-The v1 Decision protocol was introduced in Platform Specification `v1.2.0` and
-its execution-loop semantics are refined by Platform Specification `v1.3.0`.
+The v1 Decision protocol was introduced in Platform Specification `v1.2.0`, its
+execution-loop semantics are refined by Platform Specification `v1.3.0`, and
+its provider-normalization boundary is defined by Platform Specification
+`v1.4.0`.
 
 Future Decision versions SHOULD remain backward compatible where practical.
 Execution Engines MAY reject unsupported Decision versions. Model providers
@@ -261,5 +269,6 @@ SHOULD negotiate supported Decision versions through Pilot configuration or
 capability matching before AgentRun execution.
 
 Provider-native tool calling or structured-output formats MAY be used behind
-Model adapters, but the platform Decision protocol remains the canonical
-contract observed by the Execution Engine.
+Provider Adapters, but the platform Decision protocol remains the canonical
+contract observed by the Execution Engine. Provider-specific schemas MUST NOT
+leak beyond the Provider Adapter boundary.

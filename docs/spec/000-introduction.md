@@ -1,8 +1,8 @@
-# Platform Specification v1.3.0
+# Platform Specification v1.4.0
 
 ## Purpose
 
-This specification defines the v1.3.0 architecture and behavioral contracts for
+This specification defines the v1.4.0 architecture and behavioral contracts for
 the AI Platform. It is the normative source of truth for resources,
 controllers, runtimes, APIs, command-line tools, and extensions that claim
 compatibility with `ai.platform/v1`.
@@ -45,12 +45,14 @@ rules for the Platform Specification and resource APIs are defined in
 
 ## Foundational Protocols
 
-The platform has three foundational protocols:
+The platform has four foundational protocols:
 
 - Declarative Resources define desired and observed platform state.
 - Events define immutable lifecycle and audit history.
 - Decisions define provider-neutral Model intent interpreted by the Execution
   Engine.
+- Model Protocol defines how Provider Adapters normalize provider-specific
+  responses into canonical Decisions.
 
 ## Platform Goals
 

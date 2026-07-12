@@ -240,10 +240,25 @@ class AgentSpec(BaseModel):
     pilot: PilotConfig | None = None
 
 
+class ExecutionSpec(BaseModel):
+    maxIterations: int = Field(default=50, ge=0)
+    maxToolInvocations: int = Field(default=40, ge=0)
+    maxModelInvocations: int = Field(default=50, ge=0)
+    maxDecisionFailures: int = Field(default=3, ge=0)
+    maxToolFailures: int = Field(default=5, ge=0)
+    maxWallTimeSeconds: float = Field(default=1800.0, ge=0)
+    maxInputTokens: int | None = Field(default=250000, ge=0)
+    maxOutputTokens: int | None = Field(default=100000, ge=0)
+    maxModelRetries: int = Field(default=2, ge=0)
+    maxToolRetries: int = Field(default=2, ge=0)
+
+
 class AgentRunSpec(BaseModel):
     agentRef: ResourceRef
     missionRef: ResourceRef
     contextRef: ResourceRef
+    execution: ExecutionSpec = Field(default_factory=ExecutionSpec)
+    cancellationRequested: bool = False
 
 
 class ProducedByRef(BaseModel):

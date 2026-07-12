@@ -13,7 +13,7 @@ from .knowledge import DEFAULT_INDEX_NAME, KeywordRetriever, KnowledgeIndexer
 from .observability import build_timeline, build_trace
 from .policy import ApprovalService
 from .resources import ResourceKind, parse_resource_documents
-from .storage import DEFAULT_DB_URL, ResourceStore
+from .storage import CONTROLLER_FIELD_MANAGER, DEFAULT_DB_URL, ResourceStore
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -141,6 +141,17 @@ def create_app(
     @app.get("/agentruns")
     async def list_agent_runs(namespace: str | None = None) -> dict[str, list[dict[str, Any]]]:
         return {"items": store.list(ResourceKind.AGENT_RUN, namespace)}
+
+    @app.post("/agentruns/{name}/cancel")
+    async def cancel_agent_run(name: str, namespace: str) -> dict[str, Any]:
+        manifest = store.get(ResourceKind.AGENT_RUN, name, namespace)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="agentrun not found")
+        next_manifest = dict(manifest)
+        spec = dict(next_manifest.get("spec") or {})
+        spec["cancellationRequested"] = True
+        next_manifest["spec"] = spec
+        return store.apply(next_manifest, field_manager=CONTROLLER_FIELD_MANAGER)
 
     @app.get("/toolinvocations")
     async def list_tool_invocations(namespace: str | None = None) -> dict[str, list[dict[str, Any]]]:

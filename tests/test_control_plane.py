@@ -218,7 +218,7 @@ def test_reconcile_creates_fleet_agent_artifact_and_events(tmp_path: Path) -> No
     assert "Source: knowledge://prd.md" in artifact_text
     assert "Ship authentication" in artifact_text
 
-    event_types = {event["type"] for event in store.list_events(limit=50)}
+    event_types = {event["type"] for event in store.list_events(limit=None)}
     assert {
         "MissionCreated",
         "FleetCreated",

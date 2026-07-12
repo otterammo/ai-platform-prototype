@@ -87,14 +87,19 @@ status:
 The registry-driven reconciliation flow is:
 
 ```text
-Platform -> Workspace -> Mission -> FleetTemplate -> Fleet -> Agent -> AgentRun -> Pilot/Model
+Platform -> Workspace -> Mission -> FleetTemplate -> Fleet -> Agent -> AgentRun
 ```
 
 Runtime actions pass through the policy engine before side effects occur:
 
 ```text
-AgentRun Worker -> Policy Engine -> Approval Service (optional) -> Runtime
+AgentRun -> Execution Engine -> Pilot/Model -> Decision -> ToolInvocation -> Observation -> Decision -> Artifact
 ```
+
+The Execution Engine owns the AgentRun loop. It persists ExecutionFrames,
+validates Decisions, creates deterministic ToolInvocations, delivers
+Observations to later iterations, enforces budgets/timeouts/cancellation, and
+records terminal state.
 
 Knowledge now flows through an indexed retrieval path before model invocation:
 
@@ -177,6 +182,7 @@ platform --db sqlite:///./platform.db --root .platform describe mission implemen
 platform --db sqlite:///./platform.db --root .platform describe knowledgeindex default -n demo
 platform --db sqlite:///./platform.db --root .platform get contexts -n demo
 platform --db sqlite:///./platform.db --root .platform events
+platform --db sqlite:///./platform.db --root .platform cancel agentrun <run-name> -n demo
 ```
 
 Run the API:
@@ -194,6 +200,7 @@ Useful endpoints:
 - `POST /reconcile`
 - `GET /events`
 - `GET /agentruns`
+- `POST /agentruns/{name}/cancel?namespace=demo`
 - `GET /knowledge`
 - `GET /knowledge/search`
 - `GET /knowledge/indexes`
@@ -207,7 +214,11 @@ Useful endpoints:
 
 Deleting a Mission or Workspace removes the corresponding resource and Artifact records from SQLite, but it does not delete artifact files from disk.
 
-The local prototype keeps the scheduler and worker in process. Controllers create desired resources; the scheduler marks Pending AgentRuns as Scheduled; the local worker executes only Scheduled AgentRuns and records Artifact resources.
+The local prototype keeps the scheduler and worker in process. Controllers
+create desired resources; the scheduler marks Pending AgentRuns as Scheduled;
+the local worker resumes scheduled or waiting AgentRuns through the durable
+Execution Engine and records Artifact resources only after a valid `complete`
+Decision.
 
 ## Knowledge Index And Retrieval
 

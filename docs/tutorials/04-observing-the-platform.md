@@ -11,8 +11,9 @@ Mission
                 `-- Controller
                     `-- AgentRun
                         `-- Scheduler
-                            `-- Worker
-                                `-- Artifact
+                            `-- Execution Engine
+                                `-- Decision / ToolInvocation / Observation
+                                    `-- Artifact
 ```
 
 Run reconciliation until the Mission reaches the approval gate:
@@ -52,6 +53,9 @@ Concepts introduced here:
 
 - Controllers create or update child resources.
 - The scheduler moves ready AgentRuns to `Scheduled`.
-- The local worker executes scheduled AgentRuns.
-- Runtime consumes `Context`, evaluates `Policy`, invokes the model, and writes
-  Artifacts only after policy allows the action.
+- The local worker resumes AgentRuns through the Execution Engine.
+- Runtime consumes `Context`, evaluates `Policy`, requests structured
+  Decisions, persists ExecutionFrames, and writes Artifacts only after a valid
+  `complete` Decision.
+- Trace shows ExecutionFrames, Decisions, budget usage, ToolInvocations,
+  Observations, approvals, and terminal state.

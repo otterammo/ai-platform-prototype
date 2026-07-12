@@ -25,7 +25,7 @@ class StubModelClient(ModelClient):
 
     async def generate(self, messages: list[Message]) -> str:
         user_content = "\n\n".join(message["content"] for message in messages if message["role"] == "user")
-        return (
+        artifact = (
             "# Agent Result\n\n"
             "This artifact was produced by the stub model.\n\n"
             "## Interpreted Objective\n\n"
@@ -35,6 +35,28 @@ class StubModelClient(ModelClient):
             "2. Replace the stub model with an OpenAI-compatible endpoint for real execution.\n"
             "3. Add domain-specific tools to the Agent spec.\n"
         )
+        outputs = [
+            {"type": output_name, "ref": f"stub://outputs/{output_name}"}
+            for output_name in self._requested_outputs(user_content)
+        ]
+        return json.dumps(
+            {
+                "version": "v1",
+                "type": "complete",
+                "summary": artifact,
+                "outputs": outputs,
+            },
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _requested_outputs(user_content: str) -> list[str]:
+        for line in user_content.splitlines():
+            if not line.startswith("Requested outputs:"):
+                continue
+            _, _, raw_outputs = line.partition(":")
+            return [item.strip() for item in raw_outputs.split(",") if item.strip()]
+        return []
 
 
 class OpenAICompatibleClient(ModelClient):

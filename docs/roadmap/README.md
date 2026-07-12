@@ -10,7 +10,7 @@ maturity.
 | --- | --- | --- |
 | Foundation | Complete | Specification, RFC, ADR, roadmap, contributing, and review docs exist. |
 | RFC-0001 Tool Invocation Framework | Complete | Implemented in Platform Specification `v1.1.0` by [PR #12](https://github.com/otterammo/ai-platform-prototype/pull/12). |
-| RFC-0002 AgentRun Execution Engine Loop | Accepted | Platform Specification `v1.3.0` defines explicit Execution Engine loop semantics. |
+| RFC-0002 AgentRun Execution Engine Loop | Complete | Implemented in Platform Specification `v1.3.0` by [PR #15](https://github.com/otterammo/ai-platform-prototype/pull/15). |
 | Decision protocol | Specified | Platform Specification `v1.2.0` introduced Decision as the Model-to-Execution Engine protocol; `v1.3.0` refines execution-loop handling. |
 | ToolInvocation resource contract | Complete | ToolInvocation is a Workspace-scoped AgentRun child with immutable spec, policy authorization, runtime execution, events, and trace projection. |
 | Observation model | Complete for v1.1 | Observation data is embedded in `ToolInvocation.status.observation` and projected through CLI, API, events, and trace. |
@@ -93,8 +93,11 @@ Exit criteria:
 Progress:
 
 - RFC-0001 added the first governed ToolInvocation execution slice.
-- RFC-0002 accepted the explicit Execution Engine loop contract and must be
-  implemented before iterative AgentRun execution begins.
+- RFC-0002 completed the explicit local Execution Engine loop contract,
+  including persisted execution-frame state, deterministic ToolInvocation
+  creation, Observation delivery, budgets, cancellation, timeout, retry, resume,
+  and trace/events. `request_input` remains specified but unsupported by the
+  initial implementation.
 
 ## Distributed Runtime
 

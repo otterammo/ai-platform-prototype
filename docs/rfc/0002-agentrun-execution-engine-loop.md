@@ -10,19 +10,62 @@ TBD.
 
 ## Status
 
-Accepted.
+Implemented.
 
 ## Decision Date
 
 2026-07-11.
 
+## Implementation
+
+- Implementation PR:
+  [#15](https://github.com/otterammo/ai-platform-prototype/pull/15)
+- Merge commit:
+  `4f8399724a537b38ed1ac8524544e1473464279b`
+- Implementation version: Platform Specification `v1.3.0`
+- Implementation date: 2026-07-12
+- Superseded sections: none. The implementation scope and acceptance-test
+  sections remain historical implementation guidance; the normative contract is
+  the Platform Specification `v1.3.0` text.
+
+## Governance Review
+
+ADR coverage:
+
+- [ADR 0009: Durable AgentRun Execution Loop](../adr/0009-durable-agentrun-execution-loop.md)
+  records durable execution state, ExecutionFrame as an internal concept,
+  crash-safe resume, non-destructive replay, and single-owner execution.
+- [ADR 0010: Execution Budget And Terminal State Enforcement](../adr/0010-execution-budget-and-terminal-state-enforcement.md)
+  records Execution Engine ownership of budget enforcement and terminal-state
+  selection.
+
+Specification consistency review:
+
+- [Execution Engine](../spec/023-execution-engine.md) contains the normative
+  loop, budgets, completion, failure, resume, retry, cancellation, timeout,
+  ToolInvocation ownership, request-input deferral, leases, events, and trace
+  semantics.
+- [AgentRuns](../spec/008-agent-runs.md), [Runtime](../spec/013-runtime.md),
+  [Events](../spec/014-events.md), [Tool Invocations](../spec/021-tool-invocations.md),
+  [Decisions](../spec/022-decisions.md), and [Glossary](../spec/018-glossary.md)
+  align with the implemented RFC-0002 boundary.
+
 ## Formal Review Conclusion
 
 Accept.
 
-RFC-0002 is accepted as the Platform Specification `v1.3.0` execution-loop
-contract. Implementation MUST NOT begin until the normative specification
-updates in this RFC are present. This RFC does not implement runtime behavior.
+RFC-0002 is implemented as the Platform Specification `v1.3.0` execution-loop
+contract by PR #15.
+
+The merged implementation provides the local Execution Engine loop, persisted
+ExecutionFrame-equivalent status data, deterministic ToolInvocation creation,
+Observation delivery, explicit completion and failure Decisions, budget
+enforcement, cancellation, timeout handling, invalid Decision retries,
+crash-safe resume behavior, and trace/events for the implemented loop.
+
+`request_input` remains specified but unsupported by the initial implementation.
+The implementation rejects `request_input` as an unsupported Decision type
+rather than entering partial waiting behavior.
 
 ## Motivation
 

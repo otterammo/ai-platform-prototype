@@ -12,7 +12,8 @@ Use [template.md](template.md) for new RFCs.
   - Implemented in Platform Specification `v1.1.0` by
     [PR #12](https://github.com/otterammo/ai-platform-prototype/pull/12).
 - [RFC-0002: AgentRun Execution Engine Loop](0002-agentrun-execution-engine-loop.md)
-  - Accepted in Platform Specification `v1.3.0`.
+  - Implemented in Platform Specification `v1.3.0` by
+    [PR #15](https://github.com/otterammo/ai-platform-prototype/pull/15).
 - [RFC-0003: Built-In Tool Runtime](0003-built-in-tool-runtime.md)
   - Draft.
 - [RFC-0004: Structured Model Protocol](0004-structured-model-protocol.md)

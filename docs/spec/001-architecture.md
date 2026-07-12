@@ -24,7 +24,10 @@ Execution uses protocol boundaries that are not all resources:
 AgentRun
 -> Execution Engine
 -> Pilot
+-> Provider Adapter
 -> Model
+-> Provider Response
+-> Provider Adapter
 -> Decision
 -> Execution Engine
 -> Platform Resources
@@ -63,12 +66,16 @@ Context represents assembled, provenance-bearing information prepared for an
 AgentRun. Runtime MUST consume Context and MUST NOT query Knowledge directly.
 
 Pilot represents the stateless agent reasoning and model orchestration policy.
-Pilot owns prompt construction, model selection, provider adaptation, response
-parsing, and Decision production. Model is a replaceable execution backend
-selected or routed by Pilot.
+Pilot owns prompt construction, model selection, routing, and fallback.
+Provider Adapter owns provider-specific request construction, response parsing,
+metadata extraction, and canonical Decision production. Model is a replaceable
+execution backend selected or routed by Pilot.
 
 Decision represents provider-neutral Model intent returned through Pilot and
 interpreted by the Execution Engine. Decision is not a Resource.
+
+Model Protocol defines how Provider Adapters normalize provider-specific
+responses into canonical Decisions before Execution Engine interpretation.
 
 Artifact represents durable output produced by an AgentRun.
 
@@ -102,9 +109,9 @@ resource.
 
 The control plane owns admission, persistence, reconciliation, scheduling,
 policy evaluation, status propagation, and events. Runtime owns AgentRun
-execution through the Execution Engine, Pilot invocation, model invocation,
-Decision validation and interpretation, structured tool invocation, embedded
-Observation recording, and artifact production.
+execution through the Execution Engine, Pilot invocation, Provider Adapter
+invocation, model invocation, Decision validation and interpretation, structured
+tool invocation, embedded Observation recording, and artifact production.
 
 Runtime MUST NOT schedule work, reconcile resources, perform admission, build
 Context, or make orchestration decisions. Controllers MUST NOT perform runtime

@@ -10,49 +10,157 @@ TBD.
 
 ## Status
 
-Draft.
+Accepted.
 
-## Formal Review Date
+## Decision Date
 
 2026-07-12.
 
 ## Formal Review Conclusion
 
-Revise.
+Accept.
 
-RFC-0004 should not be implemented until it defines the Pilot-to-Model protocol
-as a durable provider-neutral platform contract. The current draft has the
-correct architectural direction, but it is not yet precise enough for
-provider-adapter implementation because it does not fully specify version
-negotiation, provider normalization, streaming, error ownership, metadata, and
-conformance testing.
+RFC-0004 is accepted as the Platform Specification `v1.4.0` Model Protocol
+contract. The accepted architecture centers on Provider Adapters and protocol
+normalization. Provider-specific request and response formats are implementation
+details that MUST NOT enter the Execution Engine.
+
+This RFC does not implement provider adapters.
 
 ## Motivation
 
-Once the platform supports agentic execution, YAML resources are no longer the
-only stable external contract. The Decision protocol is the provider-neutral
-language spoken from Model output through Pilot to the Execution Engine.
+The platform owns the Decision protocol. Model providers do not.
 
-That protocol should be provider-neutral, versioned, validated, and stable
-enough to outlive any one Model provider. A Pilot should be able to replace
-OpenAI, Ollama, Anthropic, local models, or future providers without changing
-the platform's execution semantics.
+Agentic execution depends on a stable contract between language model output and
+platform execution. Providers expose different APIs, structured-output modes,
+tool-calling formats, streaming behavior, metadata, refusal formats, and error
+models. Those differences must not force changes in the Execution Engine.
 
-The canonical Decision protocol is now defined in the Platform Specification
-[Decisions](../spec/022-decisions.md) chapter. RFC-0004 remains the design space
-for provider adaptation, prompt framing, schema negotiation, and advanced
-structured-output behavior.
+RFC-0004 defines how provider-specific responses are translated into the
+platform's provider-neutral Decision protocol. This contract should remain
+stable for years and should allow OpenAI, Anthropic, Gemini, Ollama, local
+models, and future providers to integrate without changing Execution Engine
+semantics.
 
 ## Background
 
-Today the model interaction can be described as:
+The platform now has these core execution contracts:
 
 ```text
-prompt
--> markdown
+Declarative Resources
+-> Control Plane
+-> AgentRun
+-> Execution Engine
+-> Decision
+-> ToolInvocation
+-> Tool Runtime
 ```
 
-Agentic execution requires structured decisions:
+RFC-0004 defines the model boundary:
+
+```text
+Execution Engine
+-> Pilot
+-> Provider Adapter
+-> Language Model
+-> Provider Response
+-> Provider Adapter
+-> Canonical Decision
+-> Execution Engine
+```
+
+The Execution Engine must never understand provider-specific formats. It sees
+only canonical Decisions and structured model invocation failures.
+
+## Goals
+
+- Define Provider Adapter as the permanent model-provider isolation boundary.
+- Reaffirm that Decision is the canonical provider-neutral model intent
+  protocol.
+- Define provider-independent Decision production.
+- Define validation ownership between Provider Adapter and Execution Engine.
+- Define provider metadata capture without coupling metadata to Decision
+  semantics.
+- Define streaming normalization.
+- Define provider and adapter error ownership.
+- Define Decision version compatibility.
+- Define conformance testing for Provider Adapters.
+- Add Platform Specification `v1.4.0` Model Protocol text before
+  implementation.
+
+## Non-Goals
+
+This RFC does not:
+
+- Implement OpenAI, Anthropic, Gemini, Ollama, local, or other Provider
+  Adapters.
+- Change the `Decision v1` schema.
+- Add provider-specific Decision schemas.
+- Define Tool Runtime behavior.
+- Define the complete multi-turn Agent Runtime beyond the Provider Adapter
+  boundary.
+- Permit provider-native tool calls to bypass ToolInvocation, Policy, Approval,
+  Events, or trace contracts.
+
+## Primary Principle
+
+Every provider response is an implementation detail until a Provider Adapter
+normalizes it into a canonical Decision or structured model invocation failure.
+
+The Execution Engine consumes:
+
+- Canonical Decisions.
+- Structured model invocation failures.
+- Provider metadata recorded as execution history.
+
+The Execution Engine does not consume:
+
+- OpenAI tool-call payloads.
+- Anthropic tool-use blocks.
+- Gemini function-call payloads.
+- Ollama JSON response envelopes.
+- Local model grammar decoder internals.
+- Provider-specific refusal text.
+- Provider-native streaming chunks.
+
+## Provider Adapter
+
+Provider Adapter is the runtime-side component that isolates one provider
+family, provider protocol, or local model interface from platform execution.
+
+Provider Adapter owns:
+
+- Provider authentication and credential use.
+- Provider request construction.
+- Prompt and message serialization.
+- Structured-output configuration.
+- Provider-specific feature use.
+- Provider response parsing.
+- Provider metadata extraction.
+- Provider-native error classification.
+- Canonical Decision creation.
+
+Provider Adapter MUST NOT:
+
+- Execute Decisions.
+- Invoke tools.
+- Create ToolInvocations.
+- Evaluate Policy.
+- Manage AgentRun execution retries.
+- Own AgentRun execution state.
+- Mutate platform Resources.
+- Select terminal AgentRun state.
+
+Pilot owns provider selection, prompt strategy, routing, fallback policy, and
+Provider Adapter invocation. Provider Adapter owns the provider-specific
+translation work for the selected Model.
+
+## Canonical Decision
+
+Every provider that succeeds in producing model intent must produce the same
+canonical Decision contract before the Execution Engine receives it.
+
+Example `invoke_tool` Decision:
 
 ```json
 {
@@ -60,344 +168,316 @@ Agentic execution requires structured decisions:
   "type": "invoke_tool",
   "tool": "filesystem",
   "operation": "write",
-  "arguments": {
-    "path": "src/Login.tsx",
-    "contents": "..."
-  }
+  "arguments": {}
 }
 ```
 
-or:
+Example `complete` Decision:
 
 ```json
 {
   "version": "v1",
   "type": "complete",
-  "summary": "Login page implemented",
-  "outputs": [
-    {
-      "type": "workspace-change",
-      "ref": "workspace://..."
-    }
-  ]
+  "summary": "Work completed.",
+  "outputs": []
 }
 ```
 
-## Goals
+Provider-specific schemas may exist inside Provider Adapters as translation
+contracts. They MUST NOT leak beyond the Provider Adapter boundary. The
+Execution Engine validates and interprets the canonical Decision schema defined
+by the Platform Specification.
 
-- Extend or refine the provider-neutral Decision protocol when needed.
-- Define Pilot-to-Model prompt framing for Decision output.
-- Define provider adaptation and schema negotiation.
-- Define validation, error handling, and provider-specific recovery behavior.
-- Make provider replacement possible without changing platform semantics.
+## Provider Capability Matrix
 
-## Non-Goals
+Provider capabilities describe which normalization strategies a Provider Adapter
+can use. Missing provider capabilities are normalized by the adapter, not by the
+Execution Engine.
 
-This RFC does not define concrete Tool Runtime behavior, loop execution, or the
-full multi-turn Agent Runtime.
+| Capability | OpenAI | Anthropic | Gemini | Ollama | Local |
+| --- | --- | --- | --- | --- | --- |
+| JSON mode | Yes | Yes | Yes | Yes | Varies |
+| Tool calling | Yes | Yes | Yes | Varies | Varies |
+| Structured output API | Yes | Provider-specific | Yes | Varies | Varies |
+| Grammar-constrained decoding | No | No | No | Varies | Yes |
+| Streaming | Yes | Yes | Yes | Yes | Varies |
+| Token usage | Yes | Yes | Yes | Partial | Varies |
+| Reasoning metadata | Provider-specific | Provider-specific | Provider-specific | Optional | Optional |
+| Finish reason | Yes | Yes | Yes | Varies | Varies |
+| Request identifier | Yes | Yes | Yes | Varies | Varies |
 
-## Proposed Design
+Normalization rules:
 
-Model output must be parsed into the versioned Decision envelope defined by the
-Platform Specification. The initial Decision types are:
+- If a provider supports a structured-output API, the adapter SHOULD bind that
+  API to the canonical Decision schema for the negotiated Decision version.
+- If a provider supports native tool calling, the adapter MAY map provider tool
+  calls to canonical Decisions. Provider tool calls are not ToolInvocations.
+- If a provider supports JSON mode only, the adapter MUST parse exactly one
+  canonical Decision object or return a structured parse failure.
+- If a provider supports grammar-constrained decoding, the adapter SHOULD use a
+  grammar generated from the canonical Decision schema.
+- If a provider supports only plain text, deterministic parsing MAY be used as a
+  fallback, but ambiguous or invalid output MUST fail instead of being inferred.
+- If token usage, reasoning metadata, finish reason, or request identifiers are
+  unavailable, metadata MUST be recorded as unknown or omitted according to the
+  Platform Specification. The platform MUST NOT fabricate provider metadata.
 
-- `invoke_tool`
-- `complete`
-- `fail`
-- `request_input`
+## Decision Production Lifecycle
 
-An `invoke_tool` Decision must identify Tool, operation, and structured
-arguments. The Execution Engine converts the Decision into a ToolInvocation
-resource only after validation.
-
-A Decision is not a platform resource and does not bypass resource admission,
-Policy, Approval, or trace contracts. It is the provider-neutral protocol object
-that the Execution Engine interprets into governed platform state.
-
-A `complete` Decision must include `summary` and `outputs` fields. The
-Execution Engine validates required Mission outputs and creates a final summary
-Artifact unless the Mission explicitly disables it.
-
-Malformed Decisions are validation failures. The Execution Engine must not infer
-a ToolInvocation from unstructured prose.
-
-Any future Platform Specification update from this RFC must remain independent
-from any single provider SDK or native tool-calling feature.
-
-## Protocol Shape
-
-The protocol should include:
-
-- prompt framing for the supported Decision versions
-- provider capability negotiation
-- provider-native structured-output translation
-- optional human-readable rationale when Policy permits recording it
-- validation errors and recovery hints when a provider returns invalid output
-
-## Provider Independence
-
-Model providers may expose native tool-calling or structured-output APIs, but
-the platform protocol remains the canonical contract. Provider adapters must
-translate provider-specific responses into the platform protocol before runtime
-acts on them.
-
-The protocol can support OpenAI, Ollama, Anthropic, Gemini, local models, and
-future providers without changing the Execution Engine only if the Execution
-Engine receives the same canonical Decision envelope from every Pilot adapter.
-Provider-native request and response shapes MUST remain behind Pilot/provider
-adapter boundaries.
-
-Provider adapters MAY use JSON mode, function or tool calling, structured output
-APIs, grammar-constrained decoding, or plain text parsing. All of these paths
-MUST normalize into the same platform Decision schema before execution.
-
-Plain text parsing is a fallback, not a peer contract. It MAY be used for
-providers without structured-output support, but it must still produce a valid
-Decision or a structured parse failure. The Execution Engine MUST NOT infer a
-Decision directly from provider prose.
-
-## Canonical Representation
-
-The platform should define one canonical Decision schema per supported Decision
-protocol version. Provider-specific schemas may exist only inside adapters as
-translation contracts.
-
-The Execution Engine should consume `Decision v1`, not OpenAI tool calls,
-Anthropic tool-use blocks, Gemini function calls, Ollama JSON blobs, or local
-grammar decoder internals. This preserves one platform contract while allowing
-provider adapters to choose the strongest structured-response mechanism each
-provider supports.
-
-## Pilot Responsibilities
-
-Pilot owns:
-
-- Prompt construction.
-- Provider selection and provider adaptation.
-- Provider-specific request framing.
-- Response parsing.
-- Validation that provider output can be represented as a Decision.
-- Decision production or structured parse/adapter failure.
-
-Pilot does not own:
-
-- AgentRun execution.
-- Infrastructure retry decisions.
-- ToolInvocation creation.
-- Policy or Approval decisions.
-- Orchestration across Missions, Fleets, Agents, or AgentRuns.
-- Terminal AgentRun state selection.
-
-Execution Engine remains the only component that validates a produced Decision
-against platform execution context and converts it into platform action.
-
-## Structured Responses
-
-Structured Decision production should be specified as an adapter normalization
-pipeline:
+Decision production follows this lifecycle:
 
 ```text
-ExecutionFrame
--> Pilot prompt and provider request
--> Provider-native response
--> Provider adapter parsing
--> Canonical Decision envelope
+Execution Engine
+-> ExecutionFrame
+-> Pilot
+-> Provider Adapter
+-> Language Model
+-> Provider Response
+-> Provider Adapter
+-> Canonical Decision or ModelInvocationFailure
 -> Execution Engine
 ```
 
-Provider mechanisms map as follows:
+The Execution Engine supplies the canonical ExecutionFrame data. Pilot renders
+that data according to strategy and selects the Model and Provider Adapter. The
+Provider Adapter performs provider-specific request/response handling and
+returns a canonical Decision or structured failure.
 
-| Provider mechanism | Pilot adapter responsibility |
-| --- | --- |
-| JSON mode | Provide the Decision JSON schema in prompt/request framing; parse one JSON object; reject extra prose or multiple objects unless explicitly supported. |
-| Function/tool calling | Map provider tool-call name and arguments to a canonical Decision type and payload; never treat the provider tool call as a ToolInvocation. |
-| Structured output APIs | Bind the provider response schema to the canonical Decision schema for the negotiated Decision version. |
-| Grammar-constrained decoding | Use a grammar generated from the canonical Decision schema and parse the result into the same envelope. |
-| Plain text parsing | Extract a Decision only when parsing is deterministic and schema-valid; otherwise return a parse failure. |
-
-## Decision Versioning
-
-The Execution Engine should declare supported Decision protocol versions, and
-Pilot/provider adapters should negotiate one supported version before the model
-request.
-
-`Decision v1` is the only version accepted by the current specification.
-Future versions should be introduced by a Platform Specification update and a
-compatibility statement:
-
-- Backward-compatible extensions add optional fields or new Decision types that
-  older engines reject deterministically.
-- Incompatible versions use a new Decision version value, for example `v2`.
-- A Pilot MUST NOT send an unsupported Decision version to the Execution Engine
-  after negotiation.
-- If an unsupported version is received, the Execution Engine rejects it with
-  `DecisionVersionUnsupported` and performs no side effect.
+The Decision is the only model-intent artifact that crosses into Execution
+Engine interpretation.
 
 ## Validation Boundary
 
-Validation should avoid duplicate ownership:
+Provider Adapter validates:
 
-- Pilot validates provider transport success, provider response completeness,
-  provider-native structured output shape, parseability, and whether the parsed
-  object can be represented as a canonical Decision envelope.
-- Execution Engine validates Decision protocol version, Decision type, required
-  fields, semantic consistency with the current AgentRun, Agent capabilities,
-  Tool contract arguments, execution budgets, and policy admission where
-  applicable.
+- Credential availability needed to call the provider.
+- Provider transport success.
+- Provider response completeness.
+- Provider-native structured response shape.
+- JSON parsing or provider-native schema parsing.
+- Provider-native tool/function call shape.
+- Whether provider output can be converted into one canonical Decision object.
+- Provider metadata extraction and redaction classification.
 
-Pilot may use the canonical schema to avoid sending obviously malformed
-Decisions, but Execution Engine remains the authoritative validator before any
-platform action occurs.
+Execution Engine validates:
+
+- Decision schema.
+- Decision version.
+- Decision type.
+- Decision semantic correctness for the current AgentRun.
+- Agent capability and Tool availability.
+- Tool operation argument schema.
+- Execution budgets.
+- Policy and Approval requirements where applicable.
+
+Provider Adapter may use the canonical Decision schema to prevent malformed
+Decisions from crossing the boundary, but Execution Engine remains the
+authoritative validator before any platform action occurs.
 
 ## Streaming
 
-Decision production should not stream partial Decisions to the Execution Engine
-in RFC-0004.
+RFC-0004 supports provider streaming as an adapter-internal input mechanism. It
+does not stream partial Decisions to the Execution Engine.
 
-Provider token streams MAY be consumed inside the Pilot adapter for latency,
-debugging, cancellation, timeout handling, or progressive parsing. A Decision is
-complete only when the adapter has received the provider's terminal response,
-parsed exactly one canonical Decision envelope, and either accepted it as
-well-formed or returned a structured failure.
+Provider streaming chunks MAY be consumed by the Provider Adapter to improve
+latency, support cancellation, collect metadata, detect truncation, or build a
+complete structured response. A Decision is complete only when the adapter has:
 
-Trace may record provider streaming metadata such as first-token latency, token
-counts, finish reason, truncation, or adapter parse progress when policy permits
-it. Trace MUST NOT record partial provider text as a Decision and MUST NOT allow
-the Execution Engine to act on partial output.
+- Received the provider terminal response or terminal stream event.
+- Accumulated required provider metadata.
+- Parsed exactly one canonical Decision object.
+- Classified the result as a valid adapter output or structured failure.
 
-## Error Model
+Trace MAY record streaming metadata such as first-token latency, total latency,
+chunk count, token usage, finish reason, truncation, cancellation, and provider
+request identifier when policy permits. Trace MUST NOT represent partial
+provider output as a Decision, and Execution Engine MUST NOT act on partial
+provider output.
 
-Provider and adapter failures should map to stable failure categories before
-Execution Engine retry policy is applied:
-
-| Failure | Owner | Engine input |
-| --- | --- | --- |
-| Provider timeout | Pilot/provider adapter detects transport timeout | Structured model invocation failure with retryability metadata. |
-| Provider rate limit or availability error | Pilot/provider adapter | Structured provider failure with provider metadata and retry hint. |
-| Malformed JSON or unparsable output | Pilot/provider adapter | `DecisionParseFailed` candidate failure. |
-| Provider-native schema mismatch | Pilot/provider adapter | Structured adapter validation failure. |
-| Canonical Decision schema invalid | Execution Engine | `DecisionValidationFailed`. |
-| Unsupported Decision version | Execution Engine | `DecisionVersionUnsupported`. |
-| Unsupported Decision type | Execution Engine | `DecisionTypeUnsupported`. |
-| Tool or operation unavailable | Execution Engine | `CapabilityViolation`. |
-| Invalid Tool arguments | Execution Engine | `ToolArgumentsInvalid`. |
-| Model refusal | Pilot/provider adapter | Structured refusal outcome; Engine retry/fail behavior follows AgentRun policy. |
-| Truncated response or finish reason length | Pilot/provider adapter | Structured provider failure or parse failure with truncation metadata. |
-
-The RFC should specify which failures consume `maxDecisionFailures`, which
-consume model invocation retry budgets, and which are terminal.
+This avoids ambiguous side-effect timing, duplicate tool invocation risk, and
+crash recovery ambiguity.
 
 ## Provider Metadata
 
-Provider metadata belongs beside, not inside, Decision semantics. The canonical
-Decision should remain the provider-neutral instruction. Execution metadata
-should be recorded in AgentRun status, ExecutionFrame data, Events, or trace as
-policy allows.
+Provider metadata is execution history. It is not Decision semantics.
+
+Provider metadata SHOULD be recorded in AgentRun status, ExecutionFrame data,
+Events, or trace according to redaction policy. It MUST NOT be required for the
+Execution Engine to interpret the Decision.
 
 Recommended metadata:
 
 - Platform Model resource identity.
 - Provider name.
 - Provider model identifier.
-- Provider request ID when available.
-- Latency and timeout metadata.
+- Provider request identifier.
+- Provider adapter name and version.
+- Structured-output mechanism used.
+- Latency.
+- First-token latency when streaming.
 - Input, output, total, and reasoning token usage when reported.
 - Finish reason.
 - Refusal or safety category when reported.
-- Structured-output mechanism used.
-- Adapter name and version.
+- Truncation indicator.
+- Retryability hint for provider or transport failures.
 
-The platform MUST represent unavailable token usage as unknown rather than
-fabricating counts.
+Unavailable metadata is unknown. Unknown metadata MUST NOT be fabricated.
+
+## Error Model
+
+Provider and adapter failures must be classified before Execution Engine retry
+policy is applied.
+
+| Failure | Owner | Execution Engine input |
+| --- | --- | --- |
+| Authentication failure | Provider Adapter | `ModelInvocationFailed` with non-retryable provider reason unless credentials may refresh. |
+| Provider transport failure | Provider Adapter | `ModelInvocationFailed` with retryability hint. |
+| Provider timeout | Provider Adapter | `ModelInvocationTimedOut`. |
+| Rate limit or capacity error | Provider Adapter | `ModelInvocationFailed` with retryability hint and provider metadata. |
+| Provider refusal | Provider Adapter | `ModelRefusal` structured outcome; Engine applies AgentRun retry/failure policy. |
+| Truncated response | Provider Adapter | `DecisionParseFailed` or `ModelInvocationFailed` with truncation metadata. |
+| Malformed provider response | Provider Adapter | `DecisionParseFailed` candidate failure. |
+| Provider-native schema mismatch | Provider Adapter | `DecisionParseFailed` or adapter validation failure. |
+| Canonical Decision schema invalid | Execution Engine | `DecisionValidationFailed`. |
+| Unsupported Decision version | Execution Engine | `DecisionVersionUnsupported`. |
+| Unsupported Decision type | Execution Engine | `DecisionTypeUnsupported`. |
+| Tool or operation unavailable | Execution Engine | `CapabilityViolation`. |
+| Invalid Tool arguments | Execution Engine | `ToolArgumentsInvalid`. |
+| Tool execution failure | Execution Engine and Tool Runtime | ToolInvocation terminal phase and Observation. |
+
+Provider Adapter failures consume model invocation retry accounting. Canonical
+Decision validation failures consume Decision failure accounting. Tool failures
+consume ToolInvocation or tool failure accounting. The Execution Engine owns the
+final retry and terminal-state decision.
+
+## Versioning And Compatibility
+
+Decision protocol versions are independent from provider API versions, Provider
+Adapter versions, Model resource versions, and resource `apiVersion` values.
+
+Compatibility rules:
+
+- Execution Engine declares supported Decision versions.
+- Provider Adapter declares supported Decision versions.
+- Pilot MUST choose a Provider Adapter and Decision version compatible with the
+  Execution Engine before invoking a Model.
+- The current accepted Decision version is `v1`.
+- Provider Adapter MUST NOT send an unsupported Decision version to the
+  Execution Engine after negotiation.
+- If the Execution Engine receives an unsupported Decision version, it MUST
+  reject it with `DecisionVersionUnsupported` and perform no side effect.
+- Backward-compatible Decision extensions MAY add optional fields that older
+  engines ignore or reject deterministically.
+- Incompatible Decision changes require a new Decision version, for example
+  `v2`.
+- Provider Adapter compatibility must be tested against every Decision version
+  it advertises.
+
+Provider API upgrades should be isolated inside Provider Adapters unless they
+change the canonical Decision contract.
 
 ## Testing
 
-The implementation should include coverage for:
+Every Provider Adapter must pass the same protocol conformance suite for each
+Decision version it advertises.
 
-- valid `invoke_tool` Decisions
-- valid `complete` Decisions
-- malformed JSON or schema violations
-- unknown tools and operations
-- provider-specific translation
-- refusal or safety outputs
-- protocol version mismatch
+Required conformance tests:
 
-Before implementation, RFC-0004 should require:
+- Valid `invoke_tool` Decision production.
+- Valid `complete` Decision production.
+- Valid `fail` Decision production.
+- `request_input` Decision production when supported.
+- Malformed provider response.
+- Invalid JSON or invalid provider-native structured output.
+- Invalid canonical Decision schema.
+- Unsupported Decision version.
+- Unsupported Decision type.
+- Provider timeout.
+- Provider refusal.
+- Truncated provider response.
+- Missing token usage.
+- Missing finish reason.
+- Streaming response that produces one complete Decision.
+- Provider-native tool call translated to Decision, not ToolInvocation.
 
-- Protocol conformance tests that every provider adapter must pass.
-- Golden canonical Decision fixtures for each Decision type.
-- Provider-native input/output fixtures for OpenAI, Ollama, Anthropic, Gemini,
-  and at least one local model path or grammar-constrained adapter.
-- Compatibility matrix covering structured-output mechanism, streaming support,
-  token usage reporting, refusal reporting, finish reasons, and unsupported
-  capabilities.
-- Negative fixtures for malformed JSON, invalid canonical schema, unsupported
-  version, unknown Decision type, tool-call mismatch, truncation, refusal, and
-  timeout.
+Golden Decision fixtures must be provider-independent. Provider-specific fixtures
+may exist only to verify adapter translation into those golden canonical
+fixtures.
 
-## Extensibility
+## Required Platform Specification Updates
 
-Future Decision types should be added through Platform Specification updates.
-Adapters must treat unknown canonical Decision types as unsupported unless they
-explicitly advertise support for the version or extension that defines the
-type.
+RFC-0004 acceptance adds Platform Specification `v1.4.0`. Normative updates are
+required for:
 
-Provider-specific extensions should not appear in canonical Decision payloads
-unless the Platform Specification defines an extension envelope, namespacing
-rules, validation behavior, and redaction rules.
+- A dedicated [Model Protocol](../spec/024-model-protocol.md) chapter.
+- Provider Adapter responsibilities and prohibitions.
+- Canonical Decision production.
+- Provider capability normalization.
+- Streaming normalization.
+- Provider metadata placement.
+- Provider and adapter error ownership.
+- Decision version compatibility.
+- Provider Adapter conformance testing.
+- Glossary terms for Provider Adapter, Provider Response, Decision Production,
+  and Model Invocation Failure.
 
-## Platform Specification Impact
+## ADR Review
 
-RFC-0004 requires specification work before implementation:
+[ADR 0011: Provider Adapter Boundary](../adr/0011-provider-adapter-boundary.md)
+records the permanent architectural decision that provider-specific formats are
+isolated behind Provider Adapters and never consumed by the Execution Engine.
 
-- Add a dedicated Model Protocol chapter or expand the Decisions/Pilots/Models
-  chapters with a normative provider-adapter protocol.
-- Define the canonical Decision schema as the sole Execution Engine input for
-  model intent.
-- Define Decision version negotiation between Execution Engine, Pilot, and
-  provider adapter.
-- Define the Pilot/provider adapter normalization pipeline.
-- Split validation responsibilities between Pilot and Execution Engine.
-- Define model invocation failure categories, retry accounting, and terminal
-  behavior.
-- Define provider metadata placement in AgentRun status, Events,
-  ExecutionFrame data, and trace.
-- Define streaming policy for provider tokens and explain why partial Decisions
-  are not streamed to the Execution Engine in the initial contract.
-- Update Pilot responsibilities to include provider schema negotiation and
-  adapter conformance.
-- Update Runtime and API trace projections for provider metadata, parse
-  failures, refusals, truncation, and model invocation attempts.
-- Add glossary terms for Provider Adapter, Model Protocol, Decision Version,
-  Structured Output Mechanism, Provider Metadata, and Model Invocation Failure.
+## Implementation Scope
+
+Implementation should follow this RFC only after the Platform Specification
+`v1.4.0` Model Protocol text is present.
+
+Implementation should include:
+
+- Provider Adapter interface.
+- Conformance test harness.
+- Provider-independent golden Decision fixtures.
+- At least one adapter implementation in a separate implementation slice.
+
+Implementation MUST NOT let provider-native tool calls, response schemas,
+streaming chunks, or refusal payloads bypass canonical Decision production.
+
+## Accepted Decisions
+
+- Provider Adapter is the model-provider isolation boundary.
+- The platform owns the Decision protocol.
+- Every provider normalizes into the same canonical Decision schema.
+- Provider-specific schemas and response formats stay inside Provider Adapters.
+- Execution Engine never consumes provider-specific response formats.
+- Provider metadata is execution history, not Decision semantics.
+- Streaming is adapter-internal until one complete Decision or structured
+  failure exists.
+- Provider Adapter failures and Decision validation failures have separate
+  ownership and retry accounting.
+- Decision version compatibility is negotiated before model invocation.
+- Provider Adapters must pass shared conformance tests.
 
 ## Risks
 
-- Treating provider-native tool calls as ToolInvocations would bypass the
-  Execution Engine and weaken Policy, trace, idempotency, and validation.
-- Multiple provider-specific Decision schemas would make provider replacement
-  observable to runtime and would erode the platform contract.
-- Streaming partial Decisions to the Execution Engine would create ambiguous
-  side-effect timing and crash recovery semantics.
-- Recording provider reasoning or raw prompts without policy controls could
-  leak sensitive data.
-- Version negotiation that happens only in prompts could fail silently; it
-  needs explicit adapter/runtime compatibility checks.
-- Plain text parsing can become nondeterministic unless constrained to strict
-  canonical schema validation and deterministic rejection.
+- Provider-native tool calls could be mistaken for platform ToolInvocations if
+  adapters do not enforce the boundary.
+- Plain text parsing can be nondeterministic unless adapters reject ambiguous
+  output.
+- Provider metadata can leak sensitive prompts, reasoning, or safety data unless
+  redaction policy is applied consistently.
+- Streaming partial Decisions would create side-effect timing and crash recovery
+  ambiguity.
+- Version negotiation that exists only in prompt text can fail silently; it must
+  be represented in adapter and Execution Engine compatibility checks.
 
 ## Open Questions
 
-- Should the protocol include explicit reasoning fields, or only externally
-  observable Decisions?
-- How should prompt rendering communicate the protocol schema to providers with
-  different structured-output capabilities?
-- Should model refusal be represented as a provider failure, a `fail` Decision,
-  or a distinct non-Decision adapter outcome that the Execution Engine maps
-  through retry policy?
-- Which provider metadata is safe to expose through Events by default, and which
-  belongs only in redacted trace or status?
-- Should provider adapter versions be part of Model resources, Pilot
-  configuration, or runtime implementation metadata?
-- What compatibility policy applies when a Pilot supports a newer Decision
-  version than the local Execution Engine?
+None blocking acceptance.
+
+Future RFCs may define:
+
+- Provider-specific adapter implementations.
+- A secure protocol for recording richer provider reasoning metadata.
+- New Decision versions.
+- Public APIs for inspecting model invocation history beyond redacted trace and
+  AgentRun status projections.

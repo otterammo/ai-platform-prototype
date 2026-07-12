@@ -3,8 +3,9 @@
 ## Purpose
 
 Pilot defines how an Agent reasons, prompts, routes model calls, handles
-fallback, parses model responses, and produces Decisions. Pilot is a platform
-concept owned by Agent configuration. It is not the same as Model.
+fallback, selects Provider Adapters, and produces Decisions through the Model
+Protocol. Pilot is a platform concept owned by Agent configuration. It is not
+the same as Model.
 
 Pilot MUST remain independent of any specific model provider.
 Pilot MUST NOT execute Decisions or create Resources.
@@ -33,8 +34,8 @@ which Models a Pilot can use.
 ## Prompt Strategy
 
 Pilot owns prompt strategy. Prompt strategy includes system instruction
-composition, role framing, output contract framing, memory usage, and how Context
-is presented to the model.
+composition, role framing, output contract framing, memory usage, and how
+Context is presented to the selected Provider Adapter and Model.
 
 Runtime MAY render prompts according to the Pilot strategy after it receives a
 scheduled AgentRun and ready Context. Controllers MUST NOT build runtime prompts.
@@ -45,17 +46,19 @@ messages.
 
 ## Decision Production
 
-Pilot owns provider adaptation and response parsing. It MUST adapt provider
-output into the platform Decision protocol before the Execution Engine
-interprets it.
+Pilot owns provider selection and Provider Adapter invocation. Provider Adapter
+owns provider-specific request construction, response parsing, metadata
+extraction, and canonical Decision production as defined in
+[Model Protocol](024-model-protocol.md).
 
-Pilot MUST NOT treat provider-native tool calls as platform actions. Provider
-native output is input to Decision production; the Execution Engine owns
-Decision validation and interpretation.
+Pilot and Provider Adapter MUST NOT treat provider-native tool calls as platform
+actions. Provider-native output is input to Decision production; the Execution
+Engine owns Decision validation and interpretation.
 
-When provider output cannot be parsed into a Decision, Pilot MUST return a
-structured parse failure to the Execution Engine. Pilot MUST NOT convert
-unstructured text into completion unless it satisfies the Decision schema.
+When provider output cannot be parsed into a Decision, Pilot or Provider
+Adapter MUST return a structured model invocation or parse failure to the
+Execution Engine. Pilot MUST NOT convert unstructured text into completion
+unless it satisfies the Decision schema.
 
 ## Reasoning Configuration
 
@@ -86,7 +89,7 @@ policy and MUST NOT retry a denied action with another Model to bypass policy.
 Fallback attempts SHOULD be traceable through events.
 
 Fallback MUST preserve the Execution Engine's persisted input frame, attempt
-numbers, budget accounting, and retry policy.
+numbers, budget accounting, retry policy, and negotiated Decision version.
 
 ## Future Multi-Model Orchestration
 

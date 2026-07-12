@@ -46,6 +46,11 @@ A structured, versioned instruction returned by a Model through Pilot and
 interpreted by the Execution Engine. Decision represents intent, is not a
 Resource, and is the canonical protocol between intelligence and execution.
 
+## Decision Production
+
+The Provider Adapter process of translating provider-specific output into one
+canonical Decision object or a structured model invocation failure.
+
 ## Execution Budget
 
 The effective limits enforced by the Execution Engine for one AgentRun,
@@ -118,8 +123,16 @@ provider, capabilities, limits, and configuration.
 
 ## Model Protocol
 
-The provider-neutral Decision protocol exchanged from Model through Pilot to the
-Execution Engine.
+The provider-neutral protocol boundary that defines how Provider Adapters
+normalize provider-specific responses into canonical Decisions before Execution
+Engine interpretation.
+
+## Model Invocation Failure
+
+A structured failure returned from Pilot or Provider Adapter when a provider
+request cannot produce a canonical Decision because of transport, timeout,
+authentication, refusal, truncation, parsing, or provider-native validation
+failure.
 
 ## ObservedGeneration
 
@@ -145,8 +158,8 @@ OwnerReferences define lifecycle and status aggregation relationships.
 
 ## Pilot
 
-The provider-independent reasoning, prompt, routing, fallback, response parsing,
-and Decision production configuration owned by an Agent.
+The provider-independent reasoning, prompt, routing, fallback, Provider Adapter
+selection, and Decision production configuration owned by an Agent.
 
 ## Platform
 
@@ -156,6 +169,19 @@ The top-level installation and global control-plane scope.
 
 A resource or rule set governing authorization, approval, and permitted side
 effects.
+
+## Provider Adapter
+
+The runtime-side component that isolates a provider family, provider protocol,
+or local model interface by handling provider-specific requests, responses,
+metadata, and errors, then producing canonical Decisions or structured model
+invocation failures.
+
+## Provider Response
+
+The provider-specific output returned by a language model API or local model
+interface before Provider Adapter normalization. Provider Responses are
+implementation details and are not consumed directly by the Execution Engine.
 
 ## Runtime
 
@@ -192,7 +218,7 @@ to execute a Tool operation for an AgentRun.
 
 ## Tool Runtime
 
-The runtime component or provider adapter that executes authorized
+The runtime component or tool provider adapter that executes authorized
 ToolInvocation operations and returns structured output for Observation
 recording in ToolInvocation status.
 

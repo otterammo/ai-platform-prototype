@@ -18,6 +18,7 @@ Use [template.md](template.md) for new ADRs.
 - [ADR 0008: Decision Protocol Boundary](0008-decision-protocol-boundary.md)
 - [ADR 0009: Durable AgentRun Execution Loop](0009-durable-agentrun-execution-loop.md)
 - [ADR 0010: Execution Budget And Terminal State Enforcement](0010-execution-budget-and-terminal-state-enforcement.md)
+- [ADR 0011: Provider Adapter Boundary](0011-provider-adapter-boundary.md)
 
 ## Statuses
 

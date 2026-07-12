@@ -17,7 +17,7 @@ Use [template.md](template.md) for new RFCs.
 - [RFC-0003: Built-In Tool Runtime](0003-built-in-tool-runtime.md)
   - Draft.
 - [RFC-0004: Structured Model Protocol](0004-structured-model-protocol.md)
-  - Draft.
+  - Accepted in Platform Specification `v1.4.0`.
 - [RFC-0005: Multi-Turn Agent Runtime](0005-multi-turn-agent-runtime.md)
   - Draft.
 

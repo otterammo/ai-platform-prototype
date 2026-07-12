@@ -13,7 +13,7 @@ The Platform Specification uses semantic versioning:
 - `PATCH` changes clarify language, fix examples, or correct non-contractual
   errors without changing behavior.
 
-The current Platform Specification version is `v1.2.0`.
+The current Platform Specification version is `v1.3.0`.
 
 Specification versions are independent from the Python package version in
 `pyproject.toml`. An implementation package may release multiple versions while
@@ -62,6 +62,9 @@ target, and compatibility notes in the relevant RFC.
 
 ## Version History
 
+- `v1.3.0`: Adds accepted AgentRun Execution Engine loop semantics, including
+  explicit state transitions, budgets, completion, cancellation, retry,
+  crash-safe resume, leases, events, and trace requirements.
 - `v1.2.0`: Adds the Decision protocol as the canonical provider-neutral Model
   intent contract between Pilot and Execution Engine.
 - `v1.1.0`: Adds structured ToolInvocation resources, embedded Observation

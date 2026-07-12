@@ -29,9 +29,14 @@ A FleetTemplate SHOULD describe:
 - Coordination strategy.
 - Expected aggregation behavior.
 - Optional constraints for model, tool, or runtime placement.
+- Optional default AgentRun execution budgets.
 
 FleetTemplate is cluster-scoped by default. Template use in a Workspace MAY be
 restricted by policy.
+
+FleetTemplate execution-budget defaults MAY be inherited by Agents and
+AgentRuns. Child configuration MUST NOT silently increase a parent-enforced
+limit.
 
 ## Agent Composition
 

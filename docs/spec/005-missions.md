@@ -27,7 +27,12 @@ Mission spec SHOULD include:
 - Inputs: references to Knowledge, parameters, or external resources admitted
   by policy.
 - Outputs: expected artifact classes or deliverables.
+- Execution constraints: optional stricter AgentRun execution budgets.
 - Template selection: a FleetTemplate or selection constraints.
+
+If a Mission permits completion without durable outputs, that no-output result
+MUST be explicit in Mission spec or admitted defaults. Otherwise, an AgentRun
+`complete` Decision with empty `outputs` MUST NOT satisfy the Mission.
 
 Mission spec MUST be stable enough for repeated reconciliation. Reapplying the
 same Mission spec SHOULD NOT create a new execution attempt unless generation or

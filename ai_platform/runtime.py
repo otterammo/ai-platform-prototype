@@ -276,20 +276,6 @@ class AgentRuntime:
         if usage["modelInvocations"] >= budget.maxModelInvocations:
             return self._budget_exceeded(run, "maxModelInvocations")
 
-        frame, frames = self._active_frame(data)
-        attempt = int(frame.get("modelAttempts", 0)) + 1
-        frame["modelAttempts"] = attempt
-        frame["decisionRequestedAt"] = utciso()
-        frame["state"] = "decision-requested"
-        usage["modelInvocations"] += 1
-        usage["wallTimeSeconds"] = self._wall_time_seconds(data)
-        frame["budgetUsage"] = dict(usage)
-        data["budgetUsage"] = usage
-        data["executionFrames"] = frames
-        data["activeFrameIndex"] = frames.index(frame)
-        run = self._save_run_data(run, data)
-        self._emit_budget_updated(run, usage, budget)
-
         model_config = self._model_for_agent(agent, mission, workspace)
         try:
             self._authorize(
@@ -303,6 +289,20 @@ class AgentRuntime:
             return self._refresh_run(run)
         except PolicyDenied as exc:
             return self._fail_run(run, exc.reason, "PolicyDenied", retryable=False)
+
+        frame, frames = self._active_frame(data)
+        attempt = int(frame.get("modelAttempts", 0)) + 1
+        frame["modelAttempts"] = attempt
+        frame["decisionRequestedAt"] = utciso()
+        frame["state"] = "decision-requested"
+        usage["modelInvocations"] += 1
+        usage["wallTimeSeconds"] = self._wall_time_seconds(data)
+        frame["budgetUsage"] = dict(usage)
+        data["budgetUsage"] = usage
+        data["executionFrames"] = frames
+        data["activeFrameIndex"] = frames.index(frame)
+        run = self._save_run_data(run, data)
+        self._emit_budget_updated(run, usage, budget)
 
         self._emit_run_event(
             run,
@@ -609,6 +609,9 @@ class AgentRuntime:
             status = await self._execute_tool_invocation(run, agent, invocation, frame, frames, data)
             if status == "waiting":
                 return self._refresh_run(run)
+            run = self._refresh_run(run)
+            if run.status.phase in AGENT_RUN_TERMINAL_PHASES:
+                return run
             invocation = self._tool_invocation(invocation_name, run.metadata.namespace)
         if invocation.status.phase in TOOL_TERMINAL_PHASES:
             frame["state"] = "tool-observed"
@@ -755,7 +758,7 @@ class AgentRuntime:
                 frame["budgetUsage"] = dict(usage)
                 data["budgetUsage"] = usage
                 data["executionFrames"] = frames
-                self._save_run_data(run, data)
+                run = self._save_run_data(run, data)
                 if usage["toolFailures"] > run.spec.execution.maxToolFailures:
                     observation = self._error_observation("ToolFailureBudgetExceeded", str(exc))
                     self._set_tool_status(
@@ -768,7 +771,7 @@ class AgentRuntime:
                         observation=observation,
                     )
                     self._record_observation(invocation, run, observation)
-                    self._budget_exceeded(run, "maxToolFailures")
+                    run = self._budget_exceeded(run, "maxToolFailures")
                     return "terminal"
                 if frame["toolRetryCount"] <= run.spec.execution.maxToolRetries:
                     self._emit_retry_scheduled(run, frame, "ToolRuntimeError", str(exc))

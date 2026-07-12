@@ -9,6 +9,7 @@ from ai_platform.cli import main
 from ai_platform.controllers import LocalAgentRunWorker
 from ai_platform.models import Message, ModelClient
 from ai_platform.observability import build_trace
+from ai_platform.policy import ApprovalService
 from ai_platform.resources import Observation, ResourceKind, parse_resource
 from ai_platform.runtime import AgentRuntime, ToolRuntimeError, ToolRuntimeRegistry, utciso
 from ai_platform.storage import ResourceStore
@@ -36,6 +37,13 @@ class FailingRuntime:
 
     def execute(self, _invocation: Any) -> Observation:
         raise AssertionError("tool runtime should not execute")
+
+
+class AlwaysFailingRuntime:
+    runtime_id = "test.always-failing"
+
+    def execute(self, _invocation: Any) -> Observation:
+        raise ToolRuntimeError("permanent runtime failure")
 
 
 class FlakyRuntime:
@@ -339,6 +347,36 @@ def test_model_transport_retry_uses_same_frame_with_new_attempt(tmp_path: Path) 
     assert "ExecutionRetryScheduled" in event_types
 
 
+def test_model_invocation_budget_counts_after_model_approval(tmp_path: Path) -> None:
+    policy_rules = [
+        {"match": {"tool": "fake", "operation": "use"}, "allow": True},
+        {"match": {"tool": "model", "operation": "invoke"}, "requiresApproval": True},
+        {"match": {"tool": "filesystem", "operation": "write"}, "allow": True},
+    ]
+    store = make_engine_store(tmp_path, execution={"maxModelInvocations": 1}, policy_rules=policy_rules)
+    model = SequenceModel([complete_decision("approved complete")])
+    runtime = runtime_with(store, model)
+
+    asyncio.run(runtime.run(run_resource(store)))
+
+    waiting = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    assert waiting is not None
+    assert waiting["status"]["phase"] == "WaitingForApproval"
+    assert waiting["status"]["data"]["budgetUsage"]["modelInvocations"] == 0
+    assert model.calls == 0
+    approvals = store.list(ResourceKind.APPROVAL)
+    assert len(approvals) == 1
+
+    ApprovalService(store).approve(approvals[0]["metadata"]["name"], actor="test")
+    asyncio.run(runtime.run(run_resource(store)))
+
+    run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    assert run is not None
+    assert run["status"]["phase"] == "Succeeded"
+    assert run["status"]["data"]["budgetUsage"]["modelInvocations"] == 1
+    assert model.calls == 1
+
+
 def test_tool_runtime_infrastructure_retry_does_not_duplicate_invocation(tmp_path: Path) -> None:
     store = make_engine_store(tmp_path, execution={"maxToolRetries": 1})
     model = SequenceModel([invoke_fake_decision(), complete_decision("tool retry complete")])
@@ -352,6 +390,24 @@ def test_tool_runtime_infrastructure_retry_does_not_duplicate_invocation(tmp_pat
     assert run is not None
     assert run["status"]["phase"] == "Succeeded"
     assert run["status"]["data"]["executionFrames"][0]["toolRetryCount"] == 1
+
+
+def test_tool_failure_budget_remains_budget_exceeded(tmp_path: Path) -> None:
+    store = make_engine_store(tmp_path, execution={"maxToolFailures": 0, "maxToolRetries": 2})
+    model = SequenceModel([invoke_fake_decision()])
+    runtime = runtime_with(store, model, ToolRuntimeRegistry({"fake": AlwaysFailingRuntime()}))
+
+    asyncio.run(runtime.run(run_resource(store)))
+
+    run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    assert run is not None
+    assert run["status"]["phase"] == "BudgetExceeded"
+    assert run["status"]["data"]["exceededBudget"] == "maxToolFailures"
+    assert run["status"]["data"]["budgetUsage"]["toolFailures"] == 1
+    invocation = store.get(ResourceKind.TOOL_INVOCATION, "run-1-tool-1-0001-1", "demo")
+    assert invocation is not None
+    assert invocation["status"]["phase"] == "Failed"
+    assert invocation["status"]["observation"]["error"]["reason"] == "ToolFailureBudgetExceeded"
 
 
 def test_iteration_budget_exhaustion_becomes_budget_exceeded(tmp_path: Path) -> None:

@@ -20,6 +20,8 @@ Platform
             `-- Agent
                 `-- AgentRun
                     |-- Context
+                    |-- ToolInvocation
+                    |   `-- Observation
                     `-- Artifact
 ```
 
@@ -52,3 +54,7 @@ export AI_PLATFORM_ROOT=.platform
 
 The checked-in tutorial assets are also used by the automated Day 0 acceptance
 test.
+
+Day 0 submits only declarative resources. Users do not create ToolInvocations
+manually; the Execution Engine creates them from model Decisions and pauses only
+when Policy requires approval.

@@ -994,7 +994,7 @@ class AgentRuntime:
             "ModelInvoked",
         )
 
-        messages = self._build_messages(mission, context, data, frame)
+        messages = self._build_messages(mission, agent, context, data, frame, budget)
         client = self.model_client_factory(model_config, self.store)
         try:
             raw_decision = await asyncio.wait_for(client.generate(messages), timeout=model_config.timeoutSeconds)
@@ -1642,9 +1642,11 @@ class AgentRuntime:
     def _build_messages(
         self,
         mission: MissionResource,
+        agent: AgentResource,
         context: ContextResource,
         data: dict[str, Any],
         frame: dict[str, Any],
+        budget: ExecutionSpec,
     ) -> list[Message]:
         rendered_context = context.status.data.get("renderedContext")
         user_parts = []
@@ -1652,12 +1654,31 @@ class AgentRuntime:
             user_parts.append(f"Objective: {mission.spec.objective}")
         if mission.spec.template:
             user_parts.append(f"Template: {mission.spec.template}")
+        user_parts.append(
+            "Agent:\n"
+            + json.dumps(
+                {
+                    "name": agent.metadata.name,
+                    "role": agent.spec.role,
+                    "capabilities": agent.spec.capabilities,
+                    "tools": self._available_tool_contracts(agent),
+                },
+                sort_keys=True,
+            )
+        )
         if rendered_context:
             user_parts.append(f"Context:\n{rendered_context}")
         if mission.spec.outputs:
             outputs = ", ".join(name for name, enabled in mission.spec.outputs.items() if enabled)
             if outputs:
                 user_parts.append(f"Requested outputs: {outputs}")
+        user_parts.append(
+            "Current budgets:\n"
+            + json.dumps(
+                {"usage": self._budget_usage(data), "limits": self._budget_snapshot(budget)},
+                sort_keys=True,
+            )
+        )
         prior_frames = [
             {
                 "iteration": item.get("iteration"),
@@ -1678,11 +1699,35 @@ class AgentRuntime:
                 "content": (
                     "You are an autonomous agent in a declarative AI control plane. "
                     "Return exactly one JSON Decision object using version v1 and type "
-                    "invoke_tool, complete, or fail. Do not return natural-language text outside JSON."
+                    "invoke_tool, complete, or fail. Use only tools listed in the Agent section. "
+                    "For invoke_tool, set tool, operation, and arguments exactly as the tool contract requires. "
+                    "Do not return natural-language text outside JSON."
                 ),
             },
             {"role": "user", "content": "\n\n".join(user_parts)},
         ]
+
+    def _available_tool_contracts(self, agent: AgentResource) -> list[dict[str, Any]]:
+        contracts: list[dict[str, Any]] = []
+        for tool_name in agent.spec.tools:
+            manifest = self.store.get(ResourceKind.TOOL, tool_name)
+            if manifest is None:
+                continue
+            tool = parse_resource(manifest)
+            if not isinstance(tool, ToolResource):
+                continue
+            contracts.append(
+                {
+                    "name": tool.metadata.name,
+                    "description": tool.spec.description,
+                    "operations": [
+                        operation.model_dump(mode="json", exclude_none=True) for operation in tool.spec.operations
+                    ],
+                    "timeoutSeconds": tool.spec.timeoutSeconds,
+                    "riskLevel": tool.spec.riskLevel,
+                }
+            )
+        return contracts
 
     def _emit_context_consumed(
         self,

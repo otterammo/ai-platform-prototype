@@ -10,7 +10,7 @@ TBD.
 
 ## Status
 
-Draft.
+Implemented.
 
 ## Motivation
 
@@ -95,6 +95,39 @@ Expected behavior:
 9. Persist modified files as Workspace changes.
 10. Produce Artifact resources summarizing completed work.
 11. Reconstruct the entire execution through Trace.
+
+## Implementation Evidence
+
+The RFC-0005 runtime path was validated on 2026-07-13 with a live Ollama
+`gpt-oss:20b` model against a temporary Git Workspace:
+
+```text
+Mission
+-> Ollama
+-> filesystem.read
+-> filesystem.write
+-> git.status
+-> git.add
+-> git.commit
+-> complete
+```
+
+The validation used only declarative resources for Workspace, Model, Tool,
+Capability, FleetTemplate, Policy, and Mission. Runtime-created ToolInvocation
+resources were observed in this exact order:
+
+1. `filesystem.read` `README.md`
+2. `filesystem.write` `SUMMARY.md`
+3. `git.status` with empty arguments
+4. `git.add` `SUMMARY.md`
+5. `git.commit` with message `docs: add live dogfood summary`
+
+The AgentRun reached `Succeeded`, the Mission reached `Completed`, every
+Decision frame was canonical, no Decision frames were rejected, Observations
+fed subsequent model turns, approval paused and resumed `git.commit`, repeated
+reconciliation during the approval pause did not create duplicate
+ToolInvocations, Trace contained Decision, ToolInvocation, Observation,
+Approval, and ExecutionFrame events, and exactly one Git commit was created.
 
 ## Testing
 

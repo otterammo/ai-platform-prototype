@@ -4,15 +4,23 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 from ai_platform.cli import main
 from ai_platform.controllers import LocalAgentRunWorker
-from ai_platform.models import Message, ModelClient
+from ai_platform.models import Message, ModelClient, normalize_decision_content
 from ai_platform.observability import build_trace
 from ai_platform.policy import ApprovalService
-from ai_platform.resources import Observation, ResourceKind, parse_resource
+from ai_platform.resources import (
+    AgentResource,
+    ContextResource,
+    MissionResource,
+    Observation,
+    ResourceKind,
+    parse_resource,
+)
 from ai_platform.runtime import AgentRuntime, ToolRuntimeError, ToolRuntimeRegistry, utciso
 from ai_platform.storage import ResourceStore
 
@@ -223,6 +231,115 @@ def invoke_tool_decision(tool: str, operation: str, arguments: dict[str, Any]) -
     }
 
 
+def make_autonomous_store(
+    tmp_path: Path,
+    *,
+    workspace_root: Path,
+    tools: list[dict[str, Any]],
+    agent_tools: list[str],
+    policy_rules: list[dict[str, Any]] | None = None,
+) -> ResourceStore:
+    store = ResourceStore(f"sqlite:///{tmp_path / 'platform.db'}", tmp_path / "platform")
+    for manifest in [
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Workspace",
+            "metadata": {"name": "demo"},
+            "spec": {"rootPath": str(workspace_root)},
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Mission",
+            "metadata": {"name": "autonomous-workload", "namespace": "demo"},
+            "spec": {"objective": "Run an autonomous workload"},
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Fleet",
+            "metadata": {"name": "autonomous-workload-fleet", "namespace": "demo"},
+            "spec": {"workspace": "demo", "mission": "autonomous-workload"},
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Agent",
+            "metadata": {"name": "runner", "namespace": "demo"},
+            "spec": {
+                "workspace": "demo",
+                "mission": "autonomous-workload",
+                "fleet": "autonomous-workload-fleet",
+                "tools": agent_tools,
+            },
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "AgentRun",
+            "metadata": {"name": "run-1", "namespace": "demo"},
+            "spec": {
+                "agentRef": {"name": "runner"},
+                "missionRef": {"name": "autonomous-workload"},
+                "contextRef": {"name": "run-1-context"},
+            },
+        },
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Context",
+            "metadata": {
+                "name": "run-1-context",
+                "namespace": "demo",
+                "ownerReferences": [{"kind": "AgentRun", "name": "run-1", "controller": True}],
+            },
+            "spec": {
+                "mission": "autonomous-workload",
+                "agentRun": "run-1",
+                "query": "Run autonomously",
+                "knowledgeIndex": "default",
+            },
+        },
+        *tools,
+    ]:
+        store.apply(manifest)
+    if policy_rules is not None:
+        store.apply(
+            {
+                "apiVersion": "ai.platform/v1",
+                "kind": "Policy",
+                "metadata": {"name": "default"},
+                "spec": {"rules": policy_rules},
+            }
+        )
+    store.update_status(
+        ResourceKind.CONTEXT,
+        "run-1-context",
+        "demo",
+        "Ready",
+        "Context ready",
+        {"renderedContext": "Context:\nRun autonomously", "chunkCount": 0, "sources": []},
+        event_type="ContextBuilt",
+    )
+    store.update_status(
+        ResourceKind.AGENT_RUN,
+        "run-1",
+        "demo",
+        "Scheduled",
+        "AgentRun scheduled for autonomous workload",
+        {"worker": "test"},
+        event_type="AgentRunScheduled",
+    )
+    return store
+
+
+def builtin_tool_manifest(name: str, operations: list[str], config: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "apiVersion": "ai.platform/v1",
+        "kind": "Tool",
+        "metadata": {"name": name},
+        "spec": {
+            "operations": operations,
+            **({"config": config} if config is not None else {}),
+        },
+    }
+
+
 def test_execution_engine_successful_decision_tool_observation_complete_trace(tmp_path: Path) -> None:
     store = make_engine_store(tmp_path)
     model = SequenceModel([invoke_fake_decision(), complete_decision("completed after echo")])
@@ -250,6 +367,105 @@ def test_execution_engine_successful_decision_tool_observation_complete_trace(tm
     assert trace is not None
     trace_run = trace["fleets"][0]["agents"][0]["agentRuns"][0]
     assert trace_run["executionFrames"][0]["toolInvocation"] == "run-1-tool-1-0001-1"
+
+
+def test_openai_compatible_adapter_normalizes_json_code_fence() -> None:
+    fenced = '```json\n{"version":"v1","type":"complete","summary":"done","outputs":[]}\n```'
+    assert json.loads(normalize_decision_content(fenced)) == {
+        "version": "v1",
+        "type": "complete",
+        "summary": "done",
+        "outputs": [],
+    }
+    wrapped = '{"decision":{"tool":"git","operation":"status","arguments":[]}}'
+    assert json.loads(normalize_decision_content(wrapped)) == {
+        "version": "v1",
+        "type": "invoke_tool",
+        "tool": "git",
+        "operation": "status",
+        "arguments": {},
+    }
+    failed = '{"decision":{"type":"fail","message":"cannot continue"}}'
+    assert json.loads(normalize_decision_content(failed)) == {
+        "version": "v1",
+        "type": "fail",
+        "message": "cannot continue",
+        "reason": "cannot continue",
+        "retryable": False,
+    }
+    noisy_wrapped = (
+        '{"decision":{"tool":"git","operation":"commit","arguments":{"message":"docs: add live dogfood summary"}}}}'
+    )
+    assert json.loads(normalize_decision_content(noisy_wrapped)) == {
+        "version": "v1",
+        "type": "invoke_tool",
+        "tool": "git",
+        "operation": "commit",
+        "arguments": {"message": "docs: add live dogfood summary"},
+    }
+    assert normalize_decision_content('{"version":"v1"}') == '{"version":"v1"}'
+
+
+def test_runtime_prompt_includes_agent_tools_and_current_budgets(tmp_path: Path) -> None:
+    store = make_engine_store(tmp_path)
+    store.apply(
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Tool",
+            "metadata": {"name": "fake"},
+            "spec": {
+                "config": {"apiKey": "secret-token"},
+                "operations": [
+                    {
+                        "name": "echo",
+                        "inputSchema": {
+                            "type": "object",
+                            "required": ["message"],
+                            "properties": {"message": {"type": "string"}},
+                        },
+                    }
+                ],
+            },
+        }
+    )
+    runtime = runtime_with(store, SequenceModel([]))
+    run = run_resource(store)
+    agent_manifest = store.get(ResourceKind.AGENT, "runner", "demo")
+    mission_manifest = store.get(ResourceKind.MISSION, "run-loop", "demo")
+    context_manifest = store.get(ResourceKind.CONTEXT, "run-1-context", "demo")
+    assert agent_manifest is not None
+    assert mission_manifest is not None
+    assert context_manifest is not None
+    agent = parse_resource(agent_manifest)
+    mission = parse_resource(mission_manifest)
+    context = parse_resource(context_manifest)
+    assert isinstance(agent, AgentResource)
+    assert isinstance(mission, MissionResource)
+    assert isinstance(context, ContextResource)
+    data = {
+        "budgetUsage": {
+            "iterations": 1,
+            "modelInvocations": 1,
+            "toolInvocations": 0,
+            "decisionFailures": 0,
+            "toolFailures": 0,
+            "failures": 0,
+            "wallTimeSeconds": 0,
+            "inputTokens": "Unknown",
+            "outputTokens": "Unknown",
+        },
+        "executionFrames": [],
+    }
+
+    messages = runtime._build_messages(mission, agent, context, data, {"iteration": 1}, run.spec.execution)
+
+    user_content = messages[1]["content"]
+    assert '"tools": [{"description": null, "name": "fake"' in user_content
+    assert '"operations": [{"inputSchema": {"properties": {"message": {"type": "string"}}' in user_content
+    assert "secret-token" not in user_content
+    assert "apiKey" not in user_content
+    assert "Current budgets:" in user_content
+    assert '"maxIterations": 50' in user_content
 
 
 def test_execution_engine_dogfoods_filesystem_and_git_runtime(tmp_path: Path) -> None:
@@ -389,6 +605,96 @@ def test_execution_engine_dogfoods_filesystem_and_git_runtime(tmp_path: Path) ->
     assert len(trace_run["toolInvocations"]) == 4
     event_types = {event["type"] for event in store.list_events(namespace="demo", limit=None)}
     assert {"ToolInvocationAuthorized", "ToolInvocationCompleted", "ObservationRecorded"}.issubset(event_types)
+
+
+def test_autonomous_filesystem_failure_recovery_feeds_observation_to_next_decision(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    store = make_autonomous_store(
+        tmp_path,
+        workspace_root=workspace_root,
+        tools=[builtin_tool_manifest("filesystem", ["read", "write"])],
+        agent_tools=["filesystem"],
+    )
+    model = SequenceModel(
+        [
+            invoke_tool_decision("filesystem", "read", {"path": "MISSING.md"}),
+            invoke_tool_decision("filesystem", "write", {"path": "SUMMARY.md", "content": "# Summary\n\nRecovered.\n"}),
+            complete_decision("filesystem recovery complete"),
+        ]
+    )
+
+    asyncio.run(runtime_with(store, model).run(run_resource(store)))
+
+    run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    assert run is not None
+    assert run["status"]["phase"] == "Succeeded"
+    frames = run["status"]["data"]["executionFrames"]
+    assert frames[0]["observation"]["error"]["reason"] == "PathNotFound"
+    assert frames[1]["observation"]["summary"] == "Wrote SUMMARY.md"
+    assert (workspace_root / "SUMMARY.md").read_text(encoding="utf-8") == "# Summary\n\nRecovered.\n"
+    assert model.calls == 3
+
+
+def test_autonomous_git_status_add_commit_from_decisions(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    run_git_command(workspace_root, "init")
+    (workspace_root / "README.md").write_text("# Demo\n", encoding="utf-8")
+    run_git_command(workspace_root, "add", "README.md")
+    run_git_command(workspace_root, "commit", "-m", "docs: seed readme")
+    (workspace_root / "SUMMARY.md").write_text("# Summary\n", encoding="utf-8")
+    store = make_autonomous_store(
+        tmp_path,
+        workspace_root=workspace_root,
+        tools=[builtin_tool_manifest("git", ["status", "add", "commit"])],
+        agent_tools=["git"],
+    )
+    model = SequenceModel(
+        [
+            invoke_tool_decision("git", "status", {}),
+            invoke_tool_decision("git", "add", {"path": "SUMMARY.md"}),
+            invoke_tool_decision("git", "commit", {"message": "docs: add summary"}),
+            complete_decision("git workload complete"),
+        ]
+    )
+
+    asyncio.run(runtime_with(store, model).run(run_resource(store)))
+
+    run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    assert run is not None
+    assert run["status"]["phase"] == "Succeeded"
+    frames = run["status"]["data"]["executionFrames"]
+    assert [frame["decision"]["operation"] for frame in frames[:-1]] == ["status", "add", "commit"]
+    assert "SUMMARY.md" in "\n".join(frames[0]["observation"]["payload"]["entries"])
+    assert frames[2]["observation"]["payload"]["commit"]
+    assert run_git_command(workspace_root, "log", "-1", "--pretty=%s").stdout.strip() == "docs: add summary"
+
+
+def test_autonomous_shell_runtime_executes_from_decision(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    store = make_autonomous_store(
+        tmp_path,
+        workspace_root=workspace_root,
+        tools=[builtin_tool_manifest("shell", ["execute"], {"allowedCommands": [sys.executable]})],
+        agent_tools=["shell"],
+    )
+    model = SequenceModel(
+        [
+            invoke_tool_decision("shell", "execute", {"argv": [sys.executable, "-c", "print('shell ok')"]}),
+            complete_decision("shell workload complete"),
+        ]
+    )
+
+    asyncio.run(runtime_with(store, model).run(run_resource(store)))
+
+    run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    assert run is not None
+    assert run["status"]["phase"] == "Succeeded"
+    frames = run["status"]["data"]["executionFrames"]
+    assert frames[0]["observation"]["payload"]["stdout"] == "shell ok\n"
+    assert frames[0]["observation"]["payload"]["exitCode"] == 0
 
 
 def test_completed_agentrun_does_not_resume_or_duplicate_tool_invocation(tmp_path: Path) -> None:

@@ -101,6 +101,12 @@ validates Decisions, creates deterministic ToolInvocations, delivers
 Observations to later iterations, enforces budgets/timeouts/cancellation, and
 records terminal state.
 
+Autonomous runs no longer require users to author `ToolInvocation` manifests by
+hand. A Mission schedules an AgentRun; the local worker asks the configured
+model for canonical Decisions; `invoke_tool` Decisions become deterministic
+ToolInvocations; Observations feed the next Decision until the model returns
+`complete` or `fail`.
+
 Knowledge now flows through an indexed retrieval path before model invocation:
 
 ```text
@@ -219,6 +225,22 @@ create desired resources; the scheduler marks Pending AgentRuns as Scheduled;
 the local worker resumes scheduled or waiting AgentRuns through the durable
 Execution Engine and records Artifact resources only after a valid `complete`
 Decision.
+
+## Autonomous Dogfood Workload
+
+The primary dogfood path is now Mission-driven:
+
+```text
+Apply Mission
+-> approve guarded filesystem/git/shell/model actions when policy asks
+-> watch the AgentRun produce Decisions, ToolInvocations, and Observations
+-> inspect the final Artifact and trace
+```
+
+The initial supported workload is: inspect the repository, read `README.md`,
+write `SUMMARY.md`, stage `SUMMARY.md`, commit it, and complete. Manual
+ToolInvocation YAML is now an advanced debugging path for replaying one runtime
+action in isolation.
 
 ## Knowledge Index And Retrieval
 

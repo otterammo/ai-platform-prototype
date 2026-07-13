@@ -14,6 +14,12 @@ Runtime is not the control plane.
 Detailed Execution Engine loop semantics are defined in
 [Execution Engine](023-execution-engine.md).
 
+The primary runtime path is autonomous AgentRun execution: the model returns one
+canonical Decision, Runtime converts `invoke_tool` Decisions into governed
+ToolInvocations, records embedded Observations, and sends those Observations
+back into the next Decision request until an explicit `complete` or `fail`
+Decision terminates the run.
+
 ## Runtime May
 
 Runtime MAY perform the following actions for a scheduled AgentRun:
@@ -121,6 +127,10 @@ and record the embedded Observation.
 
 An `invoke_tool` Decision becomes a ToolInvocation only after Execution Engine
 validation and interpretation.
+
+Users and controllers MAY still create ToolInvocation resources directly for
+debugging one runtime action, but that manual path is not the normal AgentRun
+execution path.
 
 Each `invoke_tool` Decision creates exactly one deterministic ToolInvocation.
 Runtime MUST NOT create duplicate ToolInvocations after reconciliation or crash

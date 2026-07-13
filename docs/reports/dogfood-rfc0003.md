@@ -1,4 +1,9 @@
-# Dogfood Findings
+# RFC-0003 Manual Dogfood Findings
+
+This report describes the pre-RFC-0005 manual ToolInvocation dogfood path. It
+is retained as historical debugging evidence. The primary dogfood workflow is
+now the Mission-driven autonomous path in
+[RFC-0005 Autonomous Dogfood](dogfood-rfc0005.md).
 
 ## Awkward Steps
 

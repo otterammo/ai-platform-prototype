@@ -12,7 +12,7 @@ Rules:
 - Use existing resources and controllers before introducing new abstractions.
 - Preserve level-based reconciliation and explicit status ownership.
 - Keep provider behavior isolated from resource and controller contracts.
-- Do not expand runtime semantics; route execution-engine work to the runtime_engineer.
+- Do not expand runtime semantics; route execution-engine work to the runtime-engineer.
 
 Success criteria:
 - The feature is implemented with the smallest compatible change.

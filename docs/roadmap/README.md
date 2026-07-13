@@ -156,7 +156,7 @@ Progress:
 
 - RFC-0001 is complete for the framework-level contract.
 - RFC-0003 is implementing built-in filesystem, git, and shell Tool Runtimes.
-- RFC-0005 remains Draft and depends on RFC-0003 implementation feedback.
+- RFC-0005 is implemented after live autonomous Ollama dogfood validation.
 
 ## Multi-Tenancy
 

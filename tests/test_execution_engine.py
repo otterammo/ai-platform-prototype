@@ -10,10 +10,17 @@ from typing import Any
 
 from ai_platform.cli import main
 from ai_platform.controllers import LocalAgentRunWorker
-from ai_platform.models import Message, ModelClient
+from ai_platform.models import Message, ModelClient, normalize_decision_content
 from ai_platform.observability import build_trace
 from ai_platform.policy import ApprovalService
-from ai_platform.resources import Observation, ResourceKind, parse_resource
+from ai_platform.resources import (
+    AgentResource,
+    ContextResource,
+    MissionResource,
+    Observation,
+    ResourceKind,
+    parse_resource,
+)
 from ai_platform.runtime import AgentRuntime, ToolRuntimeError, ToolRuntimeRegistry, utciso
 from ai_platform.storage import ResourceStore
 
@@ -360,6 +367,83 @@ def test_execution_engine_successful_decision_tool_observation_complete_trace(tm
     assert trace is not None
     trace_run = trace["fleets"][0]["agents"][0]["agentRuns"][0]
     assert trace_run["executionFrames"][0]["toolInvocation"] == "run-1-tool-1-0001-1"
+
+
+def test_openai_compatible_adapter_normalizes_json_code_fence() -> None:
+    fenced = '```json\n{"version":"v1","type":"complete","summary":"done","outputs":[]}\n```'
+    assert json.loads(normalize_decision_content(fenced)) == {
+        "version": "v1",
+        "type": "complete",
+        "summary": "done",
+        "outputs": [],
+    }
+    wrapped = '{"decision":{"tool":"git","operation":"status","arguments":[]}}'
+    assert json.loads(normalize_decision_content(wrapped)) == {
+        "version": "v1",
+        "type": "invoke_tool",
+        "tool": "git",
+        "operation": "status",
+        "arguments": {},
+    }
+    failed = '{"decision":{"type":"fail","message":"cannot continue"}}'
+    assert json.loads(normalize_decision_content(failed)) == {
+        "version": "v1",
+        "type": "fail",
+        "message": "cannot continue",
+        "reason": "cannot continue",
+        "retryable": False,
+    }
+    noisy_wrapped = (
+        '{"decision":{"tool":"git","operation":"commit","arguments":{"message":"docs: add live dogfood summary"}}}}'
+    )
+    assert json.loads(normalize_decision_content(noisy_wrapped)) == {
+        "version": "v1",
+        "type": "invoke_tool",
+        "tool": "git",
+        "operation": "commit",
+        "arguments": {"message": "docs: add live dogfood summary"},
+    }
+    assert normalize_decision_content('{"version":"v1"}') == '{"version":"v1"}'
+
+
+def test_runtime_prompt_includes_agent_tools_and_current_budgets(tmp_path: Path) -> None:
+    store = make_engine_store(tmp_path)
+    runtime = runtime_with(store, SequenceModel([]))
+    run = run_resource(store)
+    agent_manifest = store.get(ResourceKind.AGENT, "runner", "demo")
+    mission_manifest = store.get(ResourceKind.MISSION, "run-loop", "demo")
+    context_manifest = store.get(ResourceKind.CONTEXT, "run-1-context", "demo")
+    assert agent_manifest is not None
+    assert mission_manifest is not None
+    assert context_manifest is not None
+    agent = parse_resource(agent_manifest)
+    mission = parse_resource(mission_manifest)
+    context = parse_resource(context_manifest)
+    assert isinstance(agent, AgentResource)
+    assert isinstance(mission, MissionResource)
+    assert isinstance(context, ContextResource)
+    data = {
+        "budgetUsage": {
+            "iterations": 1,
+            "modelInvocations": 1,
+            "toolInvocations": 0,
+            "decisionFailures": 0,
+            "toolFailures": 0,
+            "failures": 0,
+            "wallTimeSeconds": 0,
+            "inputTokens": "Unknown",
+            "outputTokens": "Unknown",
+        },
+        "executionFrames": [],
+    }
+
+    messages = runtime._build_messages(mission, agent, context, data, {"iteration": 1}, run.spec.execution)
+
+    user_content = messages[1]["content"]
+    assert '"tools": [{"config": {}, "description": null, "name": "fake"' in user_content
+    assert '"operations": [{"inputSchema": {"properties": {"message": {"type": "string"}}' in user_content
+    assert "Current budgets:" in user_content
+    assert '"maxIterations": 50' in user_content
 
 
 def test_execution_engine_dogfoods_filesystem_and_git_runtime(tmp_path: Path) -> None:

@@ -19,7 +19,7 @@ Use [template.md](template.md) for new RFCs.
 - [RFC-0004: Structured Model Protocol](0004-structured-model-protocol.md)
   - Accepted in Platform Specification `v1.4.0`.
 - [RFC-0005: Multi-Turn Agent Runtime](0005-multi-turn-agent-runtime.md)
-  - Draft.
+  - Implemented after live Ollama dogfood validation.
 
 ## Statuses
 

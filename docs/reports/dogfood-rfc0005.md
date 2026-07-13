@@ -63,6 +63,45 @@ Decision invoke_tool filesystem.read
 - ExecutionFrames and trace reconstruct Decision, ToolInvocation, Observation,
   retry, approval, and completion history.
 
+## Live Ollama Validation
+
+On 2026-07-13, the RFC-0005 path was validated with live Ollama model
+`gpt-oss:20b` and an OpenAI-compatible endpoint at
+`http://100.114.23.127:11434/v1`.
+
+Validation workspace:
+
+```text
+/var/folders/r5/1m72lm1d65x12xwpf2vprb0m0000gn/T/rfc0005-live-5caxz33_/workspace
+```
+
+Only declarative resources were seeded: Workspace, Model, Tool, Capability,
+FleetTemplate, Policy, and Mission. No manual ToolInvocation resources were
+created.
+
+Observed runtime-created operations:
+
+1. `filesystem.read` with `{"path": "README.md"}`
+2. `filesystem.write` with `{"path": "SUMMARY.md", ...}`
+3. `git.status` with `{}`
+4. `git.add` with `{"path": "SUMMARY.md"}`
+5. `git.commit` with `{"message": "docs: add live dogfood summary"}`
+
+Results:
+
+- Mission phase: `Completed`.
+- AgentRun phase: `Succeeded`.
+- Decision rejection count: `0`.
+- All Decision frames were canonical.
+- Observations were delivered after each tool frame and fed the next prompt.
+- `git.commit` required approval; repeated reconciliation while waiting kept
+  model invocations at `0`, ToolInvocation count at `5`, and the ToolInvocation
+  snapshot stable.
+- Trace included ExecutionFrame, Decision, ToolInvocation, Observation, and
+  Approval events.
+- Exactly one Git commit was created:
+  `431862afc5d18725e4c639a44ae3c99d0ac265f4`.
+
 ## Manual ToolInvocations
 
 Direct ToolInvocation manifests remain useful for debugging one runtime

@@ -408,6 +408,26 @@ def test_openai_compatible_adapter_normalizes_json_code_fence() -> None:
 
 def test_runtime_prompt_includes_agent_tools_and_current_budgets(tmp_path: Path) -> None:
     store = make_engine_store(tmp_path)
+    store.apply(
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "Tool",
+            "metadata": {"name": "fake"},
+            "spec": {
+                "config": {"apiKey": "secret-token"},
+                "operations": [
+                    {
+                        "name": "echo",
+                        "inputSchema": {
+                            "type": "object",
+                            "required": ["message"],
+                            "properties": {"message": {"type": "string"}},
+                        },
+                    }
+                ],
+            },
+        }
+    )
     runtime = runtime_with(store, SequenceModel([]))
     run = run_resource(store)
     agent_manifest = store.get(ResourceKind.AGENT, "runner", "demo")
@@ -440,8 +460,10 @@ def test_runtime_prompt_includes_agent_tools_and_current_budgets(tmp_path: Path)
     messages = runtime._build_messages(mission, agent, context, data, {"iteration": 1}, run.spec.execution)
 
     user_content = messages[1]["content"]
-    assert '"tools": [{"config": {}, "description": null, "name": "fake"' in user_content
+    assert '"tools": [{"description": null, "name": "fake"' in user_content
     assert '"operations": [{"inputSchema": {"properties": {"message": {"type": "string"}}' in user_content
+    assert "secret-token" not in user_content
+    assert "apiKey" not in user_content
     assert "Current budgets:" in user_content
     assert '"maxIterations": 50' in user_content
 

@@ -1725,7 +1725,6 @@ class AgentRuntime:
                     ],
                     "timeoutSeconds": tool.spec.timeoutSeconds,
                     "riskLevel": tool.spec.riskLevel,
-                    "config": tool.spec.config,
                 }
             )
         return contracts

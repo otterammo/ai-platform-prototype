@@ -67,7 +67,7 @@ Decision invoke_tool filesystem.read
 
 On 2026-07-13, the RFC-0005 path was validated with live Ollama model
 `gpt-oss:20b` and an OpenAI-compatible endpoint at
-`http://100.114.23.127:11434/v1`.
+`http://${OLLAMA_HOST_IP}:11434/v1`.
 
 Validation workspace:
 
@@ -99,8 +99,6 @@ Results:
   snapshot stable.
 - Trace included ExecutionFrame, Decision, ToolInvocation, Observation, and
   Approval events.
-- Exactly one Git commit was created:
-  `431862afc5d18725e4c639a44ae3c99d0ac265f4`.
 
 ## Manual ToolInvocations
 

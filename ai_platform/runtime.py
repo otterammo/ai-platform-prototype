@@ -2005,16 +2005,32 @@ class AgentRuntime:
         return parsed
 
     def _save_run_data(self, run: AgentRunResource, data: dict[str, Any]) -> AgentRunResource | None:
+        expected_state = run.status.data.get("executionState")
+        expected_active_invocation = run.status.data.get("activeModelInvocation")
         fenced = self._fence_execution_mutation(
             run,
             "PersistExecutionState",
             "ExecutionStatePersisted",
             target_phase=run.status.phase,
             expected_phase=run.status.phase,
+            expected_state=expected_state if isinstance(expected_state, str) else None,
         )
         if fenced is None:
             return None
         run = fenced
+        current_active_invocation = fenced.status.data.get("activeModelInvocation")
+        if current_active_invocation != expected_active_invocation:
+            self._emit_stale_execution_fenced(
+                fenced,
+                "PersistExecutionState",
+                "ActiveModelInvocationMismatch",
+                {
+                    "activeModelInvocation": current_active_invocation,
+                    "expectedActiveModelInvocation": expected_active_invocation,
+                    "reason": "ActiveModelInvocationMismatch",
+                },
+            )
+            return None
         manifest = self.store.update_status(
             ResourceKind.AGENT_RUN,
             run.metadata.name,
@@ -2471,6 +2487,7 @@ class AgentRuntime:
 
     def _timed_out(self, run: AgentRunResource, reason: str, message: str) -> AgentRunResource:
         data = dict(run.status.data)
+        data.pop("activeModelInvocation", None)
         data["terminalReason"] = reason
         data["retryable"] = False
         data["diagnosticSummary"] = message

@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -946,6 +947,7 @@ def test_late_model_response_after_terminal_agentrun_is_discarded(tmp_path: Path
     run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
     assert run is not None
     assert run["status"]["phase"] == "TimedOut"
+    assert "activeModelInvocation" not in run["status"]["data"]
     frames = run["status"]["data"]["executionFrames"]
     assert len(frames) == 1
     assert "rawDecision" not in frames[0]
@@ -982,6 +984,48 @@ def test_stale_worker_epoch_cannot_persist_execution_progress(tmp_path: Path) ->
     run_after = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
     assert run_after is not None
     assert run_after["status"]["data"]["executionEpoch"] == 2
+    assert "staleMutation" not in run_after["status"]["data"]
+    event_types = {event["type"] for event in store.list_events(namespace="demo", limit=None)}
+    assert "StaleExecutionFenced" in event_types
+
+
+def test_same_phase_stale_worker_cannot_overwrite_active_model_invocation(tmp_path: Path) -> None:
+    store = make_engine_store(tmp_path)
+    runtime = runtime_with(store, SequenceModel([]))
+    run = run_resource(store)
+    agent_manifest = store.get(ResourceKind.AGENT, "runner", "demo")
+    mission_manifest = store.get(ResourceKind.MISSION, "run-loop", "demo")
+    context_manifest = store.get(ResourceKind.CONTEXT, "run-1-context", "demo")
+    assert agent_manifest is not None
+    assert mission_manifest is not None
+    assert context_manifest is not None
+    agent = parse_resource(agent_manifest)
+    mission = parse_resource(mission_manifest)
+    context = parse_resource(context_manifest)
+    assert isinstance(agent, AgentResource)
+    assert isinstance(mission, MissionResource)
+    assert isinstance(context, ContextResource)
+
+    started = runtime._start_engine(run, agent)
+    prepared = runtime._prepare_execution(started, agent, context)
+    stale = runtime._ensure_active_frame(prepared, agent, mission, context)
+
+    first_data = deepcopy(stale.status.data)
+    frame, frames = runtime._active_frame(first_data)
+    frame["state"] = "decision-requested"
+    first_data["executionFrames"] = frames
+    first_data["activeModelInvocation"] = {"id": "first", "attempt": 1}
+    assert runtime._save_run_data(stale, first_data) is not None
+
+    stale_data = deepcopy(stale.status.data)
+    stale_data["activeModelInvocation"] = {"id": "second", "attempt": 1}
+    stale_data["staleMutation"] = True
+
+    assert runtime._save_run_data(stale, stale_data) is None
+
+    run_after = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    assert run_after is not None
+    assert run_after["status"]["data"]["activeModelInvocation"]["id"] == "first"
     assert "staleMutation" not in run_after["status"]["data"]
     event_types = {event["type"] for event in store.list_events(namespace="demo", limit=None)}
     assert "StaleExecutionFenced" in event_types

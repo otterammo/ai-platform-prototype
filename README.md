@@ -329,4 +329,6 @@ platform --db sqlite:///./platform.db --root .platform approvals
 platform --db sqlite:///./platform.db --root .platform describe approval approval-abc123
 platform --db sqlite:///./platform.db --root .platform approve approval-abc123 --by alice
 platform --db sqlite:///./platform.db --root .platform reject approval-abc123 --by alice --reason "too risky"
+platform --db sqlite:///./platform.db --root .platform reject approval-def456 --by alice \
+  --reason "Inspect the existing file before overwriting it" --disposition continue
 ```

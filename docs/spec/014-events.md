@@ -79,6 +79,12 @@ ToolInvocation completed, ToolInvocation failed, ToolInvocation timed out,
 ToolInvocation cancelled, Observation recorded, artifact ready, completed,
 waiting, and failed. Decision-related event types SHOULD include
 DecisionRequested, DecisionProduced, DecisionValidated, and DecisionRejected.
+Provider response event types SHOULD include ProviderResponseReceived,
+ProviderResponseNormalized, ProviderResponseRejected, and
+NativeToolCallNormalized. These events SHOULD record AgentRun, ExecutionFrame,
+model attempt, provider, model, finish reason, response mode, correlation ID,
+normalization outcome, and safe response identifiers when available. They MUST
+NOT copy full prompts, secrets, or unredacted tool arguments.
 Execution fencing event types SHOULD include LateModelResponseDiscarded,
 StaleExecutionFenced, ToolInvocationFenced, and
 DuplicateModelInvocationPrevented. Implementations MAY add separate
@@ -153,3 +159,6 @@ driven by Policy and MUST NOT remove the fact that a ToolInvocation occurred.
 
 Extensions MAY add event types. Extension event types SHOULD use stable names
 and SHOULD include the same correlation fields as core events.
+
+Observations and Events are immutable historical outcomes. Consumers MUST NOT
+interpret them as a projection of current repository or Workspace state.

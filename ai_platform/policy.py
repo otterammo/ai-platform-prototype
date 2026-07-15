@@ -12,6 +12,8 @@ from .events import CORRELATION_ID_STATUS_KEY, EventContext, correlation_id_from
 from .resources import (
     AgentRunResource,
     ApprovalResource,
+    Observation,
+    ObservationError,
     PolicyResource,
     PolicyRule,
     ResourceKind,
@@ -387,11 +389,22 @@ class ApprovalService:
             raise KeyError(f"Approval {name} not found after approval")
         return refreshed
 
-    def reject(self, name: str, actor: str = "manual", reason: str | None = None) -> dict[str, Any]:
+    def reject(
+        self,
+        name: str,
+        actor: str = "manual",
+        reason: str | None = None,
+        disposition: str = "terminate",
+    ) -> dict[str, Any]:
+        if disposition not in {"terminate", "continue"}:
+            raise ValueError("rejection disposition must be terminate or continue")
         approval = self._load_pending(name)
+        if disposition == "continue":
+            self._validate_continue_rejection_target(approval)
         decision_reason = reason or "Rejected"
         decided_at = self._now()
         payload = self._approval_event_payload(approval, actor, decision_reason, decided_at)
+        payload["disposition"] = disposition
         self.store.update_status(
             ResourceKind.APPROVAL,
             approval.metadata.name,
@@ -402,6 +415,7 @@ class ApprovalService:
                 "rejectedBy": actor,
                 "rejectedAt": decided_at,
                 "reason": decision_reason,
+                "disposition": disposition,
             },
         )
         self.store.emit_event(
@@ -413,11 +427,43 @@ class ApprovalService:
             payload,
             event_context=self._context(approval, "RejectApproval", "ApprovalRejected"),
         )
-        self._fail_agent_run(approval, actor, decision_reason)
+        if disposition == "continue":
+            self._continue_agent_run(approval, actor, decision_reason)
+        else:
+            self._fail_agent_run(approval, actor, decision_reason)
         refreshed = self.store.get(ResourceKind.APPROVAL, approval.metadata.name)
         if refreshed is None:
             raise KeyError(f"Approval {name} not found after rejection")
         return refreshed
+
+    def _validate_continue_rejection_target(self, approval: ApprovalResource) -> None:
+        if not approval.spec.agentRun:
+            raise ValueError("rejection disposition continue requires an approval tied to an AgentRun")
+        run_manifest = self.store.get(ResourceKind.AGENT_RUN, approval.spec.agentRun, approval.spec.workspace)
+        if run_manifest is None:
+            raise ValueError("rejection disposition continue requires an active AgentRun")
+        run = parse_resource(run_manifest)
+        if not isinstance(run, AgentRunResource):
+            raise ValueError("rejection disposition continue requires an AgentRun approval target")
+        if run.status.phase in {
+            "Succeeded",
+            "Failed",
+            "Cancelled",
+            "TimedOut",
+            "BudgetExceeded",
+        }:
+            raise ValueError("rejection disposition continue requires a nonterminal AgentRun")
+        invocation_name = run.status.data.get("activeToolInvocation")
+        if not isinstance(invocation_name, str):
+            raise ValueError("rejection disposition continue requires a pending ToolInvocation approval")
+        invocation = self.store.get(ResourceKind.TOOL_INVOCATION, invocation_name, approval.spec.workspace)
+        if invocation is None:
+            raise ValueError("rejection disposition continue requires an active ToolInvocation")
+        invocation_status = invocation.get("status") or {}
+        invocation_data = invocation_status.get("data") or {}
+        invocation_approval = invocation_data.get("approvalId") or invocation_data.get("approval")
+        if invocation_status.get("phase") != "WaitingForApproval" or invocation_approval != approval.metadata.name:
+            raise ValueError("rejection disposition continue requires the active ToolInvocation approval")
 
     def _load_pending(self, name: str) -> ApprovalResource:
         manifest = self.store.get(ResourceKind.APPROVAL, name)
@@ -481,6 +527,116 @@ class ApprovalService:
             },
             event_type="AgentRunFailed",
             event_context=self._context(approval, "FailAgentRun", "ApprovalRejected"),
+            clear_data_keys=["pendingApproval"],
+        )
+
+    def _continue_agent_run(self, approval: ApprovalResource, actor: str, reason: str) -> None:
+        if not approval.spec.agentRun:
+            return
+        run_manifest = self.store.get(ResourceKind.AGENT_RUN, approval.spec.agentRun, approval.spec.workspace)
+        if run_manifest is None:
+            return
+        run = parse_resource(run_manifest)
+        if not isinstance(run, AgentRunResource) or run.status.phase in {
+            "Succeeded",
+            "Failed",
+            "Cancelled",
+            "TimedOut",
+            "BudgetExceeded",
+        }:
+            return
+        invocation_name = run.status.data.get("activeToolInvocation")
+        if not isinstance(invocation_name, str):
+            return
+        invocation = self.store.get(ResourceKind.TOOL_INVOCATION, invocation_name, approval.spec.workspace)
+        if invocation is None:
+            return
+        invocation_status = invocation.get("status") or {}
+        invocation_data = invocation_status.get("data") or {}
+        invocation_approval = invocation_data.get("approvalId") or invocation_data.get("approval")
+        if invocation_status.get("phase") != "WaitingForApproval" or invocation_approval != approval.metadata.name:
+            return
+        action = approval.spec.action
+        rejected_action = {
+            "tool": action.get("tool"),
+            "operation": action.get("operation"),
+        }
+        observation = Observation(
+            summary="Approval rejected; revise the proposed action",
+            error=ObservationError(reason="ApprovalRejected", message=reason),
+            payload={
+                "disposition": "continue",
+                "approval": approval.metadata.name,
+                "rejectedAction": rejected_action,
+            },
+        )
+        self.store.update_status(
+            ResourceKind.TOOL_INVOCATION,
+            invocation_name,
+            approval.spec.workspace,
+            "Denied",
+            f"Approval {approval.metadata.name} rejected by {actor}; action denied",
+            {
+                "approval": approval.metadata.name,
+                "approvalId": approval.metadata.name,
+                "rejectedBy": actor,
+                "disposition": "continue",
+                "reason": reason,
+            },
+            event_type="ToolInvocationDenied",
+            event_context=self._context(approval, "DenyToolInvocation", "ApprovalRejected"),
+            observation=observation,
+        )
+        self.store.emit_event(
+            "ObservationRecorded",
+            ResourceKind.TOOL_INVOCATION,
+            invocation_name,
+            approval.spec.workspace,
+            f"Recoverable approval rejection recorded for ToolInvocation {invocation_name}",
+            {
+                "agentRun": run.metadata.name,
+                "toolInvocation": invocation_name,
+                "observation": observation.model_dump(mode="json", exclude_none=True, exclude_defaults=True),
+            },
+            event_context=self._context(approval, "RecordObservation", "ApprovalRejected"),
+        )
+        data = dict(run.status.data)
+        usage = dict(data.get("budgetUsage") or {})
+        usage["toolFailures"] = int(usage.get("toolFailures") or 0) + 1
+        usage["failures"] = int(usage.get("failures") or 0) + 1
+        data["budgetUsage"] = usage
+        frames = [dict(item) for item in data.get("executionFrames", []) if isinstance(item, dict)]
+        active_index = data.get("activeFrameIndex")
+        if isinstance(active_index, int) and 0 <= active_index < len(frames):
+            frames[active_index]["toolRetryCount"] = int(frames[active_index].get("toolRetryCount") or 0) + 1
+            frames[active_index]["retryCount"] = int(frames[active_index].get("retryCount") or 0) + 1
+            frames[active_index]["budgetUsage"] = dict(usage)
+            data["executionFrames"] = frames
+        if usage["toolFailures"] > run.spec.execution.maxToolFailures:
+            data["terminalReason"] = "ToolFailureBudgetExceeded"
+            data["retryable"] = False
+            self.store.update_status(
+                ResourceKind.AGENT_RUN,
+                run.metadata.name,
+                run.metadata.namespace,
+                "BudgetExceeded",
+                "Recoverable approval rejection exhausted maxToolFailures",
+                data,
+                event_type="ExecutionBudgetExceeded",
+                event_context=self._context(approval, "EnforceExecutionBudget", "ToolFailureBudgetExceeded"),
+                clear_data_keys=["pendingApproval"],
+            )
+            return
+        data["executionState"] = "WaitingForTool"
+        self.store.update_status(
+            ResourceKind.AGENT_RUN,
+            run.metadata.name,
+            run.metadata.namespace,
+            "WaitingForTool",
+            f"Approval {approval.metadata.name} rejected with continue; observation ready",
+            data,
+            event_type="AgentRunResumed",
+            event_context=self._context(approval, "ResumeAgentRun", "ApprovalRejectedContinue"),
             clear_data_keys=["pendingApproval"],
         )
 

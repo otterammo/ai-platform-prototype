@@ -52,7 +52,7 @@ def test_api_approval_endpoint_rejects_pending_action(tmp_path: Path) -> None:
     with TestClient(app) as client:
         reject_response = client.post(
             f"/approvals/{approval_name}/reject",
-            json={"actor": "api", "reason": "rejected from test"},
+            json={"rejectedBy": "api", "reason": "rejected from test", "disposition": "terminate"},
         )
         assert reject_response.status_code == 200
         assert reject_response.json()["approval"]["status"]["phase"] == "Rejected"
@@ -63,6 +63,49 @@ def test_api_approval_endpoint_rejects_pending_action(tmp_path: Path) -> None:
     assert mission["status"]["phase"] == "Failed"
     assert agent is not None
     assert agent["status"]["phase"] == "Failed"
+    approval = app.state.store.get(ResourceKind.APPROVAL, approval_name)
+    assert approval is not None
+    assert approval["status"]["data"]["rejectedBy"] == "api"
+    assert approval["status"]["data"]["disposition"] == "terminate"
+
+
+def test_api_approval_endpoint_rejects_invalid_disposition(tmp_path: Path) -> None:
+    app = create_app(f"sqlite:///{tmp_path / 'platform.db'}", str(tmp_path / "platform"))
+    populate_governed_store(app.state.store, tmp_path / "workspace", default_policy_rules())
+    asyncio.run(app.state.control_plane.reconcile_once())
+    approval_name = app.state.store.list(ResourceKind.APPROVAL)[0]["metadata"]["name"]
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/approvals/{approval_name}/reject",
+            json={"rejectedBy": "api", "reason": "test", "disposition": "retry"},
+        )
+
+    assert response.status_code == 422
+    approval = app.state.store.get(ResourceKind.APPROVAL, approval_name)
+    assert approval is not None
+    assert approval["status"]["phase"] == "Pending"
+
+
+def test_api_approval_endpoint_rejects_continue_without_pending_tool_invocation(tmp_path: Path) -> None:
+    app = create_app(f"sqlite:///{tmp_path / 'platform.db'}", str(tmp_path / "platform"))
+    populate_governed_store(app.state.store, tmp_path / "workspace", default_policy_rules())
+    asyncio.run(app.state.control_plane.reconcile_once())
+    approval_name = app.state.store.list(ResourceKind.APPROVAL)[0]["metadata"]["name"]
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/approvals/{approval_name}/reject",
+            json={"rejectedBy": "api", "reason": "need more context", "disposition": "continue"},
+        )
+
+    assert response.status_code == 409
+    approval = app.state.store.get(ResourceKind.APPROVAL, approval_name)
+    mission = app.state.store.get(ResourceKind.MISSION, "implement-auth", "demo")
+    assert approval is not None
+    assert approval["status"]["phase"] == "Pending"
+    assert mission is not None
+    assert mission["status"]["phase"] == "Waiting"
 
 
 def test_api_knowledge_search_indexes_and_context_endpoint_returns_runtime_context(tmp_path: Path) -> None:

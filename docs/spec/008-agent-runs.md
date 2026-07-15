@@ -136,8 +136,10 @@ identity and explicit attempt numbers.
 
 If policy requires approval during execution, the AgentRun MUST enter a waiting
 state and reference the pending Approval. Runtime MUST stop the guarded action
-until approval is granted. If approval is rejected, the AgentRun MUST fail or
-remain waiting according to policy.
+until approval is granted. A rejection with disposition `terminate` MUST fail
+the AgentRun. A rejection with disposition `continue` MUST preserve the denied
+ToolInvocation, deliver one rejection Observation, and resume with a new
+Decision subject to existing budgets.
 
 Approval required for a ToolInvocation MUST pause the AgentRun before the tool
 operation begins. Resuming an AgentRun after approval MUST continue from the same

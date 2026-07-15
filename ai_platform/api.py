@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -19,6 +19,8 @@ from .storage import CONTROLLER_FIELD_MANAGER, DEFAULT_DB_URL, ResourceStore
 class ApprovalDecisionRequest(BaseModel):
     actor: str = "manual"
     reason: str | None = None
+    disposition: Literal["terminate", "continue"] = "terminate"
+    rejectedBy: str | None = None
 
 
 def create_app(
@@ -201,7 +203,12 @@ def create_app(
     ) -> dict[str, Any]:
         decision = request or ApprovalDecisionRequest()
         try:
-            approval = ApprovalService(store).reject(approval_id, actor=decision.actor, reason=decision.reason)
+            approval = ApprovalService(store).reject(
+                approval_id,
+                actor=decision.rejectedBy or decision.actor,
+                reason=decision.reason,
+                disposition=decision.disposition,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:

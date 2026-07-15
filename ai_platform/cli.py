@@ -192,6 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
     reject_parser.add_argument("name")
     reject_parser.add_argument("--by", default="manual")
     reject_parser.add_argument("--reason")
+    reject_parser.add_argument("--disposition", choices=["terminate", "continue"], default="terminate")
 
     serve_parser = subparsers.add_parser("serve", help="Run the FastAPI server with uvicorn")
     serve_parser.add_argument("--host", default="127.0.0.1")
@@ -411,7 +412,9 @@ async def run_async(args: argparse.Namespace) -> int:
 
     if args.command == "reject":
         try:
-            approval = ApprovalService(store).reject(args.name, actor=args.by, reason=args.reason)
+            approval = ApprovalService(store).reject(
+                args.name, actor=args.by, reason=args.reason, disposition=args.disposition
+            )
         except (KeyError, ValueError) as exc:
             print(str(exc), file=sys.stderr)
             return 1

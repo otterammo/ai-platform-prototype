@@ -75,8 +75,18 @@ reference the pending Approval. Parent Agent, Fleet, and Mission resources SHOUL
 aggregate waiting status.
 
 When Approval is granted, the control plane SHOULD resume eligible AgentRuns.
-When Approval is rejected, the AgentRun MUST fail or remain waiting according to
-policy.
+Approval rejection MUST declare a disposition. `terminate` MUST deny the
+guarded action and terminalize the AgentRun; it is the compatibility default.
+`continue` MUST deny the guarded ToolInvocation without executing it, record one
+structured rejection Observation, deliver that Observation once to the current
+execution loop, and request a new Decision. A continued rejection consumes a
+ToolInvocation attempt, one iteration, and tool-failure accounting, but not a
+model failure. Existing ToolInvocation and iteration budgets MUST bound repeated
+rejections.
+
+Approval decisions MUST be fenced against terminal AgentRuns and stale action
+identity. Duplicate or late decisions MUST NOT replay a rejected
+ToolInvocation, revive terminal work, or create duplicate ExecutionFrames.
 
 `WaitingForApproval` is a waiting condition on the blocked action, normally a
 ToolInvocation. It is not a separate AgentRun terminal phase. The Model MUST NOT

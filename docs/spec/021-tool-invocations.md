@@ -174,6 +174,12 @@ When a ToolInvocation is blocked by approval, `WaitingForApproval` is a waiting
 condition on the ToolInvocation or AgentRun status. It is not a separate
 AgentRun terminal phase.
 
+A rejected Approval MUST never authorize or execute its ToolInvocation. With
+disposition `terminate`, the parent AgentRun becomes terminal. With disposition
+`continue`, the ToolInvocation becomes terminal `Denied` with an embedded
+ApprovalRejected Observation; the Execution Engine MUST deliver that
+Observation exactly once before preparing the next frame.
+
 ## Safety
 
 Runtime MUST enforce:

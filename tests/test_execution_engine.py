@@ -8,16 +8,26 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from ai_platform.cli import main
 from ai_platform.controllers import LocalAgentRunWorker, ToolInvocationController
-from ai_platform.models import Message, ModelClient, normalize_decision_content
+from ai_platform.models import (
+    Message,
+    ModelClient,
+    ModelResponse,
+    OpenAICompatibleClient,
+    ProviderAdapterError,
+    normalize_decision_content,
+    normalize_native_tool_calls,
+)
 from ai_platform.observability import build_trace
 from ai_platform.policy import ApprovalService
 from ai_platform.resources import (
     AgentResource,
     ContextResource,
     MissionResource,
+    ModelConfig,
     Observation,
     ResourceKind,
     parse_resource,
@@ -30,14 +40,18 @@ class SequenceModel(ModelClient):
     def __init__(self, items: list[Any]) -> None:
         self.items = list(items)
         self.calls = 0
+        self.messages: list[list[Message]] = []
 
-    async def generate(self, _messages: list[Message]) -> str:
+    async def generate(self, _messages: list[Message]) -> str | ModelResponse:
         self.calls += 1
+        self.messages.append(deepcopy(_messages))
         if not self.items:
             raise AssertionError("model called after sequence was exhausted")
         item = self.items.pop(0)
         if isinstance(item, Exception):
             raise item
+        if isinstance(item, ModelResponse):
+            return item
         if isinstance(item, dict):
             return json.dumps(item)
         return str(item)
@@ -427,6 +441,157 @@ def test_openai_compatible_adapter_normalizes_json_code_fence() -> None:
     assert normalize_decision_content('{"version":"v1"}') == '{"version":"v1"}'
 
 
+def test_openai_compatible_adapter_normalizes_native_tool_call() -> None:
+    raw, call_id = normalize_native_tool_calls(
+        [
+            {
+                "id": "call-123",
+                "type": "function",
+                "function": {"name": "filesystem.read", "arguments": '{"path":"README.md"}'},
+            }
+        ]
+    )
+    assert json.loads(raw) == {
+        "version": "v1",
+        "type": "invoke_tool",
+        "tool": "filesystem",
+        "operation": "read",
+        "arguments": {"path": "README.md"},
+    }
+    assert call_id == "call-123"
+
+    alternate, _ = normalize_native_tool_calls(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "filesystem.invoke_tool",
+                    "arguments": {"operation": "list", "path": "src"},
+                },
+            }
+        ]
+    )
+    assert json.loads(alternate)["operation"] == "list"
+    assert json.loads(alternate)["arguments"] == {"path": "src"}
+
+    bare, _ = normalize_native_tool_calls(
+        [
+            {
+                "type": "function",
+                "function": {"name": "filesystem", "arguments": {"operation": "read", "path": "README.md"}},
+            }
+        ]
+    )
+    assert json.loads(bare)["operation"] == "read"
+    assert json.loads(bare)["arguments"] == {"path": "README.md"}
+
+
+def test_openai_compatible_client_handles_observed_gpt_oss_response(monkeypatch: Any) -> None:
+    body = {
+        "id": "chatcmpl-observed",
+        "model": "gpt-oss:20b",
+        "choices": [
+            {
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-observed",
+                            "type": "function",
+                            "function": {"name": "filesystem.read", "arguments": '{"path":"README.md"}'},
+                        }
+                    ],
+                },
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    }
+
+    class Response:
+        headers = {"x-request-id": "request-observed"}
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        @staticmethod
+        def read() -> bytes:
+            return json.dumps(body).encode()
+
+    monkeypatch.setenv("OLLAMA_API_KEY", "test")
+    client = OpenAICompatibleClient(
+        ModelConfig(
+            provider="openai-compatible",
+            model="gpt-oss:20b",
+            baseUrl="http://ollama.test/v1",
+            apiKeyEnv="OLLAMA_API_KEY",
+        )
+    )
+    with patch("ai_platform.models.urllib.request.urlopen", return_value=Response()):
+        response = client._generate_sync([])
+
+    assert json.loads(response.content)["operation"] == "read"
+    assert response.metadata["responseMode"] == "tool_calls"
+    assert response.metadata["nativeCallId"] == "call-observed"
+    assert response.metadata["finishReason"] == "tool_calls"
+
+
+def test_openai_compatible_adapter_rejects_invalid_native_tool_calls() -> None:
+    invalid = [
+        [],
+        [
+            {"type": "function", "function": {"name": "git.status", "arguments": {}}},
+            {"type": "function", "function": {"name": "git.diff", "arguments": {}}},
+        ],
+        [{"type": "function", "function": {"name": "filesystem", "arguments": {}}}],
+        [{"type": "function", "function": {"name": "filesystem.read", "arguments": "{"}}],
+        [{"type": "function", "function": {"name": "filesystem.read", "arguments": []}}],
+        [{"type": "other", "function": {"name": "filesystem.read", "arguments": {}}}],
+    ]
+    for calls in invalid:
+        try:
+            normalize_native_tool_calls(calls)
+        except ProviderAdapterError:
+            pass
+        else:
+            raise AssertionError(f"expected adapter rejection for {calls!r}")
+
+
+def test_provider_response_metadata_is_persisted_and_traced(tmp_path: Path) -> None:
+    store = make_engine_store(tmp_path)
+    model = SequenceModel([])
+    model.items.append(
+        ModelResponse(
+            json.dumps(complete_decision("native metadata complete")),
+            {
+                "provider": "openai-compatible",
+                "model": "gpt-oss:20b",
+                "responseId": "response-1",
+                "finishReason": "tool_calls",
+                "responseMode": "tool_calls",
+                "toolCallCount": 1,
+                "nativeCallId": "call-1",
+                "normalizationOutcome": "normalized",
+            },
+        )
+    )
+
+    asyncio.run(runtime_with(store, model).run(run_resource(store)))
+
+    run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    assert run is not None
+    metadata = run["status"]["data"]["executionFrames"][0]["providerResponse"]
+    assert metadata["responseMode"] == "tool_calls"
+    assert metadata["nativeCallId"] == "call-1"
+    events = store.list_events(namespace="demo", limit=None)
+    native_event = next(event for event in events if event["type"] == "NativeToolCallNormalized")
+    assert native_event["payload"]["finishReason"] == "tool_calls"
+    assert native_event["payload"]["normalizationOutcome"] == "normalized"
+
+
 def test_runtime_prompt_includes_agent_tools_and_current_budgets(tmp_path: Path) -> None:
     store = make_engine_store(tmp_path)
     store.apply(
@@ -728,6 +893,43 @@ def test_completed_agentrun_does_not_resume_or_duplicate_tool_invocation(tmp_pat
 
     assert model.calls == 2
     assert len(store.list(ResourceKind.TOOL_INVOCATION, "demo")) == 1
+
+
+def test_approval_rejection_continue_delivers_observation_and_requests_new_decision(tmp_path: Path) -> None:
+    policy_rules = [
+        {"match": {"tool": "fake", "operation": "use"}, "allow": True},
+        {"match": {"tool": "fake", "operation": "echo"}, "requiresApproval": True},
+        {"match": {"tool": "model"}, "allow": True},
+        {"match": {"tool": "filesystem"}, "allow": True},
+    ]
+    store = make_engine_store(tmp_path, policy_rules=policy_rules)
+    model = SequenceModel([invoke_fake_decision(), complete_decision("recovered")])
+    runtime = runtime_with(store, model, ToolRuntimeRegistry({"fake": FailingRuntime()}))
+
+    asyncio.run(runtime.run(run_resource(store)))
+    approval = store.list(ResourceKind.APPROVAL)[0]
+    ApprovalService(store).reject(
+        approval["metadata"]["name"],
+        actor="reviewer",
+        reason="Inspect before mutating",
+        disposition="continue",
+    )
+    asyncio.run(runtime.run(run_resource(store)))
+
+    run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    invocation = store.get(ResourceKind.TOOL_INVOCATION, "run-1-tool-1-0001-1", "demo")
+    assert run is not None
+    assert run["status"]["phase"] == "Succeeded"
+    assert invocation is not None
+    assert invocation["status"]["phase"] == "Denied"
+    assert invocation["status"]["observation"]["error"] == {
+        "reason": "ApprovalRejected",
+        "message": "Inspect before mutating",
+    }
+    assert invocation["status"]["observation"]["payload"]["disposition"] == "continue"
+    assert len(store.list(ResourceKind.TOOL_INVOCATION, "demo")) == 1
+    assert "ApprovalRejected" in model.messages[1][-1]["content"]
+    assert model.calls == 2
 
 
 def test_resume_after_tool_success_delivers_observation_without_reexecuting_tool(tmp_path: Path) -> None:

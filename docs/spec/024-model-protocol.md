@@ -117,6 +117,19 @@ Missing capabilities are normalized by the Provider Adapter:
 - Missing provider metadata MUST be represented as unknown or omitted. The
   platform MUST NOT fabricate metadata.
 
+For the sequential `v1` Execution Engine, an OpenAI-compatible native function
+call MUST normalize exactly one `<tool>.<operation>` name and an object-valued
+arguments payload into one canonical `invoke_tool` Decision. Arguments MAY be a
+JSON object or a JSON string containing an object. Zero native calls with empty
+content, multiple calls, unsupported call types, ambiguous names, malformed
+arguments, and non-object arguments MUST fail deterministically. Native calls
+MUST NOT represent `complete` or `fail`; those Decisions remain content-based.
+An OpenAI-compatible adapter MAY additionally accept `<tool>.invoke_tool` or a
+bare `<tool>` name only when `arguments.operation` is a non-empty string; it
+MUST remove that routing field from canonical tool arguments. A bare name
+without the explicit operation remains ambiguous and MUST be rejected. No other
+ambiguous naming convention is accepted by this compatibility mapping.
+
 ## Validation Boundary
 
 Provider Adapter validates:
@@ -190,6 +203,9 @@ Recommended metadata:
 - Refusal or safety category when reported.
 - Truncation indicator.
 - Retryability hint for provider or transport failures.
+- Native response mode (`content` or `tool_calls`), native call count, and
+  provider-native call identifier when reported.
+- Adapter normalization outcome and adapter rejection reason.
 
 Unavailable metadata is unknown. Unknown metadata MUST NOT be fabricated.
 

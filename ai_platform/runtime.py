@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol, TypeVar
 
 from .events import CORRELATION_ID_ANNOTATION, CORRELATION_ID_STATUS_KEY, EventContext
-from .models import Message, ModelClient, build_model_client
+from .models import Message, ModelClient, ModelResponse, ProviderAdapterError, build_model_client
 from .policy import ApprovalRequired, PolicyDenied, PolicyEngine, RuntimeAction
 from .resources import (
     AgentResource,
@@ -1047,7 +1047,7 @@ class AgentRuntime:
         messages = self._build_messages(mission, agent, context, data, frame, budget)
         client = self.model_client_factory(model_config, self.store)
         try:
-            raw_decision = await asyncio.wait_for(client.generate(messages), timeout=model_config.timeoutSeconds)
+            model_response = await asyncio.wait_for(client.generate(messages), timeout=model_config.timeoutSeconds)
         except asyncio.TimeoutError:
             fenced = self._fence_model_completion(
                 run,
@@ -1086,7 +1086,19 @@ class AgentRuntime:
             run = fenced
             data = dict(run.status.data)
             frame, frames = self._active_frame(data)
-            frame["modelError"] = {"reason": "ModelInvocationFailed", "message": str(exc), "attempt": attempt}
+            error_reason = exc.reason if isinstance(exc, ProviderAdapterError) else "ModelInvocationFailed"
+            frame["modelError"] = {"reason": error_reason, "message": str(exc), "attempt": attempt}
+            if isinstance(exc, ProviderAdapterError):
+                provider_metadata = self._provider_event_metadata(exc.metadata, run, frame, invocation_id, attempt)
+                frame["providerResponse"] = provider_metadata
+                self._emit_run_event(
+                    run,
+                    "ProviderResponseRejected",
+                    str(exc),
+                    provider_metadata,
+                    "NormalizeProviderResponse",
+                    error_reason,
+                )
             if isinstance(frame.get("modelInvocation"), dict):
                 frame["modelInvocation"]["state"] = "failed"
             frame["retryCount"] = int(frame.get("retryCount", 0)) + 1
@@ -1102,6 +1114,17 @@ class AgentRuntime:
                 return self._refresh_run(run)
             return self._fail_run(run, str(exc), "ModelInvocationFailed", retryable=True)
 
+        raw_decision = model_response.content if isinstance(model_response, ModelResponse) else model_response
+        response_metadata = (
+            model_response.metadata
+            if isinstance(model_response, ModelResponse)
+            else {
+                "provider": model_config.provider,
+                "model": model_config.model,
+                "responseMode": "content",
+                "normalizationOutcome": "normalized",
+            }
+        )
         fenced = self._fence_model_completion(
             run,
             expected_invocation_id=invocation_id,
@@ -1113,6 +1136,8 @@ class AgentRuntime:
         run = fenced
         data = dict(run.status.data)
         frame, frames = self._active_frame(data)
+        provider_metadata = self._provider_event_metadata(response_metadata, run, frame, invocation_id, attempt)
+        frame["providerResponse"] = provider_metadata
         frame["rawDecision"] = raw_decision
         frame["decisionProducedAt"] = utciso()
         frame["state"] = "decision-produced"
@@ -1128,6 +1153,27 @@ class AgentRuntime:
         data["executionFrames"] = frames
         data["activeDecisionSummary"] = {"raw": self._redact_text(raw_decision)}
         data.pop("activeModelInvocation", None)
+        self._emit_run_event(
+            run,
+            "ProviderResponseReceived",
+            f"Provider response received from {model_config.provider}:{model_config.model}",
+            provider_metadata,
+            "ReceiveProviderResponse",
+            "ProviderResponseReceived",
+        )
+        normalized_event = (
+            "NativeToolCallNormalized"
+            if provider_metadata.get("responseMode") == "tool_calls"
+            else "ProviderResponseNormalized"
+        )
+        self._emit_run_event(
+            run,
+            normalized_event,
+            "Provider response normalized to a canonical Decision",
+            provider_metadata,
+            "NormalizeProviderResponse",
+            "ProviderResponseNormalized",
+        )
         return self._transition(
             run,
             "DecisionReady",
@@ -1138,6 +1184,42 @@ class AgentRuntime:
             "DecisionProduced",
             clear_data_keys=["activeModelInvocation"],
         )
+
+    @staticmethod
+    def _provider_event_metadata(
+        metadata: dict[str, Any],
+        run: AgentRunResource,
+        frame: dict[str, Any],
+        invocation_id: str,
+        attempt: int,
+    ) -> dict[str, Any]:
+        allowed = {
+            "provider",
+            "model",
+            "requestId",
+            "responseId",
+            "finishReason",
+            "latencyMs",
+            "promptTokenCount",
+            "completionTokenCount",
+            "reasoningTokenCount",
+            "responseMode",
+            "toolCallCount",
+            "nativeCallId",
+            "normalizationOutcome",
+            "adapterErrorReason",
+        }
+        payload = {key: value for key, value in metadata.items() if key in allowed and value is not None}
+        payload.update(
+            {
+                "agentRun": run.metadata.name,
+                "executionFrame": frame.get("iteration"),
+                "modelAttempt": attempt,
+                "modelInvocationId": invocation_id,
+                "correlationId": run_correlation_id(run),
+            }
+        )
+        return payload
 
     def _validate_current_decision(self, run: AgentRunResource, agent: AgentResource) -> AgentRunResource:
         data = dict(run.status.data)
@@ -1844,6 +1926,10 @@ class AgentRuntime:
                     "Return exactly one JSON Decision object using version v1 and type "
                     "invoke_tool, complete, or fail. Use only tools listed in the Agent section. "
                     "For invoke_tool, set tool, operation, and arguments exactly as the tool contract requires. "
+                    "For engineering work, inspect before mutating; use . for the workspace root and never use "
+                    "cwd workspace. Read an existing file before overwriting it and preserve unrelated tests. "
+                    "Run focused tests before full validation, do not stage changes until validation passes, and "
+                    "create the requested review output before requesting a commit. "
                     "Do not return natural-language text outside JSON."
                 ),
             },

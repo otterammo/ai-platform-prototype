@@ -315,6 +315,30 @@ def test_rejection_workflow_fails_agent_fleet_and_mission(tmp_path: Path) -> Non
     assert {"ApprovalRejected", "AgentRunFailed", "AgentFailed", "FleetFailed", "MissionFailed"}.issubset(event_types)
 
 
+def test_continue_rejection_requires_pending_tool_invocation_approval(tmp_path: Path) -> None:
+    store = make_governed_store(tmp_path, default_policy_rules())
+    asyncio.run(ControlPlane(store).reconcile_once())
+    approval_id = approval_name(store)
+
+    with pytest.raises(ValueError, match="pending ToolInvocation approval"):
+        ApprovalService(store).reject(
+            approval_id,
+            actor="bob",
+            reason="need more context",
+            disposition="continue",
+        )
+
+    approval = store.get(ResourceKind.APPROVAL, approval_id)
+    mission = store.get(ResourceKind.MISSION, "implement-auth", "demo")
+    agent = store.get(ResourceKind.AGENT, "implement-auth-fleet-coder", "demo")
+    assert approval is not None
+    assert approval["status"]["phase"] == "Pending"
+    assert mission is not None
+    assert mission["status"]["phase"] == "Waiting"
+    assert agent is not None
+    assert agent["status"]["phase"] == "Waiting"
+
+
 def test_policy_denial_fails_without_creating_approval(tmp_path: Path) -> None:
     store = make_governed_store(
         tmp_path,

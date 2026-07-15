@@ -399,6 +399,8 @@ class ApprovalService:
         if disposition not in {"terminate", "continue"}:
             raise ValueError("rejection disposition must be terminate or continue")
         approval = self._load_pending(name)
+        if disposition == "continue":
+            self._validate_continue_rejection_target(approval)
         decision_reason = reason or "Rejected"
         decided_at = self._now()
         payload = self._approval_event_payload(approval, actor, decision_reason, decided_at)
@@ -433,6 +435,35 @@ class ApprovalService:
         if refreshed is None:
             raise KeyError(f"Approval {name} not found after rejection")
         return refreshed
+
+    def _validate_continue_rejection_target(self, approval: ApprovalResource) -> None:
+        if not approval.spec.agentRun:
+            raise ValueError("rejection disposition continue requires an approval tied to an AgentRun")
+        run_manifest = self.store.get(ResourceKind.AGENT_RUN, approval.spec.agentRun, approval.spec.workspace)
+        if run_manifest is None:
+            raise ValueError("rejection disposition continue requires an active AgentRun")
+        run = parse_resource(run_manifest)
+        if not isinstance(run, AgentRunResource):
+            raise ValueError("rejection disposition continue requires an AgentRun approval target")
+        if run.status.phase in {
+            "Succeeded",
+            "Failed",
+            "Cancelled",
+            "TimedOut",
+            "BudgetExceeded",
+        }:
+            raise ValueError("rejection disposition continue requires a nonterminal AgentRun")
+        invocation_name = run.status.data.get("activeToolInvocation")
+        if not isinstance(invocation_name, str):
+            raise ValueError("rejection disposition continue requires a pending ToolInvocation approval")
+        invocation = self.store.get(ResourceKind.TOOL_INVOCATION, invocation_name, approval.spec.workspace)
+        if invocation is None:
+            raise ValueError("rejection disposition continue requires an active ToolInvocation")
+        invocation_status = invocation.get("status") or {}
+        invocation_data = invocation_status.get("data") or {}
+        invocation_approval = invocation_data.get("approvalId") or invocation_data.get("approval")
+        if invocation_status.get("phase") != "WaitingForApproval" or invocation_approval != approval.metadata.name:
+            raise ValueError("rejection disposition continue requires the active ToolInvocation approval")
 
     def _load_pending(self, name: str) -> ApprovalResource:
         manifest = self.store.get(ResourceKind.APPROVAL, name)

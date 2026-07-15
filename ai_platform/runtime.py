@@ -1015,7 +1015,10 @@ class AgentRuntime:
             "executionEpoch": data.get("executionEpoch"),
             "deadlineAt": deadline,
         }
-        run = self._save_run_data(run, data)
+        saved = self._save_run_data(run, data)
+        if saved is None:
+            return self._refresh_run(run)
+        run = saved
         self._emit_budget_updated(run, usage, budget)
 
         self._emit_run_event(
@@ -1066,7 +1069,9 @@ class AgentRuntime:
                 frame["modelInvocation"]["state"] = "timed-out"
             data["activeModelInvocation"] = None
             data["executionFrames"] = frames
-            self._save_run_data(run, data)
+            saved = self._save_run_data(run, data)
+            if saved is None:
+                return self._refresh_run(run)
             return self._timed_out(run, "ModelInvocationTimedOut", frame["modelError"]["message"])
         except Exception as exc:
             fenced = self._fence_model_completion(
@@ -1087,7 +1092,9 @@ class AgentRuntime:
             frame["modelRetryCount"] = int(frame.get("modelRetryCount", 0)) + 1
             data["executionFrames"] = frames
             data["activeModelInvocation"] = None
-            self._save_run_data(run, data)
+            saved = self._save_run_data(run, data)
+            if saved is None:
+                return self._refresh_run(run)
             if frame["modelRetryCount"] <= budget.maxModelRetries:
                 self._emit_retry_scheduled(run, frame, "ModelInvocationFailed", str(exc))
                 return self._refresh_run(run)
@@ -1511,7 +1518,9 @@ class AgentRuntime:
                 frame["budgetUsage"] = dict(usage)
                 data["budgetUsage"] = usage
                 data["executionFrames"] = frames
-                self._save_run_data(run, data)
+                saved = self._save_run_data(run, data)
+                if saved is None:
+                    return "terminal"
                 observation = self._error_observation("ToolInvocationTimedOut", message)
                 self._set_tool_status(
                     invocation,
@@ -1532,7 +1541,10 @@ class AgentRuntime:
                 frame["budgetUsage"] = dict(usage)
                 data["budgetUsage"] = usage
                 data["executionFrames"] = frames
-                run = self._save_run_data(run, data)
+                saved = self._save_run_data(run, data)
+                if saved is None:
+                    return "terminal"
+                run = saved
                 if usage["toolFailures"] > run.spec.execution.maxToolFailures:
                     observation = self._error_observation("ToolFailureBudgetExceeded", str(exc))
                     self._set_tool_status(
@@ -1992,7 +2004,7 @@ class AgentRuntime:
             raise TypeError(f"expected AgentRunResource, got {type(parsed).__name__}")
         return parsed
 
-    def _save_run_data(self, run: AgentRunResource, data: dict[str, Any]) -> AgentRunResource:
+    def _save_run_data(self, run: AgentRunResource, data: dict[str, Any]) -> AgentRunResource | None:
         fenced = self._fence_execution_mutation(
             run,
             "PersistExecutionState",
@@ -2001,7 +2013,7 @@ class AgentRuntime:
             expected_phase=run.status.phase,
         )
         if fenced is None:
-            return self._refresh_run(run)
+            return None
         run = fenced
         manifest = self.store.update_status(
             ResourceKind.AGENT_RUN,

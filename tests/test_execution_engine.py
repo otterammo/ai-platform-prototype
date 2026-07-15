@@ -987,6 +987,40 @@ def test_stale_worker_epoch_cannot_persist_execution_progress(tmp_path: Path) ->
     assert "StaleExecutionFenced" in event_types
 
 
+def test_persist_fence_stops_before_model_invocation(tmp_path: Path) -> None:
+    store = make_engine_store(tmp_path)
+    model = SequenceModel([complete_decision("should not be called")])
+
+    class TerminalizingRuntime(AgentRuntime):
+        def __init__(self, store: ResourceStore) -> None:
+            super().__init__(store, model_client_factory=lambda _config, _store: model)
+            self.terminalized = False
+
+        def _save_run_data(self, run: Any, data: dict[str, Any]) -> Any:
+            if not self.terminalized:
+                self.terminalized = True
+                self.store.update_status(
+                    ResourceKind.AGENT_RUN,
+                    run.metadata.name,
+                    run.metadata.namespace,
+                    "TimedOut",
+                    "AgentRun timed out before model invocation",
+                    {"terminalReason": "AgentRunTimedOut", **run.status.data},
+                )
+            return super()._save_run_data(run, data)
+
+    asyncio.run(TerminalizingRuntime(store).run(run_resource(store)))
+
+    run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    assert run is not None
+    assert run["status"]["phase"] == "TimedOut"
+    assert model.calls == 0
+    event_types = {event["type"] for event in store.list_events(namespace="demo", limit=None)}
+    assert "StaleExecutionFenced" in event_types
+    assert "DecisionRequested" not in event_types
+    assert "ModelInvoked" not in event_types
+
+
 def test_terminal_reconciliation_is_inert_for_agentruns(tmp_path: Path) -> None:
     for phase in ["Failed", "Cancelled", "TimedOut", "BudgetExceeded", "Succeeded"]:
         case_path = tmp_path / phase.lower()

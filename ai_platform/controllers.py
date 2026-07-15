@@ -1125,8 +1125,13 @@ class ToolInvocationController:
                 self._fail_running_replay(invocation)
                 changed += 1
                 continue
-            if self._pending_approval(invocation):
-                continue
+            if invocation.status.phase == "WaitingForApproval":
+                run = self._agent_run(invocation)
+                if self._fence_terminal_or_stale_parent(invocation, run):
+                    changed += 1
+                    continue
+                if self._pending_approval(invocation):
+                    continue
             if await self._reconcile_invocation(invocation):
                 changed += 1
         return ReconcileResult("tool-invocation", changed)

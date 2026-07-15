@@ -522,8 +522,8 @@ def test_tool_invocation_requires_approval_and_resumes_after_approval(tmp_path: 
         ResourceKind.AGENT_RUN,
         "run-1",
         "demo",
-        "Succeeded",
-        "Existing AgentRun already completed",
+        "WaitingForTool",
+        "Existing AgentRun is waiting for a ToolInvocation",
     )
 
     asyncio.run(controller.reconcile_once())
@@ -536,7 +536,7 @@ def test_tool_invocation_requires_approval_and_resumes_after_approval(tmp_path: 
     assert invocation["status"]["phase"] == "WaitingForApproval"
     assert "observation" not in invocation["status"]
     assert run is not None
-    assert run["status"]["phase"] == "Succeeded"
+    assert run["status"]["phase"] == "WaitingForTool"
     assert len(approvals) == 1
     assert "agentRun" not in approvals[0]["spec"]
     approval_name = approvals[0]["metadata"]["name"]
@@ -549,7 +549,7 @@ def test_tool_invocation_requires_approval_and_resumes_after_approval(tmp_path: 
     ApprovalService(store).approve(approval_name, actor="test")
     approved_run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
     assert approved_run is not None
-    assert approved_run["status"]["phase"] == "Succeeded"
+    assert approved_run["status"]["phase"] == "WaitingForTool"
     event_types = {event["type"] for event in store.list_events(namespace="demo", limit=50)}
     assert "AgentRunResumed" not in event_types
     asyncio.run(controller.reconcile_once())
@@ -558,6 +558,35 @@ def test_tool_invocation_requires_approval_and_resumes_after_approval(tmp_path: 
     assert invocation is not None
     assert invocation["status"]["phase"] == "Succeeded"
     assert invocation["status"]["observation"]["payload"] == {"message": "hello"}
+
+
+def test_waiting_for_approval_invocation_is_fenced_when_parent_terminal(tmp_path: Path) -> None:
+    store = make_store(tmp_path, [{"match": {"tool": "fake", "operation": "echo"}, "requiresApproval": True}])
+    controller = ToolInvocationController(store)
+
+    asyncio.run(controller.reconcile_once())
+
+    invocation = store.get(ResourceKind.TOOL_INVOCATION, "invoke-0001", "demo")
+    assert invocation is not None
+    assert invocation["status"]["phase"] == "WaitingForApproval"
+
+    store.update_status(
+        ResourceKind.AGENT_RUN,
+        "run-1",
+        "demo",
+        "TimedOut",
+        "AgentRun timed out while approval was pending",
+        {"terminalReason": "AgentRunTimedOut", "executionEpoch": 1},
+    )
+
+    asyncio.run(controller.reconcile_once())
+
+    invocation = store.get(ResourceKind.TOOL_INVOCATION, "invoke-0001", "demo")
+    assert invocation is not None
+    assert invocation["status"]["phase"] == "Cancelled"
+    assert invocation["status"]["observation"]["error"]["reason"] == "ParentAgentRunTerminal"
+    event_types = {event["type"] for event in store.list_events(namespace="demo", limit=100)}
+    assert "ToolInvocationFenced" in event_types
 
 
 def test_tool_invocation_runtime_timeout_marks_timed_out(tmp_path: Path) -> None:

@@ -35,6 +35,7 @@ from .resources import (
 from .runtime import (
     AGENT_RUN_TERMINAL_PHASES,
     ENGINE_RESUMABLE_PHASES,
+    EXECUTION_EPOCH_ANNOTATION,
     AgentRuntime,
     ToolRuntimeError,
     ToolRuntimeRegistry,
@@ -1053,6 +1054,32 @@ class LocalAgentRunWorker:
                 changed += 1
                 continue
             except Exception as exc:
+                current_manifest = self.store.get(ResourceKind.AGENT_RUN, run.metadata.name, run.metadata.namespace)
+                current_phase = (current_manifest.get("status") or {}).get("phase") if current_manifest else None
+                if current_phase in AGENT_RUN_TERMINAL_PHASES:
+                    self.store.emit_event(
+                        "StaleExecutionFenced",
+                        ResourceKind.AGENT_RUN,
+                        run.metadata.name,
+                        run.metadata.namespace,
+                        f"Worker failure ignored because AgentRun is {current_phase}",
+                        {
+                            "agentRun": run.metadata.name,
+                            "currentPhase": current_phase,
+                            "error": str(exc),
+                            "reason": "AgentRunTerminal",
+                        },
+                        event_context=EventContext(
+                            controller="LocalAgentRunWorker",
+                            action="ExecuteAgentRun",
+                            reason="AgentRunTerminal",
+                            correlation_id=resource_correlation_id(run),
+                            workspace=run.metadata.namespace,
+                            mission=run.spec.missionRef.name,
+                        ),
+                    )
+                    changed += 1
+                    continue
                 error = str(exc)
                 self.store.update_status(
                     ResourceKind.AGENT_RUN,
@@ -1098,8 +1125,13 @@ class ToolInvocationController:
                 self._fail_running_replay(invocation)
                 changed += 1
                 continue
-            if self._pending_approval(invocation):
-                continue
+            if invocation.status.phase == "WaitingForApproval":
+                run = self._agent_run(invocation)
+                if self._fence_terminal_or_stale_parent(invocation, run):
+                    changed += 1
+                    continue
+                if self._pending_approval(invocation):
+                    continue
             if await self._reconcile_invocation(invocation):
                 changed += 1
         return ReconcileResult("tool-invocation", changed)
@@ -1107,6 +1139,8 @@ class ToolInvocationController:
     async def _reconcile_invocation(self, invocation: ToolInvocationResource) -> bool:
         try:
             run = self._agent_run(invocation)
+            if self._fence_terminal_or_stale_parent(invocation, run):
+                return True
             agent = self._agent(run)
             tool, operation = self._validate_tool_contract(invocation)
             action = self._runtime_action(invocation, run, agent)
@@ -1161,6 +1195,9 @@ class ToolInvocationController:
                 observation=observation,
             )
             self._record_observation(invocation, run, observation)
+            return True
+        run = self._agent_run(invocation)
+        if self._fence_terminal_or_stale_parent(invocation, run):
             return True
         runtime_id = runtime.runtime_id
         self._set_status(
@@ -1240,6 +1277,70 @@ class ToolInvocationController:
         )
         self._record_observation(invocation, run, observation)
         return True
+
+    def _fence_terminal_or_stale_parent(
+        self,
+        invocation: ToolInvocationResource,
+        run: AgentRunResource,
+    ) -> bool:
+        if run.status.phase in AGENT_RUN_TERMINAL_PHASES:
+            reason = "ParentAgentRunTerminal"
+            message = f"ToolInvocation fenced because AgentRun is {run.status.phase}"
+            observation = Observation(
+                summary=message,
+                payload={
+                    **self._event_payload(invocation, run),
+                    "parentPhase": run.status.phase,
+                    "terminalReason": run.status.data.get("terminalReason"),
+                    "executionEpoch": run.status.data.get("executionEpoch"),
+                },
+                error=ObservationError(reason=reason, message=message),
+            )
+            self._set_status(
+                invocation,
+                run,
+                "Cancelled",
+                message,
+                "ToolInvocationFenced",
+                {
+                    "reason": reason,
+                    "parentPhase": run.status.phase,
+                    "executionEpoch": run.status.data.get("executionEpoch"),
+                },
+                observation=observation,
+            )
+            self._record_observation(invocation, run, observation)
+            return True
+        expected_epoch = invocation.metadata.annotations.get(EXECUTION_EPOCH_ANNOTATION)
+        current_epoch = run.status.data.get("executionEpoch")
+        if expected_epoch and str(current_epoch) != expected_epoch:
+            reason = "ExecutionEpochMismatch"
+            message = "ToolInvocation fenced because execution epoch is stale"
+            observation = Observation(
+                summary=message,
+                payload={
+                    **self._event_payload(invocation, run),
+                    "executionEpoch": expected_epoch,
+                    "currentExecutionEpoch": current_epoch,
+                },
+                error=ObservationError(reason=reason, message=message),
+            )
+            self._set_status(
+                invocation,
+                run,
+                "Cancelled",
+                message,
+                "ToolInvocationFenced",
+                {
+                    "reason": reason,
+                    "executionEpoch": expected_epoch,
+                    "currentExecutionEpoch": current_epoch,
+                },
+                observation=observation,
+            )
+            self._record_observation(invocation, run, observation)
+            return True
+        return False
 
     def _pending_approval(self, invocation: ToolInvocationResource) -> bool:
         if invocation.status.phase != "WaitingForApproval":

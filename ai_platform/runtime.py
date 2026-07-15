@@ -47,6 +47,9 @@ ENGINE_RESUMABLE_PHASES = {
     "Finalizing",
 }
 TOOL_TERMINAL_PHASES = {"Succeeded", "Failed", "Denied", "TimedOut", "Cancelled"}
+EXECUTION_OWNER = "local"
+EXECUTION_EPOCH_ANNOTATION = "ai.platform/execution-epoch"
+EXECUTION_FRAME_INDEX_ANNOTATION = "ai.platform/execution-frame-index"
 
 
 class ToolRuntimeError(Exception):
@@ -856,7 +859,7 @@ class AgentRuntime:
         data = dict(run.status.data)
         data.setdefault("executionStartedAt", utciso())
         data["executionState"] = "Starting"
-        data["executionOwner"] = "local"
+        data["executionOwner"] = EXECUTION_OWNER
         data["executionEpoch"] = int(data.get("executionEpoch", 0)) + 1
         data.setdefault("executionFrames", [])
         data.setdefault("budgetUsage", self._initial_budget_usage())
@@ -958,17 +961,64 @@ class AgentRuntime:
             return self._fail_run(run, exc.reason, "PolicyDenied", retryable=False)
 
         frame, frames = self._active_frame(data)
+        if frame.get("state") == "decision-requested" and not frame.get("rawDecision"):
+            active_invocation = data.get("activeModelInvocation")
+            if isinstance(active_invocation, dict):
+                if self._model_invocation_expired(active_invocation):
+                    return self._timed_out(
+                        run,
+                        "ModelInvocationTimedOut",
+                        "Model invocation timed out before completion",
+                    )
+                self._emit_run_event(
+                    run,
+                    "DuplicateModelInvocationPrevented",
+                    f"Duplicate model invocation prevented for iteration {frame.get('iteration')}",
+                    {
+                        "iteration": frame.get("iteration"),
+                        "attempt": active_invocation.get("attempt"),
+                        "executionEpoch": data.get("executionEpoch"),
+                        "reason": "ModelInvocationAlreadyInFlight",
+                    },
+                    "RequestDecision",
+                    "ModelInvocationAlreadyInFlight",
+                )
+                return run
         attempt = int(frame.get("modelAttempts", 0)) + 1
+        invocation_id = self._model_invocation_id(run, frame, attempt)
+        deadline = self._model_invocation_deadline(model_config.timeoutSeconds)
         frame["modelAttempts"] = attempt
         frame["decisionRequestedAt"] = utciso()
         frame["state"] = "decision-requested"
+        frame["modelInvocation"] = {
+            "id": invocation_id,
+            "provider": model_config.provider,
+            "model": model_config.model,
+            "attempt": attempt,
+            "state": "running",
+            "executionOwner": data.get("executionOwner"),
+            "executionEpoch": data.get("executionEpoch"),
+            "deadlineAt": deadline,
+        }
         usage["modelInvocations"] += 1
         usage["wallTimeSeconds"] = self._wall_time_seconds(data)
         frame["budgetUsage"] = dict(usage)
         data["budgetUsage"] = usage
         data["executionFrames"] = frames
         data["activeFrameIndex"] = frames.index(frame)
-        run = self._save_run_data(run, data)
+        data["activeModelInvocation"] = {
+            "id": invocation_id,
+            "frameIndex": data["activeFrameIndex"],
+            "iteration": frame["iteration"],
+            "attempt": attempt,
+            "executionOwner": data.get("executionOwner"),
+            "executionEpoch": data.get("executionEpoch"),
+            "deadlineAt": deadline,
+        }
+        saved = self._save_run_data(run, data)
+        if saved is None:
+            return self._refresh_run(run)
+        run = saved
         self._emit_budget_updated(run, usage, budget)
 
         self._emit_run_event(
@@ -999,37 +1049,85 @@ class AgentRuntime:
         try:
             raw_decision = await asyncio.wait_for(client.generate(messages), timeout=model_config.timeoutSeconds)
         except asyncio.TimeoutError:
+            fenced = self._fence_model_completion(
+                run,
+                expected_invocation_id=invocation_id,
+                expected_attempt=attempt,
+                late_event_reason="ModelInvocationTimedOutAfterTerminal",
+            )
+            if fenced is None:
+                return self._refresh_run(run)
+            run = fenced
+            data = dict(run.status.data)
+            frame, frames = self._active_frame(data)
             frame["modelError"] = {
                 "reason": "ModelInvocationTimedOut",
                 "message": f"Model invocation timed out after {model_config.timeoutSeconds:g} seconds",
                 "attempt": attempt,
             }
+            if isinstance(frame.get("modelInvocation"), dict):
+                frame["modelInvocation"]["state"] = "timed-out"
+            data["activeModelInvocation"] = None
             data["executionFrames"] = frames
-            self._save_run_data(run, data)
+            saved = self._save_run_data(run, data)
+            if saved is None:
+                return self._refresh_run(run)
+            run = saved
             return self._timed_out(run, "ModelInvocationTimedOut", frame["modelError"]["message"])
         except Exception as exc:
+            fenced = self._fence_model_completion(
+                run,
+                expected_invocation_id=invocation_id,
+                expected_attempt=attempt,
+                late_event_reason="ModelInvocationFailedAfterTerminal",
+            )
+            if fenced is None:
+                return self._refresh_run(run)
+            run = fenced
+            data = dict(run.status.data)
+            frame, frames = self._active_frame(data)
             frame["modelError"] = {"reason": "ModelInvocationFailed", "message": str(exc), "attempt": attempt}
+            if isinstance(frame.get("modelInvocation"), dict):
+                frame["modelInvocation"]["state"] = "failed"
             frame["retryCount"] = int(frame.get("retryCount", 0)) + 1
             frame["modelRetryCount"] = int(frame.get("modelRetryCount", 0)) + 1
             data["executionFrames"] = frames
-            self._save_run_data(run, data)
+            data["activeModelInvocation"] = None
+            saved = self._save_run_data(run, data)
+            if saved is None:
+                return self._refresh_run(run)
+            run = saved
             if frame["modelRetryCount"] <= budget.maxModelRetries:
                 self._emit_retry_scheduled(run, frame, "ModelInvocationFailed", str(exc))
                 return self._refresh_run(run)
             return self._fail_run(run, str(exc), "ModelInvocationFailed", retryable=True)
 
-        data = dict(self._refresh_run(run).status.data)
+        fenced = self._fence_model_completion(
+            run,
+            expected_invocation_id=invocation_id,
+            expected_attempt=attempt,
+            late_event_reason="AgentRunTerminal",
+        )
+        if fenced is None:
+            return self._refresh_run(run)
+        run = fenced
+        data = dict(run.status.data)
         frame, frames = self._active_frame(data)
         frame["rawDecision"] = raw_decision
         frame["decisionProducedAt"] = utciso()
         frame["state"] = "decision-produced"
         frame["modelInvocation"] = {
+            "id": invocation_id,
             "provider": model_config.provider,
             "model": model_config.model,
             "attempt": attempt,
+            "state": "completed",
+            "executionOwner": data.get("executionOwner"),
+            "executionEpoch": data.get("executionEpoch"),
         }
         data["executionFrames"] = frames
         data["activeDecisionSummary"] = {"raw": self._redact_text(raw_decision)}
+        data.pop("activeModelInvocation", None)
         return self._transition(
             run,
             "DecisionReady",
@@ -1038,6 +1136,7 @@ class AgentRuntime:
             "DecisionProduced",
             "ProduceDecision",
             "DecisionProduced",
+            clear_data_keys=["activeModelInvocation"],
         )
 
     def _validate_current_decision(self, run: AgentRunResource, agent: AgentResource) -> AgentRunResource:
@@ -1204,6 +1303,10 @@ class AgentRuntime:
                 "metadata": {
                     "name": invocation_name,
                     "namespace": namespace,
+                    "annotations": {
+                        EXECUTION_EPOCH_ANNOTATION: str(data.get("executionEpoch", "")),
+                        EXECUTION_FRAME_INDEX_ANNOTATION: str(data.get("activeFrameIndex", "")),
+                    },
                     "ownerReferences": [{"kind": "AgentRun", "name": run.metadata.name, "controller": True}],
                 },
                 "spec": {
@@ -1248,6 +1351,10 @@ class AgentRuntime:
         )
 
     async def _resume_waiting_for_tool(self, run: AgentRunResource, agent: AgentResource) -> AgentRunResource:
+        current = self._refresh_run(run)
+        if current.status.phase in AGENT_RUN_TERMINAL_PHASES:
+            return current
+        run = current
         data = dict(run.status.data)
         frame, frames = self._active_frame(data)
         invocation_name = frame.get("toolInvocation") or data.get("activeToolInvocation")
@@ -1273,6 +1380,16 @@ class AgentRuntime:
         if invocation.status.phase == "WaitingForApproval" and self._approval_is_pending(invocation):
             return run
         if invocation.status.phase not in TOOL_TERMINAL_PHASES:
+            fenced = self._fence_execution_mutation(
+                run,
+                "StartToolInvocation",
+                "ToolInvocationStartFenced",
+                expected_phase="WaitingForTool",
+                expected_state="WaitingForTool",
+            )
+            if fenced is None:
+                return self._refresh_run(run)
+            run = fenced
             status = await self._execute_tool_invocation(run, agent, invocation, frame, frames, data)
             if status == "waiting":
                 return self._refresh_run(run)
@@ -1404,7 +1521,9 @@ class AgentRuntime:
                 frame["budgetUsage"] = dict(usage)
                 data["budgetUsage"] = usage
                 data["executionFrames"] = frames
-                self._save_run_data(run, data)
+                saved = self._save_run_data(run, data)
+                if saved is None:
+                    return "terminal"
                 observation = self._error_observation("ToolInvocationTimedOut", message)
                 self._set_tool_status(
                     invocation,
@@ -1425,7 +1544,10 @@ class AgentRuntime:
                 frame["budgetUsage"] = dict(usage)
                 data["budgetUsage"] = usage
                 data["executionFrames"] = frames
-                run = self._save_run_data(run, data)
+                saved = self._save_run_data(run, data)
+                if saved is None:
+                    return "terminal"
+                run = saved
                 if usage["toolFailures"] > run.spec.execution.maxToolFailures:
                     observation = self._error_observation("ToolFailureBudgetExceeded", str(exc))
                     self._set_tool_status(
@@ -1481,6 +1603,16 @@ class AgentRuntime:
             return "terminal"
 
     def _deliver_observation(self, run: AgentRunResource) -> AgentRunResource:
+        fenced = self._fence_execution_mutation(
+            run,
+            "DeliverObservation",
+            "ObservationDeliveryFenced",
+            expected_phase="WaitingForObservation",
+            expected_state="WaitingForObservation",
+        )
+        if fenced is None:
+            return self._refresh_run(run)
+        run = fenced
         data = dict(run.status.data)
         frame, frames = self._active_frame(data)
         invocation_name = frame.get("toolInvocation") or data.get("activeToolInvocation")
@@ -1525,6 +1657,7 @@ class AgentRuntime:
                 "pendingApproval",
                 "approval",
                 "approvalId",
+                "activeModelInvocation",
             ],
         )
 
@@ -1535,6 +1668,16 @@ class AgentRuntime:
         mission: MissionResource,
         workspace: WorkspaceResource,
     ) -> AgentRunResource:
+        fenced = self._fence_execution_mutation(
+            run,
+            "FinalizeExecution",
+            "FinalizationFenced",
+            expected_phase="Finalizing",
+            expected_state="Finalizing",
+        )
+        if fenced is None:
+            return self._refresh_run(run)
+        run = fenced
         data = dict(run.status.data)
         frame, frames = self._active_frame(data)
         decision = frame.get("decision")
@@ -1833,6 +1976,16 @@ class AgentRuntime:
         *,
         clear_data_keys: list[str] | None = None,
     ) -> AgentRunResource:
+        fenced = self._fence_execution_mutation(
+            run,
+            action,
+            reason,
+            target_phase=phase,
+            expected_phase=run.status.phase,
+        )
+        if fenced is None:
+            return self._refresh_run(run)
+        run = fenced
         data = dict(data)
         data["executionState"] = phase
         usage = self._budget_usage(data)
@@ -1854,7 +2007,33 @@ class AgentRuntime:
             raise TypeError(f"expected AgentRunResource, got {type(parsed).__name__}")
         return parsed
 
-    def _save_run_data(self, run: AgentRunResource, data: dict[str, Any]) -> AgentRunResource:
+    def _save_run_data(self, run: AgentRunResource, data: dict[str, Any]) -> AgentRunResource | None:
+        expected_state = run.status.data.get("executionState")
+        expected_active_invocation = run.status.data.get("activeModelInvocation")
+        fenced = self._fence_execution_mutation(
+            run,
+            "PersistExecutionState",
+            "ExecutionStatePersisted",
+            target_phase=run.status.phase,
+            expected_phase=run.status.phase,
+            expected_state=expected_state if isinstance(expected_state, str) else None,
+        )
+        if fenced is None:
+            return None
+        run = fenced
+        current_active_invocation = fenced.status.data.get("activeModelInvocation")
+        if current_active_invocation != expected_active_invocation:
+            self._emit_stale_execution_fenced(
+                fenced,
+                "PersistExecutionState",
+                "ActiveModelInvocationMismatch",
+                {
+                    "activeModelInvocation": current_active_invocation,
+                    "expectedActiveModelInvocation": expected_active_invocation,
+                    "reason": "ActiveModelInvocationMismatch",
+                },
+            )
+            return None
         manifest = self.store.update_status(
             ResourceKind.AGENT_RUN,
             run.metadata.name,
@@ -1868,6 +2047,173 @@ class AgentRuntime:
         if not isinstance(parsed, AgentRunResource):
             raise TypeError(f"expected AgentRunResource, got {type(parsed).__name__}")
         return parsed
+
+    def _fence_execution_mutation(
+        self,
+        run: AgentRunResource,
+        action: str,
+        reason: str,
+        *,
+        target_phase: str | None = None,
+        expected_phase: str | None = None,
+        expected_state: str | None = None,
+    ) -> AgentRunResource | None:
+        current = self._refresh_run(run)
+        if current.status.phase in AGENT_RUN_TERMINAL_PHASES:
+            self._emit_stale_execution_fenced(
+                current,
+                action,
+                reason,
+                {
+                    "currentPhase": current.status.phase,
+                    "attemptedPhase": target_phase,
+                    "expectedPhase": expected_phase,
+                    "reason": "AgentRunTerminal",
+                },
+            )
+            return None
+        if expected_phase is not None and current.status.phase != expected_phase:
+            self._emit_stale_execution_fenced(
+                current,
+                action,
+                reason,
+                {
+                    "currentPhase": current.status.phase,
+                    "expectedPhase": expected_phase,
+                    "attemptedPhase": target_phase,
+                    "reason": "PhaseMismatch",
+                },
+            )
+            return None
+        current_data = current.status.data
+        expected_epoch = run.status.data.get("executionEpoch")
+        current_epoch = current_data.get("executionEpoch")
+        if expected_epoch is not None and current_epoch != expected_epoch:
+            self._emit_stale_execution_fenced(
+                current,
+                action,
+                reason,
+                {
+                    "executionEpoch": expected_epoch,
+                    "currentExecutionEpoch": current_epoch,
+                    "reason": "ExecutionEpochMismatch",
+                },
+            )
+            return None
+        expected_owner = run.status.data.get("executionOwner")
+        current_owner = current_data.get("executionOwner")
+        if expected_owner is not None and current_owner != expected_owner:
+            self._emit_stale_execution_fenced(
+                current,
+                action,
+                reason,
+                {
+                    "executionOwner": expected_owner,
+                    "currentExecutionOwner": current_owner,
+                    "reason": "ExecutionOwnerMismatch",
+                },
+            )
+            return None
+        if expected_state is not None and current_data.get("executionState") != expected_state:
+            self._emit_stale_execution_fenced(
+                current,
+                action,
+                reason,
+                {
+                    "executionState": current_data.get("executionState"),
+                    "expectedExecutionState": expected_state,
+                    "reason": "ExecutionStateMismatch",
+                },
+            )
+            return None
+        return current
+
+    def _fence_model_completion(
+        self,
+        run: AgentRunResource,
+        *,
+        expected_invocation_id: str,
+        expected_attempt: int,
+        late_event_reason: str,
+    ) -> AgentRunResource | None:
+        current = self._refresh_run(run)
+        if current.status.phase in AGENT_RUN_TERMINAL_PHASES:
+            active = current.status.data.get("activeModelInvocation")
+            payload = active if isinstance(active, dict) else {}
+            self._emit_run_event(
+                current,
+                "LateModelResponseDiscarded",
+                f"Discarded late model response for AgentRun {current.metadata.name}",
+                {
+                    "modelInvocation": expected_invocation_id,
+                    "attempt": expected_attempt,
+                    "executionEpoch": run.status.data.get("executionEpoch"),
+                    "currentExecutionEpoch": current.status.data.get("executionEpoch"),
+                    "currentTerminalPhase": current.status.phase,
+                    "reason": late_event_reason,
+                    **payload,
+                },
+                "DiscardModelResponse",
+                late_event_reason,
+            )
+            return None
+        fenced = self._fence_execution_mutation(
+            run,
+            "CompleteModelInvocation",
+            "ModelInvocationCompletionFenced",
+            expected_phase="AwaitingDecision",
+            expected_state="AwaitingDecision",
+        )
+        if fenced is None:
+            return None
+        active = fenced.status.data.get("activeModelInvocation")
+        if not isinstance(active, dict) or active.get("id") != expected_invocation_id:
+            self._emit_stale_execution_fenced(
+                fenced,
+                "CompleteModelInvocation",
+                "ModelInvocationMismatch",
+                {
+                    "modelInvocation": expected_invocation_id,
+                    "activeModelInvocation": active,
+                    "attempt": expected_attempt,
+                    "reason": "ModelInvocationMismatch",
+                },
+            )
+            return None
+        if int(active.get("attempt") or 0) != expected_attempt:
+            self._emit_stale_execution_fenced(
+                fenced,
+                "CompleteModelInvocation",
+                "ModelInvocationAttemptMismatch",
+                {
+                    "modelInvocation": expected_invocation_id,
+                    "attempt": expected_attempt,
+                    "activeAttempt": active.get("attempt"),
+                    "reason": "ModelInvocationAttemptMismatch",
+                },
+            )
+            return None
+        return fenced
+
+    def _emit_stale_execution_fenced(
+        self,
+        run: AgentRunResource,
+        action: str,
+        reason: str,
+        payload: dict[str, Any],
+    ) -> None:
+        self._emit_run_event(
+            run,
+            "StaleExecutionFenced",
+            f"Stale execution mutation fenced for AgentRun {run.metadata.name}",
+            {
+                "executionOwner": run.status.data.get("executionOwner"),
+                "executionEpoch": run.status.data.get("executionEpoch"),
+                **payload,
+            },
+            action,
+            reason,
+        )
 
     def _emit_run_event(
         self,
@@ -2062,6 +2408,28 @@ class AgentRuntime:
             "ExecutionBudgetUpdated",
         )
 
+    def _model_invocation_id(self, run: AgentRunResource, frame: dict[str, Any], attempt: int) -> str:
+        return (
+            f"{run.metadata.name}-model-"
+            f"{run.status.data.get('executionEpoch', 0)}-"
+            f"{frame.get('iteration', 0)}-{attempt}"
+        )
+
+    @staticmethod
+    def _model_invocation_deadline(timeout_seconds: float) -> str:
+        deadline = datetime.now(UTC).timestamp() + timeout_seconds
+        return datetime.fromtimestamp(deadline, UTC).isoformat()
+
+    @staticmethod
+    def _model_invocation_expired(active_invocation: dict[str, Any]) -> bool:
+        deadline = active_invocation.get("deadlineAt")
+        if not isinstance(deadline, str):
+            return False
+        try:
+            return datetime.now(UTC) >= datetime.fromisoformat(deadline)
+        except ValueError:
+            return False
+
     def _cancel_if_requested(self, run: AgentRunResource) -> AgentRunResource | None:
         if not run.spec.cancellationRequested:
             return None
@@ -2101,6 +2469,7 @@ class AgentRuntime:
                 "pendingApproval",
                 "approval",
                 "approvalId",
+                "activeModelInvocation",
             ],
         )
 
@@ -2119,6 +2488,7 @@ class AgentRuntime:
 
     def _timed_out(self, run: AgentRunResource, reason: str, message: str) -> AgentRunResource:
         data = dict(run.status.data)
+        data.pop("activeModelInvocation", None)
         data["terminalReason"] = reason
         data["retryable"] = False
         data["diagnosticSummary"] = message
@@ -2136,6 +2506,7 @@ class AgentRuntime:
                 "pendingApproval",
                 "approval",
                 "approvalId",
+                "activeModelInvocation",
             ],
         )
 
@@ -2162,11 +2533,13 @@ class AgentRuntime:
                 "pendingApproval",
                 "approval",
                 "approvalId",
+                "activeModelInvocation",
             ],
         )
 
     def _fail_run(self, run: AgentRunResource, message: str, reason: str, *, retryable: bool) -> AgentRunResource:
         data = dict(run.status.data)
+        data.pop("activeModelInvocation", None)
         data["terminalReason"] = reason
         data["retryable"] = retryable
         data["diagnosticSummary"] = message
@@ -2184,6 +2557,7 @@ class AgentRuntime:
                 "pendingApproval",
                 "approval",
                 "approvalId",
+                "activeModelInvocation",
             ],
         )
         self._emit_run_event(

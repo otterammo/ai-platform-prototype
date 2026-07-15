@@ -855,6 +855,19 @@ def test_exhausted_model_retries_fail_without_active_invocation(tmp_path: Path) 
     assert "activeModelInvocation" not in run["status"]["data"]
 
 
+def test_successful_model_completion_clears_active_invocation(tmp_path: Path) -> None:
+    store = make_engine_store(tmp_path)
+    model = SequenceModel([complete_decision("completed")])
+
+    asyncio.run(runtime_with(store, model).run(run_resource(store)))
+
+    run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    assert run is not None
+    assert run["status"]["phase"] == "Succeeded"
+    assert model.calls == 1
+    assert "activeModelInvocation" not in run["status"]["data"]
+
+
 def test_model_invocation_budget_counts_after_model_approval(tmp_path: Path) -> None:
     policy_rules = [
         {"match": {"tool": "fake", "operation": "use"}, "allow": True},

@@ -1127,6 +1127,7 @@ class AgentRuntime:
         }
         data["executionFrames"] = frames
         data["activeDecisionSummary"] = {"raw": self._redact_text(raw_decision)}
+        data.pop("activeModelInvocation", None)
         return self._transition(
             run,
             "DecisionReady",

@@ -79,8 +79,11 @@ ToolInvocation completed, ToolInvocation failed, ToolInvocation timed out,
 ToolInvocation cancelled, Observation recorded, artifact ready, completed,
 waiting, and failed. Decision-related event types SHOULD include
 DecisionRequested, DecisionProduced, DecisionValidated, and DecisionRejected.
-Implementations MAY add separate ToolInvocation requested or validated events
-when they expose those lifecycle states.
+Execution fencing event types SHOULD include LateModelResponseDiscarded,
+StaleExecutionFenced, ToolInvocationFenced, and
+DuplicateModelInvocationPrevented. Implementations MAY add separate
+ToolInvocation requested or validated events when they expose those lifecycle
+states.
 
 Execution Engine event types MUST include:
 
@@ -105,6 +108,10 @@ Execution Engine event types MUST include:
 - `ExecutionCancelled`
 - `ExecutionTimedOut`
 - `ExecutionBudgetExceeded`
+- `LateModelResponseDiscarded`
+- `StaleExecutionFenced`
+- `ToolInvocationFenced`
+- `DuplicateModelInvocationPrevented`
 
 Decision and execution-loop events SHOULD include correlation identifier,
 AgentRun, iteration number, attempt number, Decision type, Decision version,
@@ -116,6 +123,11 @@ redacted according to Policy.
 ToolInvocation events MUST include correlation identifier, Workspace, AgentRun,
 ToolInvocation, Tool, operation, and runtime or provider actor. Sensitive
 arguments and output MUST be redacted according to Policy.
+
+Fencing events MUST include the AgentRun, current phase, execution epoch or
+fencing token when available, attempted operation, and reason. Late model
+response events MUST include the model invocation identity, attempt, current
+terminal phase, and discard reason.
 
 Events MUST identify ToolInvocation where applicable. Sensitive tool arguments,
 model prompts, provider responses, secrets, and full file content MUST be

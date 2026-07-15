@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ai_platform.cli import main
-from ai_platform.controllers import LocalAgentRunWorker
+from ai_platform.controllers import LocalAgentRunWorker, ToolInvocationController
 from ai_platform.models import Message, ModelClient, normalize_decision_content
 from ai_platform.observability import build_trace
 from ai_platform.policy import ApprovalService
@@ -42,10 +42,30 @@ class SequenceModel(ModelClient):
         return str(item)
 
 
+class BlockingModel(ModelClient):
+    def __init__(self, item: Any) -> None:
+        self.item = item
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def generate(self, _messages: list[Message]) -> str:
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        if isinstance(self.item, dict):
+            return json.dumps(self.item)
+        return str(self.item)
+
+
 class FailingRuntime:
     runtime_id = "test.failing"
 
+    def __init__(self) -> None:
+        self.calls = 0
+
     def execute(self, _invocation: Any) -> Observation:
+        self.calls += 1
         raise AssertionError("tool runtime should not execute")
 
 
@@ -906,6 +926,158 @@ def test_agentrun_wall_timeout_becomes_timed_out(tmp_path: Path) -> None:
     assert run is not None
     assert run["status"]["phase"] == "TimedOut"
     assert model.calls == 0
+
+
+def test_late_model_response_after_terminal_agentrun_is_discarded(tmp_path: Path) -> None:
+    store = make_engine_store(tmp_path)
+    model = BlockingModel(invoke_fake_decision())
+    runtime = runtime_with(store, model, ToolRuntimeRegistry({"fake": FailingRuntime()}))
+
+    async def scenario() -> None:
+        task = asyncio.create_task(runtime.run(run_resource(store)))
+        await asyncio.wait_for(model.started.wait(), timeout=1)
+        current = run_resource(store)
+        runtime._timed_out(current, "AgentRunTimedOut", "AgentRun timed out during model invocation")
+        model.release.set()
+        await task
+
+    asyncio.run(scenario())
+
+    run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    assert run is not None
+    assert run["status"]["phase"] == "TimedOut"
+    frames = run["status"]["data"]["executionFrames"]
+    assert len(frames) == 1
+    assert "rawDecision" not in frames[0]
+    assert "decision" not in frames[0]
+    assert store.list(ResourceKind.TOOL_INVOCATION, "demo") == []
+    event_types = {event["type"] for event in store.list_events(namespace="demo", limit=None)}
+    assert "LateModelResponseDiscarded" in event_types
+
+
+def test_stale_worker_epoch_cannot_persist_execution_progress(tmp_path: Path) -> None:
+    store = make_engine_store(tmp_path)
+    runtime = runtime_with(store, SequenceModel([]))
+    run = run_resource(store)
+    agent_manifest = store.get(ResourceKind.AGENT, "runner", "demo")
+    assert agent_manifest is not None
+    agent = parse_resource(agent_manifest)
+    assert isinstance(agent, AgentResource)
+    stale = runtime._start_engine(run, agent)
+    current_data = dict(stale.status.data)
+    current_data["executionEpoch"] = 2
+    store.update_status(
+        ResourceKind.AGENT_RUN,
+        stale.metadata.name,
+        stale.metadata.namespace,
+        stale.status.phase,
+        stale.status.message,
+        current_data,
+    )
+    stale_data = dict(stale.status.data)
+    stale_data["staleMutation"] = True
+
+    runtime._save_run_data(stale, stale_data)
+
+    run_after = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    assert run_after is not None
+    assert run_after["status"]["data"]["executionEpoch"] == 2
+    assert "staleMutation" not in run_after["status"]["data"]
+    event_types = {event["type"] for event in store.list_events(namespace="demo", limit=None)}
+    assert "StaleExecutionFenced" in event_types
+
+
+def test_terminal_reconciliation_is_inert_for_agentruns(tmp_path: Path) -> None:
+    for phase in ["Failed", "Cancelled", "TimedOut", "BudgetExceeded", "Succeeded"]:
+        case_path = tmp_path / phase.lower()
+        case_path.mkdir()
+        store = make_engine_store(case_path)
+        store.update_status(
+            ResourceKind.AGENT_RUN,
+            "run-1",
+            "demo",
+            phase,
+            f"AgentRun is {phase}",
+            {"terminalReason": phase, "retryable": False, "diagnosticSummary": phase},
+        )
+        model = SequenceModel([invoke_fake_decision()])
+        worker = LocalAgentRunWorker(store, runtime_with(store, model, ToolRuntimeRegistry({"fake": FailingRuntime()})))
+
+        for _ in range(3):
+            asyncio.run(worker.reconcile_once())
+
+        run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+        assert run is not None
+        assert run["status"]["phase"] == phase
+        assert model.calls == 0
+        assert store.list(ResourceKind.TOOL_INVOCATION, "demo") == []
+
+
+def test_terminal_parent_tool_invocation_is_fenced_before_runtime_execution(tmp_path: Path) -> None:
+    store = make_engine_store(tmp_path)
+    invocation_name = "run-1-tool-1-0001-1"
+    store.apply(
+        {
+            "apiVersion": "ai.platform/v1",
+            "kind": "ToolInvocation",
+            "metadata": {
+                "name": invocation_name,
+                "namespace": "demo",
+                "ownerReferences": [{"kind": "AgentRun", "name": "run-1", "controller": True}],
+            },
+            "spec": {
+                "agentRunRef": {"name": "run-1"},
+                "tool": "fake",
+                "operation": "echo",
+                "arguments": {"message": "hello"},
+            },
+        }
+    )
+    store.update_status(
+        ResourceKind.AGENT_RUN,
+        "run-1",
+        "demo",
+        "TimedOut",
+        "AgentRun timed out",
+        {"terminalReason": "AgentRunTimedOut", "executionEpoch": 1},
+    )
+    runtime = FailingRuntime()
+    controller = ToolInvocationController(store, ToolRuntimeRegistry({"fake": runtime}))
+
+    asyncio.run(controller.reconcile_once())
+
+    invocation = store.get(ResourceKind.TOOL_INVOCATION, invocation_name, "demo")
+    assert invocation is not None
+    assert invocation["status"]["phase"] == "Cancelled"
+    assert invocation["status"]["observation"]["error"]["reason"] == "ParentAgentRunTerminal"
+    assert runtime.calls == 0
+    event_types = {event["type"] for event in store.list_events(namespace="demo", limit=None)}
+    assert "ToolInvocationFenced" in event_types
+
+
+def test_duplicate_model_invocation_is_prevented_for_active_frame(tmp_path: Path) -> None:
+    store = make_engine_store(tmp_path)
+    blocking_model = BlockingModel(complete_decision("first completed"))
+    first_runtime = runtime_with(store, blocking_model)
+    second_model = SequenceModel([complete_decision("duplicate should not run")])
+    second_runtime = runtime_with(store, second_model)
+
+    async def scenario() -> None:
+        first = asyncio.create_task(first_runtime.run(run_resource(store)))
+        await asyncio.wait_for(blocking_model.started.wait(), timeout=1)
+        await second_runtime.run(run_resource(store))
+        blocking_model.release.set()
+        await first
+
+    asyncio.run(scenario())
+
+    assert blocking_model.calls == 1
+    assert second_model.calls == 0
+    run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    assert run is not None
+    assert run["status"]["phase"] == "Succeeded"
+    event_types = {event["type"] for event in store.list_events(namespace="demo", limit=None)}
+    assert "DuplicateModelInvocationPrevented" in event_types
 
 
 def test_cancel_command_cancels_waiting_agentrun(tmp_path: Path, capsys: Any) -> None:

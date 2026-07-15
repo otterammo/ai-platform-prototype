@@ -105,3 +105,24 @@ Results:
 Direct ToolInvocation manifests remain useful for debugging one runtime
 operation or reproducing a tool contract issue. They are no longer the primary
 dogfood flow.
+
+## DF-003 Terminal Fencing Finding
+
+DF-003 exposed a terminal-state race during the autonomous workload path:
+
+```text
+model invocation starts
+-> AgentRun exceeds wall-time budget
+-> AgentRun becomes TimedOut
+-> late model response returns
+-> Decision and ToolInvocation progress continues after terminal state
+```
+
+The required fix is terminal-state fencing in the Execution Engine before
+persisting model responses, Decisions, ToolInvocations, Observations, and final
+outputs. Late model responses must be discarded with
+`LateModelResponseDiscarded`, stale execution attempts must emit
+`StaleExecutionFenced`, and ToolInvocations whose parent AgentRun is terminal
+must be cancelled without invoking the runtime.
+
+Do not rerun DF-003 until the focused terminal-fencing regression tests pass.

@@ -44,6 +44,10 @@ ProcessingDecision
 
 Terminal states are `Succeeded`, `Failed`, `Cancelled`, `TimedOut`, and
 `BudgetExceeded`. A terminal AgentRun MUST NOT resume automatically.
+After an AgentRun enters a terminal state, late model responses, stale workers,
+reconciliation passes, and pending ToolInvocations MUST NOT persist new
+Decisions, create new ToolInvocations, deliver Observations into the run, start
+new side effects, or finalize outputs.
 
 `WaitingForApproval` is a waiting condition applied while a ToolInvocation is
 blocked by Policy. It is not a separate terminal phase.
@@ -59,6 +63,12 @@ ToolInvocation MUST NOT execute again.
 
 The Execution Engine MUST persist enough state that a replacement worker can
 resume without relying on process-local memory.
+
+Every execution mutation MUST verify that the AgentRun is non-terminal, that
+the worker still owns the active execution owner and epoch, and that the
+persisted phase and execution state still match the operation being completed.
+A failed fence MUST fail closed and emit a structured event rather than
+advancing execution.
 
 ## Execution Budgets
 
@@ -159,6 +169,10 @@ Crash recovery rules:
 - Before Decision persistence: if the model call may have occurred but no
   Decision was persisted, the engine MAY invoke the model again with the same
   persisted input frame and a new attempt number.
+- While a model invocation is marked active for the current frame, the engine
+  MUST NOT start a duplicate invocation for that frame. If the persisted active
+  model invocation has exceeded its deadline, the run transitions according to
+  timeout semantics instead of starting overlapping work.
 - After Decision persistence: the engine MUST NOT call the model again for that
   iteration.
 - After ToolInvocation creation: the engine waits for or reconciles the
@@ -226,6 +240,12 @@ the total run deadline expires. Timeout MUST NOT be reported as a generic
 
 A ToolInvocation timeout remains visible on the ToolInvocation itself even if
 the parent AgentRun later retries or fails.
+
+If a model response or model invocation failure returns after the AgentRun has
+already become terminal, the Execution Engine MUST discard it, leave the
+terminal phase and diagnostics unchanged, and emit `LateModelResponseDiscarded`
+with AgentRun, model invocation, attempt, execution epoch, terminal phase, and
+reason fields.
 
 ## Retry Boundaries
 
@@ -309,6 +329,13 @@ its lease MUST stop initiating new side effects.
 
 The initial local implementation may use a single-process lease, but the
 contract must support future distributed workers.
+
+Runtime-created ToolInvocations MUST carry enough durable execution-fence data
+to verify that they belong to the current AgentRun epoch before execution
+starts. If the parent AgentRun is terminal, or the ToolInvocation belongs to a
+stale epoch, the ToolInvocation transitions to a non-executed terminal state and
+records an Observation explaining the fence. Completed side effects are not
+replayed or compensated.
 
 ## Events And Trace
 

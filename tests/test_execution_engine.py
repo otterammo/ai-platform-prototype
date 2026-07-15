@@ -842,6 +842,19 @@ def test_model_transport_retry_uses_same_frame_with_new_attempt(tmp_path: Path) 
     assert "ExecutionRetryScheduled" in event_types
 
 
+def test_exhausted_model_retries_fail_without_active_invocation(tmp_path: Path) -> None:
+    store = make_engine_store(tmp_path, execution={"maxModelRetries": 0})
+    model = SequenceModel([RuntimeError("transport unavailable")])
+
+    asyncio.run(runtime_with(store, model).run(run_resource(store)))
+
+    run = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    assert run is not None
+    assert run["status"]["phase"] == "Failed"
+    assert run["status"]["data"]["terminalReason"] == "ModelInvocationFailed"
+    assert "activeModelInvocation" not in run["status"]["data"]
+
+
 def test_model_invocation_budget_counts_after_model_approval(tmp_path: Path) -> None:
     policy_rules = [
         {"match": {"tool": "fake", "operation": "use"}, "allow": True},
@@ -1027,6 +1040,24 @@ def test_same_phase_stale_worker_cannot_overwrite_active_model_invocation(tmp_pa
     assert run_after is not None
     assert run_after["status"]["data"]["activeModelInvocation"]["id"] == "first"
     assert "staleMutation" not in run_after["status"]["data"]
+    event_types = {event["type"] for event in store.list_events(namespace="demo", limit=None)}
+    assert "StaleExecutionFenced" in event_types
+
+
+def test_same_phase_stale_terminal_attempt_preserves_first_diagnostics(tmp_path: Path) -> None:
+    store = make_engine_store(tmp_path)
+    runtime = runtime_with(store, SequenceModel([]))
+    stale = run_resource(store)
+
+    runtime._timed_out(stale, "AgentRunTimedOut", "first timeout")
+    result = runtime._timed_out(stale, "ModelInvocationTimedOut", "second timeout")
+
+    run_after = store.get(ResourceKind.AGENT_RUN, "run-1", "demo")
+    assert run_after is not None
+    assert result.status.data["terminalReason"] == "AgentRunTimedOut"
+    assert run_after["status"]["phase"] == "TimedOut"
+    assert run_after["status"]["data"]["terminalReason"] == "AgentRunTimedOut"
+    assert run_after["status"]["data"]["diagnosticSummary"] == "first timeout"
     event_types = {event["type"] for event in store.list_events(namespace="demo", limit=None)}
     assert "StaleExecutionFenced" in event_types
 

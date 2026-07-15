@@ -1072,6 +1072,7 @@ class AgentRuntime:
             saved = self._save_run_data(run, data)
             if saved is None:
                 return self._refresh_run(run)
+            run = saved
             return self._timed_out(run, "ModelInvocationTimedOut", frame["modelError"]["message"])
         except Exception as exc:
             fenced = self._fence_model_completion(
@@ -1095,6 +1096,7 @@ class AgentRuntime:
             saved = self._save_run_data(run, data)
             if saved is None:
                 return self._refresh_run(run)
+            run = saved
             if frame["modelRetryCount"] <= budget.maxModelRetries:
                 self._emit_retry_scheduled(run, frame, "ModelInvocationFailed", str(exc))
                 return self._refresh_run(run)
@@ -2057,8 +2059,6 @@ class AgentRuntime:
     ) -> AgentRunResource | None:
         current = self._refresh_run(run)
         if current.status.phase in AGENT_RUN_TERMINAL_PHASES:
-            if target_phase == current.status.phase:
-                return current
             self._emit_stale_execution_fenced(
                 current,
                 action,
@@ -2538,6 +2538,7 @@ class AgentRuntime:
 
     def _fail_run(self, run: AgentRunResource, message: str, reason: str, *, retryable: bool) -> AgentRunResource:
         data = dict(run.status.data)
+        data.pop("activeModelInvocation", None)
         data["terminalReason"] = reason
         data["retryable"] = retryable
         data["diagnosticSummary"] = message
@@ -2555,6 +2556,7 @@ class AgentRuntime:
                 "pendingApproval",
                 "approval",
                 "approvalId",
+                "activeModelInvocation",
             ],
         )
         self._emit_run_event(
